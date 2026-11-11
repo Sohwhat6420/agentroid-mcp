@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "t": "request",
+  "epoch": 5,
+  "seq": 1,
+  "id": "ok-1",
+  "rpc": {
+    "jsonrpc": "2.0",
+    "id": "ok-1",
+    "method": "act.count",
+    "params": {
+      "n": 1
+    }
+  }
+}

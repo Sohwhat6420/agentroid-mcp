@@ -1,0 +1,28 @@
+{
+ "note": "the 23 tasks that failed in results/full-2b (free rerun of 44), rerun after the four agent-side fixes of 7 Nov 2026 (commit f797746); agent fixes only, no task or checker touched",
+ "tasks": [
+  "SimpleCalendarDeleteEventsOnRelativeDay",
+  "SimpleCalendarEventsInTimeRange",
+  "SimpleCalendarEventsOnDate",
+  "SimpleCalendarFirstEventAfterStartTime",
+  "SimpleCalendarNextMeetingWithPerson",
+  "SimpleDrawProCreateDrawing",
+  "SportsTrackerActivitiesCountForWeek",
+  "SportsTrackerActivitiesOnDate",
+  "SportsTrackerActivityDuration",
+  "SportsTrackerLongestDistanceActivity",
+  "SportsTrackerTotalDistanceForCategoryOverInterval",
+  "SystemBluetoothTurnOff",
+  "SystemBluetoothTurnOffVerify",
+  "SystemBluetoothTurnOn",
+  "SystemCopyToClipboard",
+  "TasksCompletedTasksForDate",
+  "TasksDueNextWeek",
+  "TasksDueOnDate",
+  "TasksHighPriorityTasks",
+  "TasksHighPriorityTasksDueOnDate",
+  "TurnOffWifiAndTurnOnBluetooth",
+  "VlcCreatePlaylist",
+  "VlcCreateTwoPlaylists"
+ ]
+}

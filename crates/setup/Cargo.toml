@@ -1,0 +1,23 @@
+[package]
+name = "agentroid-setup"
+description = "setup, doctor, --undo and quirks v0"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "setup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentroid-setup"
+path = "src/main.rs"
+
+[dependencies]
+agentroid-adb-link = { path = "../adb-link" }
+agentroid-core = { path = "../core" }
+# Read-only use of the capability probe (task 2.16): `probe`, `Profile`, `profile_path`, the lists.
+agentroid-bridged = { path = "../bridged" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

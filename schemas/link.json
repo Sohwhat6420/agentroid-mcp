@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentroid.local/schemas/link.json",
+  "title": "Agentroid persistent link (task 2.12), protocol v1: one JSON object per WebSocket text message",
+  "description": "The phone DIALS OUT to the hub at ws://<address in 100.64.0.0/10>:<port>/helper. Every frame carries v=1 and a type t. Handshake: phone hello -> hub challenge -> phone challenge_response -> hub ready -> both resume. Then hub request (or hub segment, a signed runner segment) / phone response, both ack, phone heartbeat, untrusted_bssid and human_touch. Either side may send needs_repair; the phone sends refused for a request it will not run. Signed-message layout, epoch and seq rules: LINK-REPORT.md, 'What the hub half must implement'. Cross-field rules that JSON Schema cannot state are checked in test_schemas.py (link_cross_checks).",
+  "type": "object",
+  "required": ["v", "t"],
+  "properties": {
+    "v": {"const": 1},
+    "t": {"enum": ["hello", "challenge", "challenge_response", "ready", "needs_repair", "heartbeat", "request", "response", "ack", "resume", "refused", "untrusted_bssid", "segment", "human_touch"]}
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/hello"},
+    {"$ref": "#/$defs/challenge"},
+    {"$ref": "#/$defs/challenge_response"},
+    {"$ref": "#/$defs/ready"},
+    {"$ref": "#/$defs/needs_repair"},
+    {"$ref": "#/$defs/heartbeat"},
+    {"$ref": "#/$defs/request"},
+    {"$ref": "#/$defs/response"},
+    {"$ref": "#/$defs/ack"},
+    {"$ref": "#/$defs/resume"},
+    {"$ref": "#/$defs/refused"},
+    {"$ref": "#/$defs/untrusted_bssid"},
+    {"$ref": "#/$defs/segment"},
+    {"$ref": "#/$defs/human_touch"}
+  ],
+  "$defs": {
+    "nonce": {
+      "description": "At least 32 and at most 64 random bytes, standard base64 with padding (RFC 4648 section 4). 44 characters ending in '==' would be 31 bytes, so that form is excluded. The receiver also decodes it and checks the byte count.",
+      "type": "string", "minLength": 44, "maxLength": 88,
+      "pattern": "^(?![A-Za-z0-9+/]{42}==$)(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+    },
+    "sig": {
+      "description": "ASN.1 DER ECDSA signature (SHA256withECDSA on P-256), standard base64 with padding. A DER P-256 signature is at most 72 bytes.",
+      "type": "string", "minLength": 12, "maxLength": 96,
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$"
+    },
+    "key_id": {"description": "Lower-case hex SHA-256 of the key's X.509 SubjectPublicKeyInfo DER.", "type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "epoch": {"description": "Hub epoch (the 2.8 lease epoch). The phone remembers the highest epoch that reached ready and refuses anything older.", "type": "integer", "minimum": 1},
+    "seq": {"description": "Per-direction sequence number within one epoch, starting at 1.", "type": "integer", "minimum": 1},
+    "acked": {"description": "Highest seq received in order from the other side in this epoch; 0 when none.", "type": "integer", "minimum": 0},
+    "serial": {"description": "ro.serialno as the hub read it over adb at pairing.", "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,64}$"},
+    "request_id": {"description": "Hub-chosen and unique across epochs (for example a ULID). The phone answers a reused id from its cache and never runs it twice.", "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+    "bssid": {"type": "string", "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$"},
+
+    "hello": {
+      "description": "Phone -> hub, the first frame on every connection.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "key_id", "alg", "phone_nonce", "instance", "helper_version", "sdk", "state", "epoch_seen"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "hello"},
+        "key_id": {"$ref": "#/$defs/key_id"},
+        "alg": {"const": "SHA256withECDSA"},
+        "phone_nonce": {"$ref": "#/$defs/nonce"},
+        "instance": {"description": "Random per app process start. If it differs from the last connection, the phone's request cache and outbox are gone: the hub must treat unanswered ACT requests as outcome unknown and not replay them blindly.", "type": "string", "pattern": "^[A-Za-z0-9_-]{16,64}$"},
+        "helper_version": {"type": "string", "minLength": 1, "maxLength": 32},
+        "sdk": {"type": "integer", "minimum": 29},
+        "state": {"enum": ["pending_auth", "needs_repair"]},
+        "repair_reason": {"$ref": "#/$defs/repair_reason"},
+        "epoch_seen": {"description": "Highest epoch this phone has accepted; 0 before the first.", "type": "integer", "minimum": 0}
+      }
+    },
+    "challenge": {
+      "description": "Hub -> phone. hub_sig = SHA256withECDSA by the hub key over the UTF-8 bytes of: 'agentroid-link/v1/hub-challenge' LF 'nonce=' nonce LF 'phone_nonce=' phone_nonce LF 'epoch=' decimal epoch LF 'serial=' serial LF 'phone_key_id=' the phone's key_id (no trailing LF; base64 strings exactly as sent).",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "nonce", "phone_nonce", "serial", "hub_key_id", "hub_sig"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "challenge"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "nonce": {"$ref": "#/$defs/nonce"},
+        "phone_nonce": {"$ref": "#/$defs/nonce"},
+        "serial": {"$ref": "#/$defs/serial"},
+        "hub_key_id": {"$ref": "#/$defs/key_id"},
+        "hub_sig": {"$ref": "#/$defs/sig"}
+      }
+    },
+    "challenge_response": {
+      "description": "Phone -> hub. signature = SHA256withECDSA by the phone's AndroidKeyStore key over the UTF-8 bytes of: 'agentroid-link/v1/phone-response' LF 'nonce=' nonce LF 'phone_nonce=' phone_nonce LF 'epoch=' decimal epoch LF 'serial=' serial LF 'hub_key_id=' the hub's key_id (no trailing LF).",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "nonce", "key_id", "signature"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "challenge_response"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "nonce": {"$ref": "#/$defs/nonce"},
+        "key_id": {"$ref": "#/$defs/key_id"},
+        "signature": {"$ref": "#/$defs/sig"}
+      }
+    },
+    "ready": {
+      "description": "Hub -> phone after the phone's signature verified. The phone acts only after this.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "key_id"],
+      "properties": {"v": {"const": 1}, "t": {"const": "ready"}, "epoch": {"$ref": "#/$defs/epoch"}, "key_id": {"$ref": "#/$defs/key_id"}}
+    },
+    "repair_reason": {"enum": ["hub_key_missing", "bad_hub_signature", "serial_mismatch", "stale_epoch", "bad_challenge", "key_unavailable", "unknown_device_key", "bad_phone_signature", "key_revoked"]},
+    "needs_repair": {
+      "description": "Either direction. The phone enters needs_repair (acting refused; sticky across reconnects until a challenge passes). fix is the exact text for the reason; the hub replaces the literal <serial> with the device serial before showing it.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "from", "reason", "fix"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "needs_repair"},
+        "from": {"enum": ["phone", "hub"]},
+        "reason": {"$ref": "#/$defs/repair_reason"},
+        "fix": {"type": "string"},
+        "epoch": {"type": "integer", "minimum": 0}
+      },
+      "oneOf": [
+        {"properties": {"from": {"const": "phone"}, "reason": {"const": "hub_key_missing"}, "fix": {"const": "This phone has no hub key yet. On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>"}}},
+        {"properties": {"from": {"const": "phone"}, "reason": {"const": "bad_hub_signature"}, "fix": {"const": "The hub's signature did not match the hub key this phone holds (the laptop's hub key changed, or another machine answered at the hub address). On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>"}}},
+        {"properties": {"from": {"const": "phone"}, "reason": {"const": "serial_mismatch"}, "fix": {"const": "The hub named a different device serial from the one this phone was paired as. On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>"}}},
+        {"properties": {"from": {"const": "phone"}, "reason": {"const": "stale_epoch"}, "fix": {"const": "A hub with an older epoch tried to take this phone. Stop the old hub process (only the newest hub may own a phone); the current hub then reconnects by itself."}}},
+        {"properties": {"from": {"const": "phone"}, "reason": {"const": "bad_challenge"}, "fix": {"const": "The hub sent a challenge this phone could not read. Update the hub (bridged) and the helper app so both speak link protocol v1, then let the hub reconnect."}}},
+        {"properties": {"from": {"const": "phone"}, "reason": {"const": "key_unavailable"}, "fix": {"const": "This phone's link key cannot sign (the Android Keystore refused it). On the laptop, with the phone reachable over adb, run: agentroid link pair <serial> --rekey"}}},
+        {"properties": {"from": {"const": "hub"}, "reason": {"const": "unknown_device_key"}, "fix": {"const": "The hub has no record of this phone's link key. On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>"}}},
+        {"properties": {"from": {"const": "hub"}, "reason": {"const": "bad_phone_signature"}, "fix": {"const": "The phone's signature did not verify with the key the hub holds for it. On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>"}}},
+        {"properties": {"from": {"const": "hub"}, "reason": {"const": "key_revoked"}, "fix": {"const": "This phone's link key was revoked on the hub. To let the phone back in, on the laptop, with the phone reachable over adb, run: agentroid link pair <serial>"}}}
+      ]
+    },
+    "heartbeat": {
+      "description": "Phone -> hub every 15 s while charging or the screen is on, 60 s otherwise (period_s says which). Unsequenced. The beacon fields are merged in. The hub answers every heartbeat with an ack; the phone drops and redials after 2 x period_s + 5 s without any frame from the hub.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "ts_ms", "period_s", "ack", "tx_seq", "charging", "screen_on", "battery_pct", "adb_port", "adb_port_source", "wifi_adb", "a11y_enabled", "keeper", "bssid_trusted"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "heartbeat"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "ts_ms": {"description": "Phone wall clock, Unix ms.", "type": "integer", "minimum": 0},
+        "period_s": {"enum": [15, 60]},
+        "ack": {"$ref": "#/$defs/acked"},
+        "tx_seq": {"description": "Highest seq the phone has sent in this epoch; 0 when none.", "type": "integer", "minimum": 0},
+        "charging": {"type": "boolean"},
+        "screen_on": {"type": "boolean"},
+        "battery_pct": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+        "adb_port": {"description": "Wireless-debugging port found through NsdManager _adb-tls-connect._tcp; null when unknown.", "type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "adb_port_source": {"enum": ["nsd", "none"]},
+        "wifi_adb": {"description": "Settings.Global adb_wifi_enabled == 1; null when the keeper is absent (helper flavour).", "type": ["boolean", "null"]},
+        "a11y_enabled": {"type": ["boolean", "null"]},
+        "keeper": {"enum": ["ok", "untrusted_bssid", "no_wifi", "no_permission", "absent"]},
+        "bssid_trusted": {"type": ["boolean", "null"]}
+      }
+    },
+    "request": {
+      "description": "Hub -> phone. rpc is a JSON-RPC 2.0 request (the 2.5 helper methods) whose id equals the envelope id. Run only when epoch equals the epoch that reached ready and seq is exactly ack+1; a lower epoch is refused (stale_epoch) and never run.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "seq", "id", "rpc"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "request"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "seq": {"$ref": "#/$defs/seq"},
+        "id": {"$ref": "#/$defs/request_id"},
+        "rpc": {
+          "type": "object", "additionalProperties": false, "required": ["jsonrpc", "id", "method"],
+          "properties": {"jsonrpc": {"const": "2.0"}, "id": {"$ref": "#/$defs/request_id"}, "method": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$", "maxLength": 64}, "params": {"type": "object"}}
+        }
+      }
+    },
+    "response": {
+      "description": "Phone -> hub, sequenced, and kept in the phone's outbox until the hub acks its seq. replayed=true means it came from the request-id cache and nothing was run again.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "seq", "ack", "id", "replayed", "rpc"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "response"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "seq": {"$ref": "#/$defs/seq"},
+        "ack": {"$ref": "#/$defs/acked"},
+        "id": {"$ref": "#/$defs/request_id"},
+        "replayed": {"type": "boolean"},
+        "rpc": {
+          "type": "object", "required": ["jsonrpc", "id"], "additionalProperties": false,
+          "properties": {
+            "jsonrpc": {"const": "2.0"}, "id": {"$ref": "#/$defs/request_id"}, "result": true,
+            "error": {"type": "object", "required": ["code", "message"], "additionalProperties": false, "properties": {"code": {"type": "integer"}, "message": {"type": "string"}, "data": true}}
+          },
+          "oneOf": [{"required": ["result"]}, {"required": ["error"]}]
+        }
+      }
+    },
+    "ack": {
+      "description": "Either direction: everything up to and including seq ack in this epoch has been received. The hub acks every heartbeat, and phone frames at least every 64 frames or 1 s.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "ack"],
+      "properties": {"v": {"const": 1}, "t": {"const": "ack"}, "epoch": {"$ref": "#/$defs/epoch"}, "ack": {"$ref": "#/$defs/acked"}}
+    },
+    "resume": {
+      "description": "Either direction, once right after ready (and by the phone again whenever it sees a seq gap): 'I have everything from you up to last_acked; resend what follows'. Each side then resends its unacked frames with seq > last_acked, in order, with their original seq.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "last_acked"],
+      "properties": {"v": {"const": 1}, "t": {"const": "resume"}, "epoch": {"$ref": "#/$defs/epoch"}, "last_acked": {"$ref": "#/$defs/acked"}}
+    },
+    "refused": {
+      "description": "Phone -> hub, unsequenced, best effort: the request was NOT run and did not advance the phone's ack. stale_epoch: req_epoch < epoch (epoch fencing). epoch_ahead: req_epoch > epoch (re-challenge first). not_ready: no challenge has passed on this connection. out_of_order: seq was not ack+1 (the phone also sends resume). bad_request: the frame or rpc was malformed, or the id was reused for a different call.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "reason"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "refused"},
+        "epoch": {"description": "The phone's current epoch; 0 when not ready.", "type": "integer", "minimum": 0},
+        "reason": {"enum": ["stale_epoch", "epoch_ahead", "not_ready", "out_of_order", "bad_request"]},
+        "id": {"$ref": "#/$defs/request_id"},
+        "req_seq": {"type": "integer", "minimum": 0},
+        "req_epoch": {"type": "integer", "minimum": 0}
+      },
+      "allOf": [
+        {"if": {"properties": {"reason": {"enum": ["stale_epoch", "epoch_ahead"]}}}, "then": {"required": ["req_epoch"]}}
+      ]
+    },
+    "untrusted_bssid": {
+      "description": "Phone -> hub, sequenced like a response. The keeper did NOT re-assert wireless debugging because the current Wi-Fi BSSID is not on the hub-set trusted list (or cannot be read). One tap per mesh AP: the hub may add the bssid with the keeper.trust_bssids request.",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "seq", "ack", "bssid", "reason", "action", "ts_ms"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "untrusted_bssid"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "seq": {"$ref": "#/$defs/seq"},
+        "ack": {"$ref": "#/$defs/acked"},
+        "bssid": {"oneOf": [{"$ref": "#/$defs/bssid"}, {"type": "null"}]},
+        "reason": {"enum": ["not_in_trusted_list", "no_trusted_list", "bssid_unreadable"]},
+        "action": {"const": "wifi_adb_not_reasserted"},
+        "ts_ms": {"type": "integer", "minimum": 0}
+      },
+      "allOf": [
+        {"if": {"properties": {"reason": {"const": "bssid_unreadable"}}}, "then": {"properties": {"bssid": {"type": "null"}}}, "else": {"properties": {"bssid": {"type": "string"}}}}
+      ]
+    },
+    "segment": {
+      "description": "Hub -> phone, sequenced exactly like a request (same epoch fence, seq == ack + 1, same outbox and resume, the same request-id cache). segment is one signed on-phone runner segment, a schemas/segment.json object {segment, signature} (format v1, task 2.14), signed with the hub key the phone pinned at pairing. The phone verifies it (SegmentVerifier: signature, device, epoch, expiry, R0/R1 only; Phase 2 refuses R2+ with no approval channel) and answers with one ordinary response frame with the same id: its acceptance or refusal, as the result of method runner.segment. The run's report is pulled later with a request runner.report {segment_id}. That segment satisfies schemas/segment.json is checked in test_schemas.py (link_cross_checks).",
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "t", "epoch", "seq", "id", "segment"],
+      "properties": {
+        "v": {"const": 1}, "t": {"const": "segment"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "seq": {"$ref": "#/$defs/seq"},
+        "id": {"$ref": "#/$defs/request_id"},
+        "segment": {
+          "type": "object", "additionalProperties": false, "required": ["segment", "signature"],
+          "properties": {
+            "segment": {"type": "object", "required": ["v", "segment_id"], "properties": {"v": {"const": 1}, "segment_id": {"type": "string", "minLength": 1}}},
+            "signature": {
+              "type": "object", "additionalProperties": false, "required": ["alg", "key_id", "value"],
+              "properties": {"alg": {"const": "ECDSA-P256-SHA256"}, "key_id": {"$ref": "#/$defs/key_id"}, "value": {"type": "string", "pattern": "^[A-Za-z0-9+/]+={0,2}$"}}
+            }
+          }
+        }
+      }
+    },
+    "human_touch": {
+      "description": "Phone -> hub, sequenced like a response. The accessibility overlay saw a human touch on the touchscreen (not one of the helper's own gestures). touch_ms is when, and sent_ms is when this frame was made, both on the phone's SystemClock.elapsedRealtime(), so touch_ms <= sent_ms (checked in test_schemas.py). The daemon dates the touch on its own clock from the arrival (Daemon::phone_touch, PhoneClock::Elapsed): never earlier than it can have been, at worst a little late, so a person is never ignored.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "t", "epoch", "seq", "ack", "touch_ms", "sent_ms"],
+      "properties": {
+        "v": {"const": 1},
+        "t": {"const": "human_touch"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "seq": {"$ref": "#/$defs/seq"},
+        "ack": {"$ref": "#/$defs/acked"},
+        "touch_ms": {"type": "integer", "minimum": 0},
+        "sent_ms": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

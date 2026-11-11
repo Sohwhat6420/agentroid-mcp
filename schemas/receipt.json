@@ -1,0 +1,10 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/receipt.json","title":"Receipt card","type":"object",
+"required":["run_id","device","flow","steps_planned","steps_done","model_calls","tokens_in","tokens_out","pool","wall_time_s","phone_peak_c","battery_change","laptop_cpu_s","pauses","retries","errors"],"additionalProperties":false,
+"properties":{"run_id":{"type":"string","minLength":1},"device":{"type":"string","minLength":1},"flow":{"type":"string"},
+"steps_planned":{"type":"integer","minimum":0},"steps_done":{"type":"integer","minimum":0},
+"model_calls":{"type":"integer","minimum":0},"tokens_in":{"type":"integer","minimum":0},"tokens_out":{"type":"integer","minimum":0},
+"pool":{"type":"object","required":["name","usd"],"additionalProperties":false,"properties":{"name":{"type":"string","minLength":1},"usd":{"type":"number","minimum":0}}},
+"wall_time_s":{"type":"number","minimum":0},"phone_peak_c":{"type":["number","null"]},"battery_change":{"type":["number","null"]},"laptop_cpu_s":{"type":"number","minimum":0},
+"pauses":{"type":"object","required":["heat","human"],"additionalProperties":false,"properties":{"heat":{"type":"integer","minimum":0},"human":{"type":"integer","minimum":0}}},
+"retries":{"type":"integer","minimum":0},
+"errors":{"type":"array","items":{"type":"string"}}}}

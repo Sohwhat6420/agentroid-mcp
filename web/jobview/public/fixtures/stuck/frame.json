@@ -1,0 +1,20 @@
+{
+ "v": 1,
+ "run_id": "r-20261020-1302-7f3a",
+ "ts": "2026-10-20T05:37:35.305Z",
+ "bytes": 19434,
+ "w": 610,
+ "h": 1356,
+ "screen_w": 1220,
+ "screen_h": 2712,
+ "secure": false,
+ "display": 0,
+ "step_id": "s170",
+ "miss": {
+  "step_id": "s171",
+  "x": 260,
+  "y": 2003,
+  "selector": "id:camera:id/iso_chip",
+  "reason": "not in the accessibility tree"
+ }
+}

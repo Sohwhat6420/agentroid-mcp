@@ -1,0 +1,78 @@
+{
+ "ok": true,
+ "data": {
+  "text": "long_press ok",
+  "image_bytes": null
+ },
+ "header": {
+  "alias": {
+   "v": "poco-x6",
+   "age_s": 0
+  },
+  "model": {
+   "v": "POCO X6",
+   "age_s": 0
+  },
+  "mode": {
+   "v": "full",
+   "age_s": 0
+  },
+  "battery": {
+   "v": 81,
+   "age_s": 0
+  },
+  "powered": {
+   "v": false,
+   "age_s": 0
+  },
+  "temp_c": {
+   "v": 33.5,
+   "age_s": 0
+  },
+  "screen": {
+   "v": "on",
+   "age_s": 0
+  },
+  "lock": {
+   "v": "unlocked",
+   "age_s": 0
+  },
+  "foreground": {
+   "v": {
+    "package": "com.fixture.overlay",
+    "title": "Allow notifications?"
+   },
+   "age_s": 0
+  },
+  "focus_changed": {
+   "v": true,
+   "age_s": 0,
+   "title": "Allow notifications?"
+  },
+  "data_age_s": 0
+ },
+ "receipt": {
+  "run_id": "fixture-long_press",
+  "device": "DEVICE0000EXAMPLE",
+  "flow": "long_press",
+  "steps_planned": 1,
+  "steps_done": 1,
+  "model_calls": 0,
+  "tokens_in": 0,
+  "tokens_out": 0,
+  "pool": {
+   "name": "none",
+   "usd": 0
+  },
+  "wall_time_s": 0.42,
+  "phone_peak_c": 33.5,
+  "battery_change": 0,
+  "laptop_cpu_s": 0.01,
+  "pauses": {
+   "heat": 0,
+   "human": 0
+  },
+  "retries": 0,
+  "errors": []
+ }
+}

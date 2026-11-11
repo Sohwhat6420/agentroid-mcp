@@ -1,0 +1,1 @@
+[{"key":"miui_refresh_rate","ns":"secure","before":"ABSENT","applied":"60","owner":{"pid":1,"job_id":"j2","session":"s"},"ts":"2026-10-19T10:00:00Z"},{"key":"x","ns":"vendor","before":"0","applied":"1","owner":{"pid":2,"job_id":"j2","session":"s"},"ts":"2026-10-19T10:00:01Z"}]

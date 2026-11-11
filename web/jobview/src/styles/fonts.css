@@ -1,0 +1,5 @@
+/* Geist 400/600 and JetBrains Mono (variable), SIL OFL 1.1 (licences in src/fonts/). The same files the design
+   inlined (DESIGN §3), now served by bridged from the page's own origin: zero third-party requests. */
+@font-face{font-family:"Geist";font-weight:400;font-style:normal;font-display:swap;src:url(../fonts/geist-400.woff2) format("woff2")}
+@font-face{font-family:"Geist";font-weight:600;font-style:normal;font-display:swap;src:url(../fonts/geist-600.woff2) format("woff2")}
+@font-face{font-family:"JetBrains Mono";font-weight:100 800;font-style:normal;font-display:swap;src:url(../fonts/jetbrains-mono-var.woff2) format("woff2")}

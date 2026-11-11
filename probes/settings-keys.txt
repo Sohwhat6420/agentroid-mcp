@@ -1,0 +1,10 @@
+# Settings keys the profile records as present or absent (names only: values are never stored).
+# Generic AOSP keys plus the refresh-rate keys the display care task needs. Vendor-only keys go here too.
+peak_refresh_rate
+min_refresh_rate
+user_refresh_rate
+screen_brightness
+adb_wifi_enabled
+accessibility_enabled
+stay_on_while_plugged_in
+show_touches

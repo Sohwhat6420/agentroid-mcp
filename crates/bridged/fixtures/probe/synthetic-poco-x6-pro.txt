@@ -1,0 +1,94 @@
+# SYNTHETIC: written by hand in the real commands' output formats. Not captured from a phone.
+# Identifiers are placeholders. Format: a line "### <exact command>" starts that command's output.
+# Section order does not matter; a command with no section here "fails" for the fake runner.
+### getprop ro.serialno
+PLACEHOLDER-POCO-SERIAL
+### getprop ro.build.version.sdk
+35
+### getprop ro.build.version.release
+15
+### getprop ro.product.manufacturer
+Xiaomi
+### getprop ro.product.model
+POCO X6 Pro
+### getprop ro.build.version.oneui
+
+### getprop ro.mi.os.version.name
+OS2.0
+### getevent -pl
+add device 1: /dev/input/event2
+  name:     "synthetic-gpio-keys"
+  events:
+    KEY (0001): KEY_VOLUMEDOWN        KEY_VOLUMEUP          KEY_POWER
+  input props:
+    <none>
+add device 2: /dev/input/event3
+  name:     "synthetic-touchpad-decoy"
+  events:
+    KEY (0001): BTN_TOUCH
+    ABS (0003): ABS_MT_POSITION_X     : value 0, min 0, max 1219, fuzz 0 flat 0 resolution 0
+                ABS_MT_POSITION_Y     : value 0, min 0, max 2711, fuzz 0 flat 0 resolution 0
+  input props:
+    INPUT_PROP_POINTER
+add device 3: /dev/input/event5
+  name:     "synthetic-touchscreen"
+  events:
+    KEY (0001): BTN_TOUCH             BTN_TOOL_FINGER
+    ABS (0003): ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0 flat 0 resolution 0
+                ABS_MT_TOUCH_MAJOR    : value 0, min 0, max 255, fuzz 0 flat 0 resolution 0
+                ABS_MT_POSITION_X     : value 0, min 0, max 1219, fuzz 0 flat 0 resolution 0
+                ABS_MT_POSITION_Y     : value 0, min 0, max 2711, fuzz 0 flat 0 resolution 0
+                ABS_MT_TRACKING_ID    : value 0, min 0, max 65535, fuzz 0 flat 0 resolution 0
+  input props:
+    INPUT_PROP_DIRECT
+### settings list system
+peak_refresh_rate=120.0
+min_refresh_rate=60.0
+screen_brightness=102
+screen_off_timeout=60000
+### settings list secure
+accessibility_enabled=0
+### settings list global
+adb_wifi_enabled=1
+stay_on_while_plugged_in=0
+### cmd display
+Display manager commands:
+  help
+    Print this help text.
+### pm list features
+feature:android.hardware.touchscreen
+feature:android.hardware.touchscreen.multitouch.jazzhand
+feature:android.software.input_methods
+feature:android.software.live_wallpaper
+### dumpsys deviceidle
+Enabled: true
+mLightEnabled=true  mDeepEnabled=true
+### cmd appops get dev.agentroid.helper
+No operations.
+### cmd appops get com.android.shell
+No operations.
+### dumpsys input
+INPUT MANAGER (dumpsys input)
+Input Dispatcher State at time of dump:
+  FocusedApplications: <none>
+### wm size
+Physical size: 1220x2712
+### wm density
+Physical density: 440
+### ime list -s
+com.example.synthetic.ime.a/.ImeA
+com.example.synthetic.ime.b/.ImeB
+### dumpsys battery
+Current Battery Service state:
+  AC powered: false
+  USB powered: true
+  status: 2
+  level: 80
+  temperature: 301
+### dumpsys thermalservice
+IsStatusOverride: false
+Thermal Status: 0
+### dumpsys display
+DISPLAY MANAGER (dumpsys display)
+Display Devices: size=1
+  DisplayDeviceInfo{Built-in Screen: width=1220, height=2712, modeId=1, defaultModeId=1, supportedModes=[DisplayMode{id=1, width=1220, height=2712, fps=60.000004, alternativeRefreshRates=[]}, DisplayMode{id=2, width=1220, height=2712, fps=120.0, alternativeRefreshRates=[]}]}

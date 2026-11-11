@@ -1,0 +1,16 @@
+{
+  "classes": {
+    "R0": {
+      "step_kinds": ["read", "assert", "wait", "scroll", "back"],
+      "packages": ["*"]
+    },
+    "R1": {
+      "step_kinds": [
+        "tap_unique",
+        "settings_toggle_leased@com.android.settings",
+        "play_store_update@com.android.vending"
+      ],
+      "packages": ["com.android.settings", "com.android.chrome"]
+    }
+  }
+}

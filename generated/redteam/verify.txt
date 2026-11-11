@@ -1,0 +1,18 @@
+$ agentroid audit verify generated/redteam/audit.jsonl
+OK generated/redteam\audit.jsonl: 255 records (17 allowed, 224 blocked, 14 asked) across 1 file, head seq 255 c608fe6e97b25fa258596247e82309e6fae5c5c166ca7ac7e2a8b791351f9e73
+(exit 0)
+
+# audit-tampered.jsonl: line 41 edited, "decision":"blocked" -> "allowed"
+$ agentroid audit verify generated/redteam/audit-tampered.jsonl
+BROKEN generated/redteam\audit-tampered.jsonl: generated/redteam\audit-tampered.jsonl line 41: hash does not match the record's contents (this line was edited)
+(exit 1)
+
+# audit-rehashed.jsonl: the same edit, and the attacker recomputes that line's hash
+$ agentroid audit verify generated/redteam/audit-rehashed.jsonl
+BROKEN generated/redteam\audit-rehashed.jsonl: generated/redteam\audit-rehashed.jsonl line 42: prev does not match the previous record's hash (the previous line was edited, or lines were removed or reordered)
+(exit 1)
+
+# audit-cut.jsonl: the last 5 records removed (the head file kept)
+$ agentroid audit verify generated/redteam/audit-cut.jsonl
+BROKEN generated/redteam\audit-cut.jsonl: generated/redteam\audit-cut.jsonl line 251: the log ends at seq 250 but the head says seq 255 (c608fe6e97b2): records were cut off the end, or the head is stale
+(exit 1)

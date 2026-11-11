@@ -1,0 +1,1 @@
+1.541 ms per parse+classify+decide (debug build, 200 runs)

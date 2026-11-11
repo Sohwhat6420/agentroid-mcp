@@ -1,0 +1,158 @@
+# SYNTHETIC: written by hand in the real commands' output formats. Not captured from a phone.
+# A POCO X6 Pro on HyperOS 2 (Android 15). ONE switch wrong: RUN_ANY_IN_BACKGROUND is ignore. Identifiers are placeholders.
+# Format: a line "### <exact command>" starts that command's output. A command with no section "fails".
+### getprop ro.serialno
+PLACEHOLDER-POCO-SERIAL
+### getprop ro.build.version.sdk
+35
+### getprop ro.build.version.release
+15
+### getprop ro.product.manufacturer
+Xiaomi
+### getprop ro.product.model
+POCO X6 Pro
+### getprop ro.build.version.oneui
+
+### getprop ro.mi.os.version.name
+OS2.0
+### settings list global
+adb_enabled=1
+adb_wifi_enabled=1
+airplane_mode_on=0
+development_settings_enabled=1
+MILLET_NO_RESTRICT_APP=com.tailscale.ipn,dev.agentroid.helper
+stay_on_while_plugged_in=0
+wifi_on=1
+### settings list secure
+accessibility_enabled=1
+default_input_method=com.example.synthetic.ime.a/.ImeA
+enabled_accessibility_services=com.example.synthetic.artemis/com.example.synthetic.artemis.ArtemisService:dev.agentroid.helper/dev.agentroid.helper.a11y.HelperAccessibilityService
+location_mode=0
+touch_exploration_enabled=0
+### settings list system
+min_refresh_rate=60.0
+peak_refresh_rate=120.0
+screen_brightness=102
+screen_brightness_mode=1
+screen_off_timeout=60000
+### dumpsys deviceidle
+  Settings:
+    flex_time_short=+1m0s0ms
+    light_after_inactive_to=+3m0s0ms
+  Whitelist (except idle) system apps:
+    com.android.providers.downloads
+    com.android.vending
+  Whitelist system apps:
+    com.android.shell
+    com.google.android.gms
+  Whitelist user apps:
+    com.tailscale.ipn
+    dev.agentroid.helper
+  Whitelist (except idle) all app ids:
+    1000
+    10123
+  Whitelist user app ids:
+    10230
+    10301
+  mLightEnabled=true  mDeepEnabled=true
+  mForceIdle=false
+  mState=ACTIVE mLightState=ACTIVE
+### cmd appops get dev.agentroid.helper
+RUN_ANY_IN_BACKGROUND: ignore
+START_FOREGROUND: allow; time=+3m12s401ms ago
+SYSTEM_ALERT_WINDOW: allow
+MIUIOP(10007): allow
+MIUIOP(10008): allow; time=+2d1h4m ago
+MIUIOP(10021): allow
+MIUIOP(10023): allow
+MIUIOP(10053): allow
+### dumpsys package dev.agentroid.helper
+Packages:
+  Package [dev.agentroid.helper] (7d1c0e2):
+    userId=10301
+    pkg=Package{5a3b2f9 dev.agentroid.helper}
+    versionCode=1 minSdk=29 targetSdk=34
+    versionName=0.0.0
+    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ]
+    install permissions:
+      android.permission.FOREGROUND_SERVICE: granted=true
+      android.permission.INTERNET: granted=true
+      android.permission.RECEIVE_BOOT_COMPLETED: granted=true
+      android.permission.WRITE_SECURE_SETTINGS: granted=true
+    User 0: ceDataInode=0 installed=true hidden=false suspended=false stopped=false notLaunched=false enabled=0
+### pm list packages
+package:android
+package:com.android.chrome
+package:com.android.providers.downloads
+package:com.android.settings
+package:com.android.shell
+package:com.android.vending
+package:com.example.synthetic.artemis
+package:com.example.synthetic.ime.a
+package:com.example.synthetic.ime.b
+package:com.google.android.gms
+package:com.miui.powerkeeper
+package:com.miui.securitycenter
+package:com.tailscale.ipn
+package:com.xiaomi.mi_connect_service
+package:dev.agentroid.helper
+### ps -A -o NAME
+NAME
+init
+kthreadd
+logd
+servicemanager
+surfaceflinger
+zygote64
+system_server
+com.android.systemui
+com.miui.powerkeeper
+com.miui.securitycenter.remote
+com.tailscale.ipn
+dev.agentroid.helper
+dev.agentroid.helper:link
+adbd
+sh
+ps
+### getevent -pl
+add device 1: /dev/input/event2
+  name:     "synthetic-gpio-keys"
+  events:
+    KEY (0001): KEY_VOLUMEDOWN        KEY_VOLUMEUP          KEY_POWER
+  input props:
+    <none>
+add device 2: /dev/input/event5
+  name:     "synthetic-touchscreen"
+  events:
+    KEY (0001): BTN_TOUCH             BTN_TOOL_FINGER
+    ABS (0003): ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0 flat 0 resolution 0
+                ABS_MT_POSITION_X     : value 0, min 0, max 1219, fuzz 0 flat 0 resolution 0
+                ABS_MT_POSITION_Y     : value 0, min 0, max 2711, fuzz 0 flat 0 resolution 0
+                ABS_MT_TRACKING_ID    : value 0, min 0, max 65535, fuzz 0 flat 0 resolution 0
+  input props:
+    INPUT_PROP_DIRECT
+### dumpsys display
+DISPLAY MANAGER (dumpsys display)
+Display Devices: size=1
+  DisplayDeviceInfo{Built-in Screen: width=1220, height=2712, modeId=1, defaultModeId=1, supportedModes=[DisplayMode{id=1, width=1220, height=2712, fps=60.000004, alternativeRefreshRates=[]}, DisplayMode{id=2, width=1220, height=2712, fps=120.0, alternativeRefreshRates=[]}]}
+### pm list features
+feature:android.hardware.touchscreen
+feature:android.hardware.touchscreen.multitouch.jazzhand
+feature:android.software.input_methods
+### wm size
+Physical size: 1220x2712
+### wm density
+Physical density: 440
+### ime list -s
+com.example.synthetic.ime.a/.ImeA
+com.example.synthetic.ime.b/.ImeB
+### dumpsys battery
+Current Battery Service state:
+  AC powered: false
+  USB powered: true
+  status: 2
+  level: 80
+  temperature: 301
+### dumpsys thermalservice
+IsStatusOverride: false
+Thermal Status: 0

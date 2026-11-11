@@ -1,0 +1,8 @@
+ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)
+Display #0 (activities from top to bottom):
+  * Task{9a8b7c6 #31 type=standard A=10200:com.example.jobapp U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    * Hist  #0: ActivityRecord{5f1c2d3 u0 com.example.jobapp/.MainActivity t31}
+  ResumedActivity: ActivityRecord{5f1c2d3 u0 com.example.jobapp/.MainActivity t31}
+Display #2 (activities from top to bottom):
+  * Task{1b2c3d4 #50 type=standard A=10201:com.example.alreadyhidden U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+  ResumedActivity: ActivityRecord{6a7b8c9 u0 com.example.alreadyhidden/.Main t50}

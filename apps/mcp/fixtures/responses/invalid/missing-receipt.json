@@ -1,0 +1,53 @@
+{
+ "ok": true,
+ "data": {
+  "text": "ok"
+ },
+ "header": {
+  "alias": {
+   "v": "poco-x6",
+   "age_s": 0
+  },
+  "model": {
+   "v": "POCO X6",
+   "age_s": 0
+  },
+  "mode": {
+   "v": "full",
+   "age_s": 0
+  },
+  "battery": {
+   "v": 81,
+   "age_s": 0
+  },
+  "powered": {
+   "v": false,
+   "age_s": 0
+  },
+  "temp_c": {
+   "v": 33.5,
+   "age_s": 0
+  },
+  "screen": {
+   "v": "on",
+   "age_s": 0
+  },
+  "lock": {
+   "v": "unlocked",
+   "age_s": 0
+  },
+  "foreground": {
+   "v": {
+    "package": "com.fixture.overlay",
+    "title": "Allow notifications?"
+   },
+   "age_s": 0
+  },
+  "focus_changed": {
+   "v": true,
+   "age_s": 0,
+   "title": "Allow notifications?"
+  },
+  "data_age_s": 0
+ }
+}

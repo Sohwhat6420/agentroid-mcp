@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<!-- bridged replaces this value with a per-start random token when it serves the page (WIRING.md, controls) -->
+<meta name="agentroid-token" content="">
+<title>Connecting · Agentroid job</title>
+<!-- the theme is set before first paint, so a dark-mode visitor never sees a light flash. A file, not inline,
+     so bridged can send Content-Security-Policy: script-src 'self' (WIRING.md). -->
+<script src="theme-boot.js"></script>
+<link rel="stylesheet" href="/src/styles/fonts.css">
+<link rel="stylesheet" href="/src/styles/v2.css">
+<link rel="stylesheet" href="/src/styles/app.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the job</a>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="g-run" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><circle cx="8" cy="8" r="2.4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-cool" viewBox="0 0 16 16"><path d="M6.6 9.6V3a1.4 1.4 0 0 1 2.8 0v6.6a2.9 2.9 0 1 1-2.8 0z"/><path d="M12 3.2v4M10.6 5.9 12 7.3l1.4-1.4"/></symbol>
+  <symbol id="g-wait" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><path d="M6.3 6.3a1.8 1.8 0 1 1 2.5 1.6c-.5.3-.8.6-.8 1.2v.3"/><circle cx="8" cy="11.3" r=".5" fill="currentColor"/></symbol>
+  <symbol id="g-stuck" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><path d="M4.9 8h6.2"/></symbol>
+  <symbol id="g-paused" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><path d="M6.5 5.6v4.8M9.5 5.6v4.8"/></symbol>
+  <symbol id="g-taken" viewBox="0 0 16 16"><path d="M4 2.6l8.2 5.1-3.7 1 2.1 3.8-1.6.9-2.1-3.8L4 12.2z"/></symbol>
+  <symbol id="g-stopped" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" rx="1.2"/></symbol>
+  <symbol id="g-failed" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><path d="M5.9 5.9l4.2 4.2M10.1 5.9l-4.2 4.2"/></symbol>
+  <symbol id="g-done" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><path d="M5.2 8.2l1.9 1.9 3.7-3.9"/></symbol>
+  <symbol id="g-queued" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" stroke-dasharray="2 2.2"/></symbol>
+  <symbol id="g-retry" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M11.8 1.9v2.8H9"/></symbol>
+  <symbol id="g-skip" viewBox="0 0 16 16"><path d="M3 8h10" stroke-dasharray="2 2"/></symbol>
+  <symbol id="g-link" viewBox="0 0 16 16"><path d="M6.8 9.2a2.6 2.6 0 0 0 3.7 0l2-2a2.6 2.6 0 0 0-3.7-3.7l-.8.8"/><path d="M9.2 6.8a2.6 2.6 0 0 0-3.7 0l-2 2a2.6 2.6 0 0 0 3.7 3.7l.8-.8"/></symbol>
+  <symbol id="g-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.8"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></symbol>
+  <symbol id="g-moon" viewBox="0 0 16 16"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></symbol>
+  <symbol id="g-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7"/></symbol>
+</svg>
+
+<header class="top">
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <b>Agentroid</b><span class="sep" aria-hidden="true">/</span><span>Jobs</span><span class="sep" aria-hidden="true">/</span>
+    <span><b id="crumb-flow"><span class="sk sk-line sk-w120"></span></b> <span class="meta" id="crumb-meta"></span></span>
+  </nav>
+  <button class="btn quiet" id="pal-open" type="button" aria-haspopup="dialog" aria-controls="pal" aria-keyshortcuts="Control+K Meta+K">Commands <kbd id="pal-kbd">Ctrl K</kbd></button>
+  <label class="dev" id="fix" title="Fixture mode: shows recorded data so the page can be reviewed without the daemon. Not live." hidden>
+    <span class="tag">FIXTURE</span><span class="dev-label">Recorded scenario</span>
+    <select id="fix-select"></select>
+  </label>
+  <button class="btn quiet" id="theme" type="button" aria-label="Switch to dark theme"><svg class="g" aria-hidden="true"><use href="#g-moon"/></svg><span>Dark</span></button>
+</header>
+
+<main id="main" tabindex="-1" aria-busy="true">
+  <!-- First paint is a skeleton in the exact grid positions of the loaded page (static: no shimmer, no spinner). -->
+  <section class="band" id="band" aria-labelledby="state-word">
+    <div>
+      <div class="state-word-wrap" id="state-wrap">
+        <div class="state-head"><svg class="g" aria-hidden="true"><use id="state-glyph" href="#g-queued"/></svg><h1 id="state-word">Connecting…</h1></div>
+        <p id="state-sentence">Reading the job from the laptop. The page fills in when the first answer arrives.</p>
+        <p class="notice" id="notice" hidden></p>
+      </div>
+      <div class="ruler" id="ruler" role="progressbar" aria-label="Steps done" aria-valuemin="0"></div>
+      <div class="ruler-legend" id="ruler-legend"><span class="sk sk-line sk-w30"></span></div>
+    </div>
+    <dl class="figs" id="figs"><div><dt>Steps</dt><dd><span class="sk sk-fig"></span><span class="sk sk-line sk-w70"></span></dd></div><div><dt>Elapsed</dt><dd><span class="sk sk-fig"></span><span class="sk sk-line sk-w70"></span></dd></div><div><dt>Finish (estimate)</dt><dd><span class="sk sk-fig"></span><span class="sk sk-line sk-w70"></span></dd></div></dl>
+    <div class="controls" id="controls" role="group" aria-label="Job controls"><div class="ctl-row"><span class="sk sk-btn"></span><span class="sk sk-btn"></span><span class="sk sk-btn"></span></div></div>
+  </section>
+
+  <section class="receipt" id="receipt" aria-labelledby="rc-h" hidden></section>
+
+  <section class="frame-panel" aria-labelledby="frame-h">
+    <div class="sec-h"><h2 id="frame-h">Latest frame</h2><span class="age" id="frame-age"><span class="sk sk-line sk-w120"></span></span></div>
+    <div class="frame-box">
+      <figure class="phone" id="phone"><div class="screen" id="screen"><span class="sk sk-fill"></span></div><div class="stamp" id="stamp" hidden><span></span></div></figure>
+      <div class="frame-cap" id="frame-cap" aria-live="off"><span class="sk sk-line sk-w90"></span><span class="sk sk-line sk-w70"></span></div>
+    </div>
+  </section>
+
+  <div class="mid">
+    <section aria-labelledby="spine-h">
+      <div class="sec-h"><h2 id="spine-h">Where the time went</h2><div class="spine-legend" id="spine-legend"></div></div>
+      <div class="chart-wrap" id="chart-wrap" tabindex="0" role="group" aria-roledescription="time chart" aria-label="Battery temperature and pauses over time" aria-describedby="chart-desc chart-keys">
+        <svg id="chart" height="210" aria-hidden="true"></svg>
+        <div class="sk-chart" id="chart-sk" aria-hidden="true"><span class="sk sk-lane"></span><span class="sk sk-plot"></span></div>
+        <div class="tip" id="tip" role="status" aria-live="polite"></div>
+      </div>
+      <p class="chart-hint" id="chart-desc">Battery temperature in °C. Point at or tap the line to see why the job paused.</p>
+      <details class="keys"><summary>Chart keys</summary><p id="chart-keys">With the chart focused: <kbd>←</kbd> <kbd>→</kbd> move 30 s, <kbd>Shift</kbd> moves 5 min, <kbd>Home</kbd> and <kbd>End</kbd> jump to the ends, <kbd>Enter</kbd> opens that step.</p></details>
+    </section>
+
+    <section aria-labelledby="rec-h" class="rec">
+      <div class="sec-h"><h2 id="rec-h">Flight recorder</h2><span class="meta" id="rec-meta"></span></div>
+      <div class="scrub">
+        <div class="scrub-track" id="scrub-track" aria-hidden="true"></div>
+        <label class="sr-only" for="scrub">Scrub through steps</label>
+        <input type="range" id="scrub" min="1" max="1" value="1" step="1">
+        <div class="scrub-ends"><span id="scrub-start">Step 1</span><span id="scrub-end"></span></div>
+      </div>
+      <div class="detail" id="detail" aria-live="polite"><span class="sk sk-line sk-w50 sk-h18"></span><span class="sk sk-line sk-w90"></span><span class="sk sk-line sk-w70"></span></div>
+      <div class="filters" role="group" aria-label="Filter steps">
+        <button class="chip" type="button" data-f="all" aria-pressed="true">All steps</button>
+        <button class="chip" type="button" data-f="problems" aria-pressed="false">Retries and problems</button>
+        <button class="chip" type="button" data-f="pauses" aria-pressed="false">Pauses</button>
+        <button class="chip" type="button" id="raw-toggle" aria-pressed="false" aria-controls="raw">Raw events</button>
+      </div>
+      <div class="list" id="list" tabindex="-1"><ol class="sk-rows"><li><span class="sk sk-line sk-w70"></span></li><li><span class="sk sk-line sk-w50"></span></li><li><span class="sk sk-line sk-w70"></span></li><li><span class="sk sk-line sk-w90"></span></li><li><span class="sk sk-line sk-w50"></span></li><li><span class="sk sk-line sk-w70"></span></li></ol></div>
+      <pre class="raw" id="raw" hidden tabindex="0" aria-label="Raw NDJSON events, newest last"></pre>
+    </section>
+  </div>
+
+  <aside class="vitals" aria-labelledby="vit-h">
+    <div class="sec-h"><h2 id="vit-h">Phone</h2><span class="meta" id="link-meta"></span></div>
+    <div id="vitals"><div class="vital"><h3>Battery temperature</h3><span class="sk sk-big"></span><span class="sk sk-line sk-w70"></span></div><div class="vital"><h3>Battery</h3><span class="sk sk-big"></span><span class="sk sk-line sk-w90"></span></div></div>
+  </aside>
+</main>
+
+<dialog class="pal" id="pal" aria-labelledby="pal-h">
+  <h2 class="sr-only" id="pal-h">Commands</h2>
+  <div class="pal-in"><input id="pal-q" type="text" role="combobox" aria-expanded="true" aria-controls="pal-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" aria-label="Type a command or a step number" placeholder="Type a command or a step number"></div>
+  <ul class="pal-list" id="pal-list" role="listbox" aria-label="Commands"></ul>
+  <p class="pal-foot"><kbd>↑</kbd> <kbd>↓</kbd> move, <kbd>Enter</kbd> runs, <kbd>Esc</kbd> closes</p>
+</dialog>
+
+<footer>
+  <span>Keys: <kbd>Ctrl</kbd> <kbd>K</kbd> commands, <kbd>j</kbd> back to live, <kbd>f</kbd> last problem, <kbd>[</kbd> <kbd>]</kbd> previous and next step, <kbd>Esc</kbd> cancel</span>
+  <span id="source-label">Connecting to bridged on this laptop.</span>
+  <span>Times are SGT (UTC+8). Data is checked against <span class="mono">job-view.json</span> and <span class="mono">progress.json</span> v1.</span>
+</footer>
+<div class="sr-only" aria-live="assertive" id="announce"></div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

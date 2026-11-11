@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "t": "refused",
+  "epoch": 5,
+  "reason": "stale_epoch",
+  "id": "stale-1",
+  "req_seq": 99,
+  "req_epoch": 4
+}

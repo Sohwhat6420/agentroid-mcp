@@ -1,0 +1,1 @@
+{"flow":"recorded","version":1,"app":{"package":"com.android.settings","version_range":"*"},"steps":[{"id":"a","kind":"tap","select":{"ref":"r3fa91c"},"risk":"R1"},{"id":"b","kind":"wait","until":{"ref":"r00beef"},"timeout_ms":3000,"risk":"R0"}]}

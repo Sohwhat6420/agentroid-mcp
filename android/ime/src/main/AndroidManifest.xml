@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- EXPORTED: the system's input-method manager binds this service by intent, so it has to be exported.
+             Only the system can bind it: android:permission is BIND_INPUT_METHOD (signature). -->
+        <service
+            android:name="dev.agentroid.helper.ime.HelperInputMethodService"
+            android:exported="true"
+            android:label="@string/ime_label"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/ime_method" />
+        </service>
+    </application>
+</manifest>
+

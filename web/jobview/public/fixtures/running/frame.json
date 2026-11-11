@@ -1,0 +1,20 @@
+{
+ "v": 1,
+ "run_id": "r-20261020-1302-7f3a",
+ "ts": "2026-10-20T05:22:11Z",
+ "bytes": 23929,
+ "w": 610,
+ "h": 1356,
+ "screen_w": 1220,
+ "screen_h": 2712,
+ "secure": false,
+ "display": 0,
+ "step_id": "s127",
+ "next_tap": {
+  "step_id": "s128",
+  "x": 520,
+  "y": 2003,
+  "selector": "near_text:\"S\" > id:camera:id/shutter_dial",
+  "label": "Shutter to 1/250 s"
+ }
+}

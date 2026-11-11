@@ -1,0 +1,24 @@
+# doctor's read-only commands for a phone Agentroid drives (mode full or helper). task 2.7.
+# One exact command per line, sent as ONE shell argument (adb -s <target> shell "<line>"), 5 s timeout each.
+# Lines starting with # and blank lines are ignored. Every line must be plain (letters, digits, . _ - and
+# single spaces); a test checks that, and that no line holds a writing verb.
+# A read_only device (the protected phone) NEVER gets this file: it gets probes/readonly-s24.txt, through the probe's list.
+#
+# From probes/readonly.txt (the probe's read-only commands, reused):
+getprop ro.serialno
+getprop ro.build.version.sdk
+getprop ro.product.manufacturer
+getprop ro.product.model
+getprop ro.mi.os.version.name
+getprop ro.build.version.oneui
+settings list global
+settings list secure
+settings list system
+dumpsys deviceidle
+# doctor's own reads (not in the probe list):
+# cmd appops get dev.agentroid.helper is also in probes/readonly.txt since 20 Oct (it named com.agentroid.helper;
+# the helper's applicationId is dev.agentroid.helper, android/app); doctor keeps it here so it is sent in this order.
+cmd appops get dev.agentroid.helper
+dumpsys package dev.agentroid.helper
+pm list packages
+ps -A -o NAME

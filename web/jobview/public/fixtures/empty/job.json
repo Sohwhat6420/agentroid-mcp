@@ -1,0 +1,12 @@
+{
+ "job_id": "7f3a",
+ "run_id": "r-20261020-1302-7f3a",
+ "device": "POCO X6 Pro",
+ "flow": "camera-sweep-200",
+ "status": "queued",
+ "steps_planned": 200,
+ "steps_done": 0,
+ "events_url": "/jobs/7f3a/events",
+ "frame_url": "/jobs/7f3a/frame.jpg",
+ "changes_in_force": []
+}

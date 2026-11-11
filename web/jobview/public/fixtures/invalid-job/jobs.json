@@ -1,0 +1,18 @@
+[
+ {
+  "job_id": "j1",
+  "run_id": "r1",
+  "device": "d",
+  "flow": "f",
+  "status": "exploded"
+ },
+ {
+  "job_id": "9c1e",
+  "run_id": "r-20261020-0915-9c1e",
+  "device": "POCO F5 Pro",
+  "flow": "settings-audit",
+  "status": "done",
+  "steps_planned": 24,
+  "steps_done": 24
+ }
+]

@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "t": "response",
+  "epoch": 5,
+  "seq": 2,
+  "ack": 2,
+  "id": "ok-1",
+  "replayed": true,
+  "rpc": {
+    "jsonrpc": "2.0",
+    "id": "ok-1",
+    "result": {
+      "n": 1
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "needs_repair",
+  "from": "hub",
+  "reason": "bad_phone_signature",
+  "fix": "The phone's signature did not verify with the key the hub holds for it. On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>",
+  "epoch": 5
+}

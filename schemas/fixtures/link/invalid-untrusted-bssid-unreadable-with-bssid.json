@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "t": "untrusted_bssid",
+  "epoch": 5,
+  "seq": 5,
+  "ack": 3,
+  "bssid": "aa:bb:cc:dd:ee:01",
+  "reason": "bssid_unreadable",
+  "action": "wifi_adb_not_reasserted",
+  "ts_ms": 1760001000105
+}

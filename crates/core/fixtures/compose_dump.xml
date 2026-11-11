@@ -1,0 +1,14 @@
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0">
+<node class="android.view.View" text="" content-desc="" resource-id="" clickable="false" bounds="[0,0][1220,2712]">
+ <node class="android.view.View" text="" content-desc="" resource-id="" clickable="false" bounds="[0,300][1220,600]">
+  <node class="android.view.View" text="" content-desc="" resource-id="" clickable="true" bounds="[0,300][1220,600]"/>
+  <node class="android.widget.TextView" text="Shizuku" content-desc="" resource-id="" clickable="false" bounds="[200,330][800,400]"/>
+  <node class="android.widget.TextView" text="Xingchen &amp; Rikka" content-desc="" resource-id="" clickable="false" bounds="[200,410][800,470]"/>
+  <node class="android.widget.Button" text="Install" content-desc="" resource-id="" clickable="true" bounds="[900,380][1180,480]"/>
+ </node>
+ <node class="android.view.View" text="" content-desc="" resource-id="" clickable="false" bounds="[0,2500][1220,2712]">
+  <node class="android.view.View" text="" content-desc="" resource-id="" clickable="true" bounds="[600,2500][900,2712]">
+   <node class="android.widget.TextView" text="Search" content-desc="" resource-id="" clickable="false" bounds="[650,2620][850,2680]"/>
+  </node>
+ </node>
+</node></hierarchy>

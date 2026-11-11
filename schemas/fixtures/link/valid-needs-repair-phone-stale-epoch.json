@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "needs_repair",
+  "from": "phone",
+  "reason": "stale_epoch",
+  "fix": "A hub with an older epoch tried to take this phone. Stop the old hub process (only the newest hub may own a phone); the current hub then reconnects by itself.",
+  "epoch": 5
+}

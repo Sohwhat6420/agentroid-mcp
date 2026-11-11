@@ -1,0 +1,11 @@
+RootTask id=1 bounds=[0,0][1220,2712] displayId=0 userId=0
+ configuration={1.0 ?mcc?mnc [en_GB] ldltr sw443dp w443dp h985dp 440dpi nrml long port finger -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1220, 2712) mAppBounds=Rect(0, 0 - 1220, 2712) mWindowingMode=fullscreen} s.5}
+  taskId=31: com.example.jobapp/com.example.jobapp.MainActivity bounds=[0,0][1220,2712] userId=0 visible=true topActivity=ComponentInfo{com.example.jobapp/com.example.jobapp.MainActivity}
+RootTask id=7 bounds=[0,0][1220,2712] displayId=0 userId=0
+  taskId=7: com.example.launcher/com.example.launcher.Home bounds=[0,0][1220,2712] userId=0 visible=false topActivity=ComponentInfo{com.example.launcher/com.example.launcher.Home}
+RootTask id=40 bounds=[0,0][1220,2712] displayId=0 userId=0
+  taskId=40: com.example.twotask/com.example.twotask.Main bounds=[0,0][1220,2712] userId=0 visible=false topActivity=ComponentInfo{com.example.twotask/com.example.twotask.Main}
+RootTask id=41 bounds=[0,0][1220,2712] displayId=0 userId=0
+  taskId=41: com.example.twotask/com.example.twotask.Compose bounds=[0,0][1220,2712] userId=0 visible=false topActivity=ComponentInfo{com.example.twotask/com.example.twotask.Compose}
+Stack id=50 bounds=[0,0][1220,2712] displayId=2 userId=0
+  taskId=50: com.example.alreadyhidden/.Main bounds=[0,0][1220,2712] userId=0 visible=true topActivity=ComponentInfo{com.example.alreadyhidden/com.example.alreadyhidden.Main}

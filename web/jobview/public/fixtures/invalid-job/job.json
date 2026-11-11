@@ -1,0 +1,7 @@
+{
+ "job_id": "j1",
+ "run_id": "r1",
+ "device": "d",
+ "flow": "f",
+ "status": "exploded"
+}

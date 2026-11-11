@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- :overlay asks for no permission. TYPE_ACCESSIBILITY_OVERLAY windows need only the bound accessibility service
+     (the existing :a11y one), not SYSTEM_ALERT_WINDOW. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

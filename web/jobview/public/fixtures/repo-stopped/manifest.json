@@ -1,0 +1,12 @@
+{
+ "name": "repo-stopped",
+ "label": "Repo fixture: stopped with a change still in force",
+ "job_id": "j4",
+ "now": "2026-10-19T10:06:00Z",
+ "link": "fixture",
+ "files": [
+  "job.json",
+  "jobs.json",
+  "events.ndjson"
+ ]
+}

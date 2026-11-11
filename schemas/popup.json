@@ -1,0 +1,7 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/popup.json","title":"Pop-up rule","type":"object",
+"required":["package","window","button","action"],"additionalProperties":false,
+"properties":{"package":{"type":"string","minLength":1},
+"window":{"type":"object","minProperties":1,"maxProperties":1,"additionalProperties":false,"properties":{"title":{"type":"string"},"activity":{"type":"string"}}},
+"button":{"type":"string"},"action":{"enum":["tap","back","pause"]},"note":{"type":"string"},
+"oem":{"type":"string","minLength":1},
+"sdk_min":{"type":"integer","minimum":29},"sdk_max":{"type":"integer","minimum":29}}}

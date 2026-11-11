@@ -1,0 +1,21 @@
+[package]
+name = "agentroid-credstore"
+description = "Windows Credential Manager helper for the MCP HTTP listener's bearer tokens (task 2.6)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "credstore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "credstore"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }

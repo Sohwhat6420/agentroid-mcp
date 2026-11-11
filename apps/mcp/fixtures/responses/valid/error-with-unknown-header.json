@@ -1,0 +1,78 @@
+{
+ "ok": false,
+ "error": {
+  "kind": "transport",
+  "code": null,
+  "message": "cannot connect to bridged at \\\\.\\pipe\\agentroid: connect ENOENT (is bridged running?)"
+ },
+ "header": {
+  "alias": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "model": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "mode": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "battery": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "powered": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "temp_c": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "screen": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "lock": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "foreground": {
+   "v": "unknown",
+   "age_s": null
+  },
+  "focus_changed": {
+   "v": "unknown",
+   "age_s": null,
+   "title": null
+  },
+  "data_age_s": null
+ },
+ "receipt": {
+  "run_id": "fixture-x",
+  "device": "none",
+  "flow": "look",
+  "steps_planned": 1,
+  "steps_done": 0,
+  "model_calls": 0,
+  "tokens_in": 0,
+  "tokens_out": 0,
+  "pool": {
+   "name": "none",
+   "usd": 0
+  },
+  "wall_time_s": 0.01,
+  "phone_peak_c": null,
+  "battery_change": null,
+  "laptop_cpu_s": 0,
+  "pauses": {
+   "heat": 0,
+   "human": 0
+  },
+  "retries": 0,
+  "errors": [
+   "no bridged"
+  ]
+ }
+}

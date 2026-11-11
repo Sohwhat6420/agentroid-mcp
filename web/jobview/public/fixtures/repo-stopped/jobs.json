@@ -1,0 +1,34 @@
+[
+ {
+  "job_id": "j4",
+  "run_id": "r4",
+  "device": "poco-x6",
+  "flow": "camera-slice",
+  "status": "stopped",
+  "steps_planned": 20,
+  "steps_done": 7,
+  "changes_in_force": [
+   {
+    "key": "screen_brightness",
+    "ns": "system",
+    "before": "128",
+    "applied": "1",
+    "owner": {
+     "pid": 10,
+     "job_id": "j4",
+     "session": "s"
+    },
+    "scope": "job"
+   }
+  ]
+ },
+ {
+  "job_id": "9c1e",
+  "run_id": "r-20261020-0915-9c1e",
+  "device": "POCO F5 Pro",
+  "flow": "settings-audit",
+  "status": "done",
+  "steps_planned": 24,
+  "steps_done": 24
+ }
+]

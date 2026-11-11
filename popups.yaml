@@ -1,0 +1,76 @@
+# Pop-up rulebook (schema: schemas/popup.json; loader and policy:
+# crates/bridged/src/runner/popups.rs).
+#
+# A flat list. Each rule is the triple package + window (title or activity) + button; all three must
+# match on the same screen in the same package. `oem` / `sdk_min` / `sdk_max` scope a rule; a scoped
+# rule does not apply when the phone's OEM or SDK is unknown.
+#
+# Policy: only a button that leaves the phone's state unchanged is
+# tapped automatically (Got it, Not now, Later, Wait, Done, ...). A permission Allow always pauses,
+# whatever its rule says. Anything not listed here is needs_attention: the job pauses, keeps the
+# lease and reports only a crop rectangle. A per-job switch turns automatic dismissal off.
+#
+# Seeded from the field note's list. Window titles and button texts are the English UI strings as
+# ASSUMED here; none was read off a phone in this task. Check each on the POCO before relying on it.
+
+# HyperOS battery-saver sheet (field note 5). "Got it" leaves the battery setting as it is.
+- package: com.miui.powerkeeper
+  window: {title: "Battery saver"}
+  button: "Got it"
+  action: tap
+  oem: xiaomi
+  note: "HyperOS battery-saver sheet; Got it changes nothing"
+
+# Runtime permission dialogs. Allow is a state change, so these pause (never tapped).
+- package: com.google.android.permissioncontroller
+  window: {title: "Allow"}
+  button: "Allow"
+  action: pause
+  note: "Runtime permission dialog (GMS builds); Allow is a state change"
+- package: com.android.permissioncontroller
+  window: {title: "Allow"}
+  button: "Allow"
+  action: pause
+  note: "Runtime permission dialog (AOSP builds); Allow is a state change"
+- package: com.lbe.security.miui
+  window: {title: "Allow"}
+  button: "Allow"
+  action: pause
+  oem: xiaomi
+  note: "MIUI / HyperOS permission manager; Allow is a state change"
+
+# "App isn't responding". Wait keeps the app running; Close app would kill it, so never Close.
+- package: android
+  window: {title: "isn't responding"}
+  button: "Wait"
+  action: tap
+  note: "ANR dialog; Wait changes nothing"
+
+# Update prompts. Not now / Later postpone without installing anything.
+- package: com.android.vending
+  window: {title: "Update available"}
+  button: "Not now"
+  action: tap
+  note: "Play Store update prompt"
+- package: com.android.updater
+  window: {title: "System update"}
+  button: "Later"
+  action: tap
+  oem: xiaomi
+  note: "HyperOS system update prompt"
+
+# Low storage. Dismissing would let a job that writes files carry on into failure, so it pauses.
+- package: com.miui.securitycenter
+  window: {title: "Storage space running out"}
+  button: ""
+  action: pause
+  oem: xiaomi
+  note: "Low storage warning; pause and report"
+
+# Xiaomi's security scan after an install. Done closes the result sheet and changes nothing.
+- package: com.miui.securitycenter
+  window: {title: "Security scan"}
+  button: "Done"
+  action: tap
+  oem: xiaomi
+  note: "Post-install security scan result"

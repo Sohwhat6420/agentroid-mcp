@@ -1,0 +1,114 @@
+Agentroid
+Copyright 2026 Ethan Soh
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+Licences were looked up on 27 Oct 2026 (GitHub licence files and API,
+crates.io, source.android.com).
+
+------------------------------------------------------------------------------
+1. Code carried into this repository from other projects
+------------------------------------------------------------------------------
+
+Artemis (https://github.com/google/artemis)
+  Licence: Apache License 2.0. The repository has no NOTICE file.
+  Use: parts of the accessibility-tree walk in the Agentroid helper app
+  (multi-window enumeration sorted by layer, hash de-duplication and
+  active-window handling) follow HierarchyDumper.java from Artemis's
+  accessibility helper (packages/artemis-accessibility-helper,
+  com.artemis.helper), adapted. The attribution and the "modified" statement
+  are in the headers of these files under android/:
+    a11y/src/main/java/dev/agentroid/helper/a11y/A11yBridge.java
+      (windows(): the layer-sorted window walk, hash de-duplication and
+      active-window fallback)
+    a11y/src/main/java/dev/agentroid/helper/a11y/AndroidNode.java
+    core/src/main/java/dev/agentroid/helper/core/TreeSerializer.java
+      (node(): the node walk, adapted from the same source)
+
+android_env (https://github.com/google-deepmind/android_env)
+  Licence: Apache License 2.0.
+  Use: bench/androidworld/patch_android_env_windows.py embeds a few lines of
+  android_env's adb install code as the text to find and replace, and patches
+  a virtual-environment copy at run time. Those lines are upstream code; the
+  file's docstring carries the attribution.
+
+Earlier work by the same author
+  The command guard, shell-quoting helpers and several service patterns were
+  ported from the author's own earlier projects. They are the author's own work
+  and are covered by the copyright line above.
+
+The connection keeper (apps/keeper)
+  The author's own work, folded in from his separate agentroid-keeper
+  repository. That folder is under the MIT licence (apps/keeper/LICENSE);
+  the rest of the repository is Apache-2.0.
+
+------------------------------------------------------------------------------
+2. External tools and datasets used at run time (not bundled)
+------------------------------------------------------------------------------
+
+scrcpy (https://github.com/Genymobile/scrcpy) ........ Apache License 2.0
+  Started as a separate program. Agentroid builds its command line and parses
+  its output; no scrcpy source or binary is included.
+
+AndroidWorld (https://github.com/google-research/android_world) .. Apache-2.0
+  The benchmark harness for the scripts in bench/androidworld. It is installed
+  separately and imported, not vendored. bench/androidworld/action_map.py
+  re-implements the semantics of android_world's execute_adb_action from
+  reading it, with no copied code.
+
+UI Automator (Android Open Source Project) .......... Apache License 2.0
+  The platform's own "uiautomator dump" command is called through adb. When
+  that command cannot read a screen that never goes idle, bridged runs its
+  fallback reader, crates/bridged/assets/idle-free-dump/Dump.java (and the dex
+  built from it). The reader calls the device's own
+  /system/framework/uiautomator.jar by reflection, in the same order as AOSP's
+  DumpCommand (platform/frameworks/testing, uiautomator/cmds/uiautomator), with
+  a shorter idle wait. The call order follows that file; no source lines are
+  copied, and the file's header says so. Neither the jar nor any UI Automator
+  binary is included.
+
+------------------------------------------------------------------------------
+3. Third-party libraries
+------------------------------------------------------------------------------
+
+The libraries below were checked individually. The complete dependency lists
+are Cargo.lock, apps/mcp/package-lock.json and web/jobview/package-lock.json.
+
+OkHttp (https://github.com/square/okhttp) .......... Apache License 2.0
+  The helper app's WebSocket client (okhttp-jvm 5.5.0), bundled in the APK.
+Okio (https://github.com/square/okio) ............. Apache License 2.0
+  okio-jvm 3.18.1, bundled in the helper APK.
+Kotlin standard library (https://github.com/JetBrains/kotlin) ... Apache License 2.0
+  kotlin-stdlib 2.1.21, bundled in the helper APK.
+  These three are the only third-party libraries in the helper APK. The jars
+  carry no NOTICE file of their own.
+Model Context Protocol TypeScript SDK ............. MIT and Apache-2.0
+  (https://github.com/modelcontextprotocol/typescript-sdk)
+zod (https://github.com/colinhacks/zod) ............ MIT
+rquickjs (https://github.com/DelSkayn/rquickjs) .... MIT
+p256 (RustCrypto, https://crates.io/crates/p256) ... Apache-2.0 OR MIT
+Geist and JetBrains Mono fonts ................... SIL Open Font License 1.1
+  Bundled as woff2 files in web/jobview/src/fonts/. The licence texts sit
+  beside the fonts (LICENSE-Geist-OFL.txt, LICENSE-JetBrainsMono-OFL.txt).
+
+------------------------------------------------------------------------------
+4. Studied for design; no code incorporated
+------------------------------------------------------------------------------
+
+mobilerun-portal (https://github.com/droidrun/mobilerun-portal), AGPL-3.0:
+  ideas only; no code was read or copied.
+mobile-mcp (https://github.com/mobile-next/mobile-mcp), Apache-2.0: the
+  tool-surface taxonomy, and the content-identity idea behind stable refs
+  (crates/core/src/refs.rs says so in its header).
+REA (https://github.com/morluto/rea), MIT: MCP contract style.
+Midscene (https://github.com/web-infra-dev/midscene), MIT: flow grammar ideas.
+Open-AutoGLM (https://github.com/zai-org/Open-AutoGLM), Apache-2.0: the idea of
+  a takeover callback.
+
+------------------------------------------------------------------------------
+Trade marks
+------------------------------------------------------------------------------
+
+Android is a trade mark of Google LLC. Agentroid is an independent project and
+is not affiliated with, endorsed by or sponsored by Google, Anthropic or any
+project named above.

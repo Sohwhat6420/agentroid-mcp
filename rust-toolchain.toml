@@ -1,0 +1,6 @@
+# The Rust version every build uses, locally and in CI, so a new stable release cannot change
+# clippy's verdicts or the guard's behaviour under a contributor. Bump it on purpose, in its own commit.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

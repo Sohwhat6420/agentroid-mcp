@@ -1,0 +1,13 @@
+{
+ "name": "cooling",
+ "label": "Cooling (heat pause)",
+ "job_id": "7f3a",
+ "now": "2026-10-20T05:28:08.289Z",
+ "link": "fixture",
+ "files": [
+  "job.json",
+  "jobs.json",
+  "events.ndjson",
+  "frame.json"
+ ]
+}

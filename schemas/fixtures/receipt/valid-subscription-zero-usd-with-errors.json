@@ -1,0 +1,1 @@
+{"run_id":"r2","device":"f5-pro","flow":"login","steps_planned":5,"steps_done":3,"model_calls":0,"tokens_in":0,"tokens_out":0,"pool":{"name":"subscription","usd":0},"wall_time_s":12,"phone_peak_c":41.0,"battery_change":0,"laptop_cpu_s":0.4,"pauses":{"heat":2,"human":0},"retries":0,"errors":["step c: post-condition failed"]}

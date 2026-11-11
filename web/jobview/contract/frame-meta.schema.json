@@ -1,0 +1,20 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/frame-meta.json",
+"title":"PROPOSED by 2.11b (not yet in schemas/): metadata for the latest frame (GET /jobs/:id/frame.json). The JPEG itself is GET /jobs/:id/frame.jpg.",
+"type":"object","required":["v","run_id","ts","bytes","w","h","screen_w","screen_h","secure"],"additionalProperties":false,
+"properties":{
+ "v":{"const":1},
+ "run_id":{"type":"string","minLength":1},
+ "ts":{"type":"string","pattern":"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"},
+ "bytes":{"type":"integer","minimum":0,"maximum":61440,"description":"size of frame.jpg; 60 KB (61,440 bytes) at most"},
+ "w":{"type":"integer","minimum":1},"h":{"type":"integer","minimum":1},
+ "screen_w":{"type":"integer","minimum":1},"screen_h":{"type":"integer","minimum":1},
+ "secure":{"type":"boolean","description":"true when the foreground window has FLAG_SECURE: frame.jpg is then absent and bytes is 0"},
+ "display":{"type":"integer","minimum":0},
+ "step_id":{"type":"string","description":"the last step that had finished when the frame was taken"},
+ "next_tap":{"type":"object","required":["step_id","x","y","selector"],"additionalProperties":false,
+  "properties":{"step_id":{"type":"string","minLength":1},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},
+   "selector":{"type":"string","minLength":1},"label":{"type":"string"}}},
+ "miss":{"type":"object","required":["step_id","x","y","selector","reason"],"additionalProperties":false,
+  "properties":{"step_id":{"type":"string","minLength":1},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},
+   "selector":{"type":"string","minLength":1},"reason":{"type":"string","minLength":1}}}
+}}

@@ -1,0 +1,1 @@
+{"flow":"open-settings","version":1,"app":{"package":"com.android.settings","version_range":">=14"},"steps":[{"id":"s1","kind":"tap","select":{"text":"Display"}}]}

@@ -1,0 +1,12 @@
+{
+ "name": "empty",
+ "label": "Queued, no events yet",
+ "job_id": "7f3a",
+ "now": "2026-10-20T05:01:47Z",
+ "link": "fixture",
+ "files": [
+  "job.json",
+  "jobs.json",
+  "events.ndjson"
+ ]
+}

@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "needs_repair",
+  "from": "phone",
+  "reason": "stale_epoch",
+  "fix": "Something went wrong, try again.",
+  "epoch": 5
+}

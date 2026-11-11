@@ -1,0 +1,13 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/job-view.json","title":"Job view API object (GET /jobs/:id) or list (GET /jobs)",
+"oneOf":[{"$ref":"#/$defs/job"},{"type":"array","items":{"$ref":"#/$defs/job"}}],
+"$defs":{"job":{"type":"object","required":["job_id","run_id","device","flow","status"],"additionalProperties":false,
+"properties":{"job_id":{"type":"string","minLength":1},"run_id":{"type":"string","minLength":1},"device":{"type":"string"},"flow":{"type":"string"},
+"status":{"enum":["queued","running","paused","taken_over","stuck","stopped","done","error"]},
+"steps_planned":{"type":"integer","minimum":0},"steps_done":{"type":"integer","minimum":0},
+"events_url":{"type":"string","pattern":"^/jobs/[^/]+/events$"},"frame_url":{"type":"string","pattern":"^/jobs/[^/]+/frame\\.jpg$"},
+"changes_in_force":{"type":"array","items":{"type":"object","required":["key","before","applied","owner"],"additionalProperties":false,
+ "properties":{"key":{"type":"string","minLength":1},"ns":{"enum":["system","secure","global","vendor"]},"before":{"type":"string"},"applied":{"type":"string"},
+ "owner":{"type":"object","required":["pid","job_id","session"],"additionalProperties":false,"properties":{"pid":{"type":"integer","minimum":0},"job_id":{"type":"string"},"session":{"type":"string"}}},
+ "scope":{"enum":["session","job","until","permanent"]},
+ "expires":{"type":"string","pattern":"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"},
+ "ts":{"type":"string","pattern":"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"}}}}}}}}

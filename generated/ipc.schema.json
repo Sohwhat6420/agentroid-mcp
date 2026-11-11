@@ -1,0 +1,2035 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IpcApi",
+  "description": "Root of the generated schema: lists every request and response type so one file defines the lot.",
+  "type": "object",
+  "required": [
+    "device_call",
+    "devices_list",
+    "hello",
+    "job_dry_run",
+    "job_pause",
+    "job_receipt",
+    "job_resume",
+    "job_run_script",
+    "job_start",
+    "job_status",
+    "job_stop",
+    "lease_acquire",
+    "lease_release",
+    "lease_status",
+    "link_health",
+    "link_pair_status",
+    "link_segment",
+    "link_segment_report",
+    "rpc_request",
+    "rpc_response"
+  ],
+  "properties": {
+    "device_call": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/DeviceCallParams"
+        },
+        {
+          "$ref": "#/definitions/DeviceCallResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "devices_list": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/DevicesListParams"
+        },
+        {
+          "$ref": "#/definitions/DevicesListResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "hello": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/HelloParams"
+        },
+        {
+          "$ref": "#/definitions/HelloResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_dry_run": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobDryRunParams"
+        },
+        {
+          "$ref": "#/definitions/JobDryRunResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_pause": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobRef"
+        },
+        {
+          "$ref": "#/definitions/JobStatusResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_receipt": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobRef"
+        },
+        {
+          "$ref": "#/definitions/JobReceiptResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_resume": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobResumeParams"
+        },
+        {
+          "$ref": "#/definitions/JobStatusResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_run_script": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/RunScriptParams"
+        },
+        {
+          "$ref": "#/definitions/RunScriptResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_start": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobStartParams"
+        },
+        {
+          "$ref": "#/definitions/JobStartResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_status": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobRef"
+        },
+        {
+          "$ref": "#/definitions/JobStatusResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "job_stop": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/JobRef"
+        },
+        {
+          "$ref": "#/definitions/JobStopResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "lease_acquire": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LeaseAcquireParams"
+        },
+        {
+          "$ref": "#/definitions/Lease"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "lease_release": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LeaseReleaseParams"
+        },
+        {
+          "$ref": "#/definitions/LeaseReleaseResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "lease_status": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LeaseStatusParams"
+        },
+        {
+          "$ref": "#/definitions/LeaseStatusResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "link_health": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LinkHealthParams"
+        },
+        {
+          "$ref": "#/definitions/LinkHealthResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "link_pair_status": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LinkPairStatusParams"
+        },
+        {
+          "$ref": "#/definitions/LinkPairStatusResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "link_segment": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LinkSegmentParams"
+        },
+        {
+          "$ref": "#/definitions/LinkSegmentResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "link_segment_report": {
+      "type": "array",
+      "items": [
+        {
+          "$ref": "#/definitions/LinkSegmentReportParams"
+        },
+        {
+          "$ref": "#/definitions/LinkSegmentReportResult"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "rpc_request": {
+      "$ref": "#/definitions/RpcRequest"
+    },
+    "rpc_response": {
+      "$ref": "#/definitions/RpcResponse"
+    }
+  },
+  "definitions": {
+    "ChangeOwner": {
+      "description": "Who holds a settings lease.",
+      "type": "object",
+      "required": [
+        "job_id",
+        "pid",
+        "session"
+      ],
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "session": {
+          "type": "string"
+        }
+      }
+    },
+    "ChangeRow": {
+      "description": "One setting changed under a care lease: `key`, `before`, `applied`, `owner` (plus where and how long).",
+      "type": "object",
+      "required": [
+        "applied",
+        "before",
+        "key",
+        "ns",
+        "owner",
+        "scope",
+        "ts"
+      ],
+      "properties": {
+        "applied": {
+          "type": "string"
+        },
+        "before": {
+          "type": "string"
+        },
+        "expires": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "ns": {
+          "description": "`system`, `secure`, `global` or `vendor`.",
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/definitions/ChangeOwner"
+        },
+        "scope": {
+          "description": "`session`, `job`, `until` (`permanent` is R2 and refused in Phase 2).",
+          "type": "string"
+        },
+        "ts": {
+          "type": "string"
+        }
+      }
+    },
+    "DeviceCallParams": {
+      "type": "object",
+      "required": [
+        "call",
+        "device"
+      ],
+      "properties": {
+        "call": {
+          "$ref": "#/definitions/ToolCall"
+        },
+        "device": {
+          "type": "string"
+        }
+      }
+    },
+    "DeviceCallResult": {
+      "type": "object",
+      "required": [
+        "text",
+        "tool"
+      ],
+      "properties": {
+        "attempts": {
+          "description": "Attempts made (1 when nothing was retried).",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "health": {
+          "description": "The health member (2.4): `alias`, `model`, `mode`, `battery`, `powered`, `temp_c`, `screen`, `lock`, `foreground {package, title}` and `age_s`, as `apps/mcp/src/header.ts` reads it. Only what the call path itself saw: a field nobody read is absent, never guessed. Never absent from the reply.",
+          "default": null
+        },
+        "image_bytes": {
+          "description": "Size of the screenshot, when the call took one (bytes are not carried over this channel yet).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "rgb": {
+          "description": "`pixel_probe`: the colour, 0 to 255 each.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
+          },
+          "maxItems": 3,
+          "minItems": 3
+        },
+        "source": {
+          "description": "`ocr` when `text` was read from an element crop by OCR on the laptop (no image in the result).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "value": {
+          "description": "`set_value`: the value read back."
+        }
+      }
+    },
+    "DeviceRow": {
+      "type": "object",
+      "required": [
+        "device",
+        "hw_serial",
+        "mode",
+        "model",
+        "serial"
+      ],
+      "properties": {
+        "allowed": {
+          "description": "Can the phone be leased: on the allowlist (`--allow-serial`, `allow.txt`, `--allow-emulators`), or the protected phone (always `read_only`, ruled reads only). A listed phone that is not allowed is visible but every call and lease on it is refused. Older daemons do not send the field; a reader treats a missing value as allowed.",
+          "default": true,
+          "type": "boolean"
+        },
+        "changes_in_force": {
+          "description": "care's settings leases in force on this phone (2.13; the `changes_in_force` items of `schemas/job-view.json`). Empty when none, or when the daemon has no care configured.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ChangeRow"
+          }
+        },
+        "device": {
+          "description": "Lease key: the hardware serial, or the adb serial when none is known.",
+          "type": "string"
+        },
+        "holder": {
+          "description": "Current lease holder, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hw_serial": {
+          "type": "string"
+        },
+        "mode": {
+          "description": "`full`, `helper` or `read_only` (the protected phone is always `read_only`).",
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "serial": {
+          "type": "string"
+        }
+      }
+    },
+    "DevicesListParams": {
+      "type": "object"
+    },
+    "DevicesListResult": {
+      "type": "object",
+      "required": [
+        "devices"
+      ],
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DeviceRow"
+          }
+        }
+      }
+    },
+    "DryRunOverlay": {
+      "type": "object",
+      "required": [
+        "tree",
+        "verdict"
+      ],
+      "properties": {
+        "tree": {
+          "type": "string"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      }
+    },
+    "DryRunRow": {
+      "type": "object",
+      "required": [
+        "field",
+        "kind",
+        "selector",
+        "step_id",
+        "verdict"
+      ],
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "row": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selector": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": "string"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      }
+    },
+    "HelloParams": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "description": "A label for this session (for example the Claude Code session); it becomes the lease holder name.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "HelloResult": {
+      "type": "object",
+      "required": [
+        "capabilities",
+        "holder",
+        "name",
+        "protocol",
+        "version"
+      ],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "holder": {
+          "description": "The holder name this connection will use for leases.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "protocol": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "JobDryRunParams": {
+      "description": "`job.dry_run`: the flow against saved trees; the phone is not touched.",
+      "type": "object",
+      "required": [
+        "device",
+        "flow",
+        "trees"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "flow": true,
+        "trees": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SavedTreeParam"
+          }
+        }
+      }
+    },
+    "JobDryRunResult": {
+      "type": "object",
+      "required": [
+        "flow",
+        "matched",
+        "overlays",
+        "rows",
+        "text"
+      ],
+      "properties": {
+        "flow": {
+          "type": "string"
+        },
+        "matched": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "overlays": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunOverlay"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunRow"
+          }
+        },
+        "text": {
+          "description": "The same report as text.",
+          "type": "string"
+        }
+      }
+    },
+    "JobReceiptResult": {
+      "type": "object",
+      "required": [
+        "detail",
+        "receipt",
+        "run_id"
+      ],
+      "properties": {
+        "detail": {
+          "description": "The receipt panel's fields `receipt.json` has no slot for: outcome, steps retried / not run, time split into work / cooling / waiting, settings changed and restored, pop-ups dismissed."
+        },
+        "receipt": {
+          "description": "Exactly `schemas/receipt.json`."
+        },
+        "recording": {
+          "description": "For a job started with `record` that ended `done`: `{flow, maestro, steps, maestro_skipped}`, the two files written and what the Maestro export left as comments."
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "steps": {
+          "description": "One row per top-level step of the job's flow, in order: `{step_id, status, note}` where status is `done`, `failed`, `interrupted`, `running` or `not_run`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true
+        }
+      }
+    },
+    "JobRef": {
+      "description": "`job.status`, `job.pause`, `job.stop`, `job.receipt`.",
+      "type": "object",
+      "required": [
+        "run_id"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        }
+      }
+    },
+    "JobResumeParams": {
+      "type": "object",
+      "required": [
+        "run_id"
+      ],
+      "properties": {
+        "human_confirmed": {
+          "description": "A person confirmed: lets a `checkpoint` step that waits for a person pass. Default false.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        }
+      }
+    },
+    "JobStartParams": {
+      "description": "`job.start`. The job runs under the caller's lease and stops before its next acting step if that lease is lost. The caller releases the lease when it is done with the device.",
+      "type": "object",
+      "required": [
+        "device"
+      ],
+      "properties": {
+        "app": {
+          "description": "With `steps`: the package the steps run in (the engine relaunches it if it leaves the screen and treats it as the one expected app).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auto_dismiss": {
+          "description": "The per-job pop-up switch; default true.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "device": {
+          "type": "string"
+        },
+        "flow": {
+          "description": "An inline flow: a `schemas/flow.json` object, or the same flow as YAML text. Exactly one of `flow` and `steps` is given."
+        },
+        "oem": {
+          "description": "The phone's OEM (`xiaomi`), for OEM-scoped pop-up rules; unknown means they never apply.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "record": {
+          "description": "Record the run: if it ends `done`, `<run id>.flow.yaml` (a flow `job.start` replays) and `<run id>.maestro.yaml` (a Maestro export) are written beside the run directory. Secret variables' values are never saved. Default false.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "sdk": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "steps": {
+          "description": "`run_steps`: an ordered list of flow steps (`schemas/flow.json` `$defs/step`; a step with no `id` is numbered `s1`, `s2`, ...), run in order, stopping at the first failure. Needs `app`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true
+        },
+        "vars": {
+          "description": "Merged into the flow's `vars` (same names win here).",
+          "default": null,
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        }
+      }
+    },
+    "JobStartResult": {
+      "type": "object",
+      "required": [
+        "journal",
+        "progress",
+        "run_id",
+        "status"
+      ],
+      "properties": {
+        "journal": {
+          "description": "`journal.ndjson` of this run.",
+          "type": "string"
+        },
+        "progress": {
+          "description": "`progress.ndjson` of this run (2.11a tails it).",
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "JobStatusResult": {
+      "type": "object",
+      "required": [
+        "device",
+        "flow",
+        "journal_seq",
+        "line",
+        "retries",
+        "run_id",
+        "status",
+        "steps_done",
+        "steps_planned"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "flow": {
+          "type": "string"
+        },
+        "journal_seq": {
+          "description": "Records in the journal: the journal position.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "One short line: progress, step, last error, health.",
+          "type": "string"
+        },
+        "pause_reason": {
+          "description": "Why it paused (`unknown_overlay`, `unreadable_screen`, `unverified_intent`, ...).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retries": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "description": "`running`, `paused`, `stuck`, `stopped`, `done` or `error` (`schemas/job-view.json`).",
+          "type": "string"
+        },
+        "step_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "steps_done": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "steps_planned": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "JobStopResult": {
+      "type": "object",
+      "required": [
+        "journal_seq",
+        "run_id",
+        "status"
+      ],
+      "properties": {
+        "journal_seq": {
+          "description": "Records in the journal when it stopped.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "Lease": {
+      "description": "Mirrors `schemas/registry-lease.json`.",
+      "type": "object",
+      "required": [
+        "device",
+        "epoch",
+        "holder"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "holder": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeaseAcquireParams": {
+      "type": "object",
+      "required": [
+        "device"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        }
+      }
+    },
+    "LeaseReleaseParams": {
+      "type": "object",
+      "required": [
+        "device"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        }
+      }
+    },
+    "LeaseReleaseResult": {
+      "type": "object",
+      "required": [
+        "released"
+      ],
+      "properties": {
+        "released": {
+          "type": "boolean"
+        }
+      }
+    },
+    "LeaseStatusParams": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "description": "Only this device; default all leases.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "LeaseStatusResult": {
+      "type": "object",
+      "required": [
+        "leases"
+      ],
+      "properties": {
+        "leases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Lease"
+          }
+        }
+      }
+    },
+    "LinkHealthParams": {
+      "type": "object",
+      "required": [
+        "device"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        }
+      }
+    },
+    "LinkHealthResult": {
+      "type": "object",
+      "required": [
+        "connected",
+        "device",
+        "online",
+        "paired",
+        "reason",
+        "transport"
+      ],
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "device": {
+          "type": "string"
+        },
+        "lease_epoch": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "link_epoch": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "online": {
+          "type": "boolean"
+        },
+        "paired": {
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "One line: why this transport.",
+          "type": "string"
+        },
+        "transport": {
+          "description": "`link` when the paired link is up and not revoked, else `adb` (the fallback, under the same lease).",
+          "type": "string"
+        }
+      }
+    },
+    "LinkPairRow": {
+      "type": "object",
+      "required": [
+        "connected",
+        "device",
+        "key_id",
+        "needs_repair",
+        "online",
+        "pending_requests",
+        "revoked",
+        "superseded"
+      ],
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "device": {
+          "type": "string"
+        },
+        "epoch": {
+          "description": "The link epoch (one counter with the 2.8 lease epoch).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "key_id": {
+          "description": "The phone key's id (pinned at pairing).",
+          "type": "string"
+        },
+        "last_seen_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "needs_repair": {
+          "description": "The phone asked to be paired again.",
+          "type": "boolean"
+        },
+        "online": {
+          "type": "boolean"
+        },
+        "pending_requests": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "revoked": {
+          "type": "boolean"
+        },
+        "superseded": {
+          "description": "A newer hub owns the phone.",
+          "type": "boolean"
+        }
+      }
+    },
+    "LinkPairStatusParams": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "description": "Only this device; default every paired phone.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "LinkPairStatusResult": {
+      "type": "object",
+      "required": [
+        "devices"
+      ],
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LinkPairRow"
+          }
+        }
+      }
+    },
+    "LinkSegmentParams": {
+      "description": "`link.segment`: build, classify (Phase 2: R2+ and require_confirmation are refused; there is no approval channel), sign with the hub key and send one runner segment (`schemas/segment.json`) on the link's `segment` frame. Lease holder only; `read_only` devices are refused.",
+      "type": "object",
+      "required": [
+        "device",
+        "run_id",
+        "segment_id",
+        "steps"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "expires_in_s": {
+          "description": "Seconds until the segment expires; default 300.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "owned": {
+          "description": "The flow owns the app it drives (an owned app's own steps can be R1). Default false.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "segment_id": {
+          "type": "string"
+        },
+        "steps": {
+          "description": "`schemas/segment.json` steps (without the classification: the hub computes it).",
+          "type": "array",
+          "items": true
+        }
+      }
+    },
+    "LinkSegmentReportParams": {
+      "type": "object",
+      "required": [
+        "device",
+        "segment_id"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "segment_id": {
+          "type": "string"
+        }
+      }
+    },
+    "LinkSegmentReportResult": {
+      "type": "object",
+      "required": [
+        "findings",
+        "ok",
+        "outcome",
+        "report",
+        "segment_id"
+      ],
+      "properties": {
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ok": {
+          "description": "The supervisor found nothing wrong with the phone's report.",
+          "type": "boolean"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "report": true,
+        "segment_id": {
+          "type": "string"
+        }
+      }
+    },
+    "LinkSegmentResult": {
+      "type": "object",
+      "required": [
+        "classification",
+        "epoch",
+        "from_hub_cache",
+        "response",
+        "segment_id"
+      ],
+      "properties": {
+        "classification": {
+          "description": "The segment's class, computed by the hub (`R0` or `R1`).",
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "from_hub_cache": {
+          "description": "The hub answered from its request cache: nothing was sent twice.",
+          "type": "boolean"
+        },
+        "response": {
+          "description": "The phone's JSON-RPC answer to the segment."
+        },
+        "segment_id": {
+          "type": "string"
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "RpcRequest": {
+      "description": "A JSON-RPC request or notification (no `id`).",
+      "type": "object",
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "properties": {
+        "id": {
+          "description": "String, number or null; absent for notifications."
+        },
+        "jsonrpc": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      }
+    },
+    "RpcResponse": {
+      "description": "A JSON-RPC response: exactly one of `result` and `error`.",
+      "type": "object",
+      "required": [
+        "id",
+        "jsonrpc"
+      ],
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": true,
+        "jsonrpc": {
+          "type": "string"
+        },
+        "result": true
+      }
+    },
+    "RunScriptParams": {
+      "description": "`job.run_script`: JavaScript in the slice-c sandbox (`full` devices only; on any other device every binding is refused, and each refusal is journalled).",
+      "type": "object",
+      "required": [
+        "device",
+        "script"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "script": {
+          "type": "string"
+        }
+      }
+    },
+    "RunScriptResult": {
+      "type": "object",
+      "required": [
+        "calls",
+        "cpu_ms",
+        "journal",
+        "journalled_refusals",
+        "outcome",
+        "refusals",
+        "run_id",
+        "stdout",
+        "stdout_truncated",
+        "value",
+        "wall_ms"
+      ],
+      "properties": {
+        "calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "cpu_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "journal": {
+          "description": "`journal.ndjson` of this script run.",
+          "type": "string"
+        },
+        "journalled_refusals": {
+          "description": "Refusal records written to that journal (equals `refusals.len()` unless the disk failed).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "outcome": {
+          "description": "`ok`, `script_error`, `memory_limit`, `cpu_deadline`, `wall_deadline`, `call_cap`, `crashed`, `sandbox_error`.",
+          "type": "string"
+        },
+        "refusals": {
+          "description": "The sandbox's refusal records, as returned.",
+          "type": "array",
+          "items": true
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "stdout_truncated": {
+          "type": "boolean"
+        },
+        "value": true,
+        "wall_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SavedTreeParam": {
+      "type": "object",
+      "required": [
+        "name",
+        "xml"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "xml": {
+          "description": "A uiautomator dump.",
+          "type": "string"
+        }
+      }
+    },
+    "ToolCall": {
+      "description": "One tool call as `device.call` carries it: the tool and its arguments (flattened, so the JSON is `{\"tool\": \"tap\", \"x\": 1, ...}`) plus the three options every tool takes (2.4), which the daemon enforces: - `require`: selectors that must be on screen before the call (else nothing is done); - `retry`: at most [`MAX_RETRY`] more attempts when the call fails on the transport or its `verify` fails; - `verify`: one selector that must be on screen after the call.",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Screenshot plus UI tree (a read). The `element` and `ocr` options are not implemented in this build (always return an error).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "element": {
+              "default": null
+            },
+            "max_width": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "ocr": {
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "since": {
+              "description": "A snapshot id from an earlier read's header: answer with only what changed since.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "look"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A screenshot (a read).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "max_width": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "screenshot"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Press and hold a tree index or a point.",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "index": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "ms": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "ref": {
+              "description": "A stable ref (`r3fa91c`) from a tree listing: it names the same element after a scroll.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "space": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "long_press"
+              ]
+            },
+            "x": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "y": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "tool",
+            "x1",
+            "x2",
+            "y1",
+            "y2"
+          ],
+          "properties": {
+            "ms": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "space": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "swipe"
+              ]
+            },
+            "x1": {
+              "type": "number",
+              "format": "double"
+            },
+            "x2": {
+              "type": "number",
+              "format": "double"
+            },
+            "y1": {
+              "type": "number",
+              "format": "double"
+            },
+            "y2": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "`up`, `down`, `left` or `right`.",
+          "type": "object",
+          "required": [
+            "direction",
+            "tool"
+          ],
+          "properties": {
+            "direction": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "scroll"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "tool"
+          ],
+          "properties": {
+            "index": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "ref": {
+              "description": "A stable ref (`r3fa91c`) from a tree listing: it names the same element after a scroll.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "submit": {
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "type_text"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "tool"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "key"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "tool": {
+              "type": "string",
+              "enum": [
+                "unlock"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "package",
+            "tool"
+          ],
+          "properties": {
+            "package": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "open_app"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "tool",
+            "uri"
+          ],
+          "properties": {
+            "package": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "open_url"
+              ]
+            },
+            "uri": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "component",
+            "tool"
+          ],
+          "properties": {
+            "action": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "component": {
+              "type": "string"
+            },
+            "data": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "start_activity"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Installed packages containing `filter` (a read).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "filter": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "list_apps"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Wait (core caps one wait at 10 s).",
+          "type": "object",
+          "required": [
+            "seconds",
+            "tool"
+          ],
+          "properties": {
+            "seconds": {
+              "type": "number",
+              "format": "double"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "wait"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Set a text field to `value` (text fields only) and read it back from the tree. Targets: `element` (a selector) or `index`.",
+          "type": "object",
+          "required": [
+            "tool",
+            "value"
+          ],
+          "properties": {
+            "element": {
+              "default": null
+            },
+            "index": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "set_value"
+              ]
+            },
+            "value": true
+          }
+        },
+        {
+          "description": "The colour of one pixel (a read). Not implemented in this build (always returns an error).",
+          "type": "object",
+          "required": [
+            "tool",
+            "x",
+            "y"
+          ],
+          "properties": {
+            "space": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "pixel_probe"
+              ]
+            },
+            "x": {
+              "type": "number",
+              "format": "double"
+            },
+            "y": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "PLANNED, not implemented (doctor `diagnose`).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "diagnose": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "doctor"
+              ]
+            }
+          }
+        },
+        {
+          "description": "PLANNED, not implemented.",
+          "type": "object",
+          "required": [
+            "dir",
+            "tool"
+          ],
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "pull_new"
+              ]
+            }
+          }
+        },
+        {
+          "description": "PLANNED, not implemented.",
+          "type": "object",
+          "required": [
+            "local",
+            "phone_path",
+            "tool"
+          ],
+          "properties": {
+            "local": {
+              "type": "string"
+            },
+            "phone_path": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "push"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The UI tree (a read).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "interactive_only": {
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "since": {
+              "description": "A snapshot id from an earlier read's header: answer with only what changed since.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "ui_tree"
+              ]
+            }
+          }
+        },
+        {
+          "description": "`adb shell getprop <key>` (a read; the protected phone answers only `ro.serialno`).",
+          "type": "object",
+          "required": [
+            "key",
+            "tool"
+          ],
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "getprop"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Tap a tree index, or a point (`x`, `y` in `space`).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "index": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "ref": {
+              "description": "A stable ref (`r3fa91c`) from a tree listing: it names the same element after a scroll.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "space": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string",
+              "enum": [
+                "tap"
+              ]
+            },
+            "x": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "y": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "require": {
+          "description": "Selector objects (`id`, `text`, `desc`, `near_text`, `rel`), at most [`MAX_REQUIRE`].",
+          "type": "array",
+          "items": true
+        },
+        "retry": {
+          "description": "Extra attempts, 0 to [`MAX_RETRY`]; more is refused as invalid params.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "verify": true
+      }
+    }
+  }
+}

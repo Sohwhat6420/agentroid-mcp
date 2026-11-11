@@ -1,0 +1,28 @@
+{
+  "name": "pilot-20",
+  "chosen": "2026-10-26",
+  "source": "google-research/android_world android_world/registry.py (ANDROID_TASK_REGISTRY, 'main' on 26 Oct 2026)",
+  "why": "One or two tasks per app that the Android-only tool set can reach on a Pixel 6 / API 33 emulator with no extra apps beyond AndroidWorld's own. Mixed: 8 system settings, 2 clock, 1 composite, 9 app tasks that need typing and navigation. No task that needs the gallery import, clipboard-from-image, video or a call. Picked before any run, so the score cannot steer the pick.",
+  "tasks": [
+    "SystemBluetoothTurnOn",
+    "SystemBluetoothTurnOff",
+    "SystemWifiTurnOn",
+    "SystemWifiTurnOff",
+    "SystemBrightnessMax",
+    "SystemBrightnessMin",
+    "OpenAppTaskEval",
+    "TurnOffWifiAndTurnOnBluetooth",
+    "ClockTimerEntry",
+    "ClockStopWatchRunning",
+    "ContactsAddContact",
+    "MarkorCreateNote",
+    "MarkorCreateFolder",
+    "MarkorDeleteNote",
+    "MarkorEditNote",
+    "SimpleSmsSend",
+    "SimpleCalendarAddOneEvent",
+    "ExpenseAddSingle",
+    "RecipeAddSingleRecipe",
+    "CameraTakePhoto"
+  ]
+}

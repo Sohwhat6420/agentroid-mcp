@@ -1,0 +1,58 @@
+{
+  "detail": {
+    "measured": {
+      "battery_change": false,
+      "laptop_cpu_s": true,
+      "phone_peak_c": false
+    },
+    "outcome": "failed",
+    "phone_peak_c": null,
+    "popups_dismissed": [
+      {
+        "how": "tap \"Got it\" at (610,2475)",
+        "package": "com.miui.powerkeeper",
+        "rule": "com.miui.powerkeeper / title \"Battery saver\" / \"Got it\"",
+        "step_id": "bt"
+      }
+    ],
+    "settings_changed": [],
+    "steps": {
+      "done": 1,
+      "not_run": 2,
+      "planned": 3,
+      "retried": 1
+    },
+    "time_s": {
+      "cooling": 0.0,
+      "waiting": 2.0,
+      "wall": 12.3,
+      "work": 10.3
+    }
+  },
+  "receipt": {
+    "battery_change": null,
+    "device": "DEVICE0000EXAMPLE",
+    "errors": [
+      "late failed: assert text=\"Never there\": no element matched: text=\"Never there\""
+    ],
+    "flow": "t",
+    "laptop_cpu_s": 0.1,
+    "model_calls": 0,
+    "pauses": {
+      "heat": 0,
+      "human": 0
+    },
+    "phone_peak_c": null,
+    "pool": {
+      "name": "none",
+      "usd": 0
+    },
+    "retries": 1,
+    "run_id": "run-1",
+    "steps_done": 1,
+    "steps_planned": 3,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "wall_time_s": 12.3
+  }
+}

@@ -1,0 +1,3 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/registry-lease.json","title":"Device lease (2.8) {device, holder, epoch}","type":"object",
+"required":["device","holder","epoch"],"additionalProperties":false,
+"properties":{"device":{"type":"string","minLength":1},"holder":{"type":"string","minLength":1},"epoch":{"type":"integer","minimum":0}}}

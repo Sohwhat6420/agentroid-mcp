@@ -1,0 +1,1 @@
+{"job_id":"j4","run_id":"r4","device":"poco-x6","flow":"camera-slice","status":"stuck","changes_in_force":[{"key":"screen_brightness","applied":"1","owner":{"pid":10,"job_id":"j4","session":"s"}}]}

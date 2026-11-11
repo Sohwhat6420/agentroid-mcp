@@ -1,0 +1,1 @@
+{"run_id":"r1","device":"d","flow":"f","steps_planned":1,"steps_done":1,"model_calls":0,"tokens_in":1.5,"tokens_out":0,"pool":{"name":"p","usd":0},"wall_time_s":1,"phone_peak_c":30,"battery_change":0,"laptop_cpu_s":0,"pauses":{"heat":0,"human":0},"retries":0,"errors":[]}

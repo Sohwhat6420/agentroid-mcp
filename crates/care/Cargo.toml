@@ -1,0 +1,30 @@
+[package]
+name = "agentroid-care"
+description = "Task 2.13 Care, laptop side: heat guard, battery floor, settings leases, fake heat, migration, parallel phones"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "care"
+path = "src/lib.rs"
+
+[features]
+# `dumpsys battery set temp` (V3) exists only for guard-logic tests. It is compiled into this
+# crate's own unit tests (cfg(test)) and into nothing else unless a test harness turns this on.
+# bridged must never enable it.
+guard-logic-tests = []
+
+[dependencies]
+agentroid-adb-link = { path = "../adb-link" }
+agentroid-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+# Only to prove the 2.10c script shell tier still refuses `dumpsys battery set|reset` (R2).
+agentroid-sandbox = { path = "../sandbox" }

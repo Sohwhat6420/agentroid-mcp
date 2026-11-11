@@ -1,0 +1,21 @@
+{
+  "bundle": "agent",
+  "settings": {
+    "system:screen_brightness_mode": "0",
+    "system:screen_brightness": "1",
+    "system:peak_refresh_rate": "60",
+    "system:min_refresh_rate": "60",
+    "secure:miui_refresh_rate": "60",
+    "global:window_animation_scale": "0",
+    "global:transition_animation_scale": "0",
+    "global:animator_duration_scale": "0",
+    "secure:default_input_method": "dev.agentroid.helper/dev.agentroid.helper.ime.HelperInputMethodService",
+    "system:screen_off_timeout": "600000",
+    "global:stay_on_while_plugged_in": "7",
+    "global:heads_up_notifications_enabled": "0",
+    "global:wifi_scan_always_enabled": "0",
+    "global:ble_scan_always_enabled": "0"
+  },
+  "dnd_zen_rule": true,
+  "virtual_display": false
+}

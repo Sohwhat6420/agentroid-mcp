@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "t": "refused",
+  "epoch": 5,
+  "reason": "out_of_order",
+  "id": "gap-1",
+  "req_seq": 50,
+  "req_epoch": 5
+}

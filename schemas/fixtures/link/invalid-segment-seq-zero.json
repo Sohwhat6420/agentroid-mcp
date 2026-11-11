@@ -1,0 +1,70 @@
+{
+  "v": 1,
+  "t": "segment",
+  "epoch": 7,
+  "seq": 0,
+  "id": "seg-1",
+  "segment": {
+    "segment": {
+      "v": 1,
+      "segment_id": "seg-r1-tap",
+      "run_id": "run-fixture-1",
+      "device": "f1xture5erial",
+      "epoch": 7,
+      "owned": false,
+      "classification": "R1",
+      "expires": "2026-10-20T12:30:00Z",
+      "steps": [
+        {
+          "id": "s1",
+          "kind": "assert",
+          "package": "com.android.settings",
+          "select": {
+            "desc": "Search settings"
+          },
+          "post": {
+            "kind": "none"
+          },
+          "risk": "R0"
+        },
+        {
+          "id": "s2",
+          "kind": "tap",
+          "package": "com.android.settings",
+          "select": {
+            "text": "Network & internet"
+          },
+          "post": {
+            "kind": "present",
+            "select": {
+              "text": "Internet"
+            }
+          },
+          "risk": "R1",
+          "timeout_ms": 3000
+        },
+        {
+          "id": "s3",
+          "kind": "tap",
+          "package": "com.android.settings",
+          "select": {
+            "id": "com.android.settings:id/internet"
+          },
+          "post": {
+            "kind": "text_equals",
+            "select": {
+              "id": "android:id/title"
+            },
+            "text": "Internet"
+          },
+          "risk": "R1"
+        }
+      ]
+    },
+    "signature": {
+      "alg": "ECDSA-P256-SHA256",
+      "key_id": "6df2aa989240a4a4fc0bda6d5a4d308ca735b25553369e353fcc4c89f2d39c65",
+      "value": "MEUCIDrAOaoqt2fjVDBNPszsSOp+r+yuuTyNuqwcmUhx1BvnAiEAq4eeEMC73EZaD7dQDuTEbiTksajS00bfXK3+AYzRLPs="
+    }
+  }
+}

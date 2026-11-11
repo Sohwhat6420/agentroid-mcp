@@ -1,0 +1,9 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/lease-bundle.json","title":"Lease bundle (profiles/human.json, profiles/agent.json)","type":"object",
+"required":["bundle","settings"],"additionalProperties":false,
+"properties":{
+"bundle":{"enum":["human","agent"]},
+"settings":{"type":"object","minProperties":1,
+ "propertyNames":{"pattern":"^(system|secure|global|vendor):[A-Za-z0-9_.]+$"},
+ "additionalProperties":{"type":"string"}},
+"dnd_zen_rule":{"type":"boolean"},
+"virtual_display":{"type":"boolean"}}}

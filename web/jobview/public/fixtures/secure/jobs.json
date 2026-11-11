@@ -1,0 +1,63 @@
+[
+ {
+  "job_id": "7f3a",
+  "run_id": "r-20261020-1302-7f3a",
+  "device": "POCO X6 Pro",
+  "flow": "camera-sweep-200",
+  "status": "running",
+  "steps_planned": 200,
+  "steps_done": 61,
+  "events_url": "/jobs/7f3a/events",
+  "frame_url": "/jobs/7f3a/frame.jpg",
+  "changes_in_force": [
+   {
+    "key": "screen_brightness",
+    "ns": "system",
+    "before": "128",
+    "applied": "1",
+    "owner": {
+     "pid": 4127,
+     "job_id": "7f3a",
+     "session": "cli-0930"
+    },
+    "scope": "job",
+    "ts": "2026-10-20T05:02:05Z"
+   },
+   {
+    "key": "peak_refresh_rate",
+    "ns": "system",
+    "before": "120",
+    "applied": "60",
+    "owner": {
+     "pid": 4127,
+     "job_id": "7f3a",
+     "session": "cli-0930"
+    },
+    "scope": "job",
+    "ts": "2026-10-20T05:02:05Z"
+   },
+   {
+    "key": "screen_off_timeout",
+    "ns": "system",
+    "before": "30000",
+    "applied": "600000",
+    "owner": {
+     "pid": 4127,
+     "job_id": "7f3a",
+     "session": "cli-0930"
+    },
+    "scope": "job",
+    "ts": "2026-10-20T05:02:06Z"
+   }
+  ]
+ },
+ {
+  "job_id": "9c1e",
+  "run_id": "r-20261020-0915-9c1e",
+  "device": "POCO F5 Pro",
+  "flow": "settings-audit",
+  "status": "done",
+  "steps_planned": 24,
+  "steps_done": 24
+ }
+]

@@ -1,0 +1,29 @@
+# The full read-only probe list. Run on a phone Agentroid drives.
+# One exact command per line, matched whole: no arguments beyond those written here, no metacharacters.
+# Each line is sent as ONE shell argument (adb -s <target> shell "<line>"), 5 s timeout each.
+# Lines starting with # and blank lines are ignored.
+# `cmd appops get <pkg>`: the packages are the fixed lines below; a caller never supplies one.
+# A read_only device runs only readonly-s24.txt (a reviewed subset), never this file.
+getprop ro.serialno
+getprop ro.build.version.sdk
+getprop ro.build.version.release
+getprop ro.product.manufacturer
+getprop ro.product.model
+getprop ro.build.version.oneui
+getprop ro.mi.os.version.name
+getevent -pl
+settings list system
+settings list secure
+settings list global
+cmd display
+dumpsys display
+pm list features
+dumpsys deviceidle
+cmd appops get dev.agentroid.helper
+cmd appops get com.android.shell
+dumpsys input
+wm size
+wm density
+ime list -s
+dumpsys battery
+dumpsys thermalservice

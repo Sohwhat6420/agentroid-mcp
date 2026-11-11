@@ -1,0 +1,17 @@
+[package]
+name = "agentroid-handover"
+description = "Task 2.15: agent mode and human mode (touch detector 1, mode state machine, virtual-display handover and clash rules)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "handover"
+path = "src/lib.rs"
+
+[dependencies]
+# The guarded runner and the getevent argv shapes (full devices only, never the protected phone), plus the Clock seam.
+agentroid-adb-link = { path = "../adb-link" }
+# Parsing profiles/human.json and profiles/agent.json (already in Cargo.lock through bridged).
+serde_json = "1"

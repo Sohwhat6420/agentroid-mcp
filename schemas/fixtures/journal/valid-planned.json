@@ -1,0 +1,1 @@
+{"v":1,"run_id":"r1","seq":0,"step_id":"s1","intent":"tap Display","post":{"kind":"activity_is","activity":"DisplaySettings"},"status":"planned","ts_phone":"2026-10-19T10:00:00.123Z","ts_hub":"2026-10-19T10:00:00.150Z","epoch":3,"display":0}

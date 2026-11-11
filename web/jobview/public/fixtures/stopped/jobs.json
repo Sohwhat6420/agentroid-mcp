@@ -1,0 +1,23 @@
+[
+ {
+  "job_id": "7f3a",
+  "run_id": "r-20261020-1302-7f3a",
+  "device": "POCO X6 Pro",
+  "flow": "camera-sweep-200",
+  "status": "stopped",
+  "steps_planned": 200,
+  "steps_done": 120,
+  "events_url": "/jobs/7f3a/events",
+  "frame_url": "/jobs/7f3a/frame.jpg",
+  "changes_in_force": []
+ },
+ {
+  "job_id": "9c1e",
+  "run_id": "r-20261020-0915-9c1e",
+  "device": "POCO F5 Pro",
+  "flow": "settings-audit",
+  "status": "done",
+  "steps_planned": 24,
+  "steps_done": 24
+ }
+]

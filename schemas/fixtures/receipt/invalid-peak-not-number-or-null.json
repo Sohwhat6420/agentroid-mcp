@@ -1,0 +1,1 @@
+{"run_id":"r1","device":"poco-x6","flow":"open-settings","steps_planned":10,"steps_done":10,"model_calls":4,"tokens_in":12000,"tokens_out":800,"pool":{"name":"anthropic-api","usd":0.0421},"wall_time_s":93.5,"phone_peak_c":"hot","battery_change":-2,"laptop_cpu_s":4.1,"pauses":{"heat":0,"human":1},"retries":2,"errors":[]}

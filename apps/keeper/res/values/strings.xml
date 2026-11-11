@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agentroid Keeper</string>
+    <string name="desc">Agentroid keeper: keeps Wireless debugging (adb_wifi_enabled) on across Wi-Fi changes, boots and a 15-minute backstop. No listening socket.</string>
+</resources>

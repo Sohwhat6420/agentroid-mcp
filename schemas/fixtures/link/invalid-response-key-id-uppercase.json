@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "challenge_response",
+  "epoch": 5,
+  "nonce": "UxP+VOV5AblEc1P4MfPKpPk7G0LluTwfq1okkhTMlUQ=",
+  "key_id": "679CA2E20EA98DEB26E7F905175C49077D98B1068E3E1DFA80847CC7C39CD58A",
+  "signature": "MEYCIQCIv/DwFrN41E+AOLPYi/JjDxOWjCIFuh43wFNrX3R2MwIhAOqIZ6dX181RQgZPo1DdGjjs6WIsLoziPjvTmaKaKKWI"
+}

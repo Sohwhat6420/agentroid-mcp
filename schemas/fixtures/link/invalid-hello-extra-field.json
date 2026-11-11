@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "t": "hello",
+  "key_id": "679ca2e20ea98deb26e7f905175c49077d98b1068e3e1dfa80847cc7c39cd58a",
+  "alg": "SHA256withECDSA",
+  "phone_nonce": "TwwzTDIWxVmWZok1AmxcHtJJOOYGii4DHqAMDMiNnjE=",
+  "instance": "33ac72f95a22ef5e1b53c604d5ee7c55",
+  "helper_version": "0.2.0-test",
+  "sdk": 34,
+  "state": "pending_auth",
+  "epoch_seen": 0,
+  "serial": "POCOX6TEST01"
+}

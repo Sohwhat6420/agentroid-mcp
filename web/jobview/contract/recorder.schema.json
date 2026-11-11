@@ -1,0 +1,16 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/recorder.json",
+"title":"PROPOSED by 2.11b (not yet in schemas/): the flight-recorder summary for a stuck or failed step (GET /jobs/:id/recorder.json). 2.11a dumps the last 10 trees and 3 frames on stuck; the view shows one crop.",
+"type":"object","required":["v","run_id","ts","step_id","reason","trees","frames","crop"],"additionalProperties":false,
+"properties":{
+ "v":{"const":1},
+ "run_id":{"type":"string","minLength":1},
+ "ts":{"type":"string","pattern":"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"},
+ "step_id":{"type":"string","minLength":1},
+ "reason":{"type":"string","minLength":1},
+ "trees":{"type":"integer","minimum":0,"maximum":10},
+ "frames":{"type":"integer","minimum":0,"maximum":3},
+ "crop":{"type":"object","required":["url","x","y","w","h","bytes"],"additionalProperties":false,
+  "properties":{"url":{"type":"string","pattern":"^/jobs/[^/]+/recorder/crop\\.jpg$"},
+   "x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"w":{"type":"integer","minimum":1},"h":{"type":"integer","minimum":1},
+   "bytes":{"type":"integer","minimum":0,"maximum":61440}}}
+}}

@@ -1,0 +1,25 @@
+# SYNTHETIC: the answers to the 10 approved S24 commands, in the real formats. Not captured from the protected phone.
+### getprop ro.serialno
+PLACEHOLDER-S24-SERIAL
+### getprop ro.build.version.sdk
+36
+### getprop ro.build.version.release
+16
+### getprop ro.product.model
+SM-SYNTHETIC
+### getprop ro.build.version.oneui
+80000
+### wm size
+Physical size: 1440x3120
+### wm density
+Physical density: 600
+### pm list features
+feature:android.hardware.touchscreen
+feature:android.software.app_functions
+### dumpsys battery
+Current Battery Service state:
+  level: 90
+  temperature: 290
+### dumpsys thermalservice
+IsStatusOverride: false
+Thermal Status: 0

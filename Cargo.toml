@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/adb-link", "crates/core", "crates/bridged", "crates/mcp", "crates/sandbox", "crates/credstore", "crates/setup", "crates/care", "crates/handover", "crates/segments", "crates/link-hub"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Apache-2.0"
+publish = false
+
+# Disk (11 Nov 2026, C: under 25 GB): full debuginfo plus the incremental cache reached 12 GB in target/debug.
+# Line tables keep panics and backtraces readable at a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false

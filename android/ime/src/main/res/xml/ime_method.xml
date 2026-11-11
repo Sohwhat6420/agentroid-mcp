@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- No settings activity and no subtypes: this keyboard has no UI, it only commits text sent over the link. -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android" />

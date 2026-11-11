@@ -1,0 +1,1 @@
+{"classes":{"R0":{"step_kinds":["read","wait","assert"],"packages":["*"]},"R1":{"step_kinds":["tap","route"],"packages":["com.android.vending"]}}}

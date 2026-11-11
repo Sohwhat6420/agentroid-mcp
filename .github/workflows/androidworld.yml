@@ -1,0 +1,186 @@
+name: androidworld
+
+# Manual trigger only. No pull_request triggers, so a fork can never reach the secret.
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "control = stopwatch positive control only (no model, no secret); run2 = verifier, guard as of run 2; run3 = verifier+screens, fixed guard"
+        required: true
+        default: control
+        type: choice
+        options: [control, run2, run3]
+      tasks:
+        description: "all = the 116; smoke = 2 cheap tasks; or a comma list"
+        default: smoke
+      shards:
+        description: "number of shards (7-9 tasks each keeps a shard under the usage cap)"
+        default: "13"
+      usd_cap:
+        description: "per-shard cap on the API-equivalent cost counter; the shard stops after the current task"
+        default: "20"
+
+permissions:
+  contents: read
+  actions: read   # lets a running shard read the BENCH_STOP repo variable (gate 1 checks that it can)
+
+concurrency:
+  group: androidworld-${{ inputs.config }}
+  cancel-in-progress: false
+
+env:
+  ANDROID_WORLD_COMMIT: 55ddaf5edc6f6c25673aed343907d5b9dca66f84   # the laptop venv's commit
+  CLAUDE_CODE_VERSION: 2.1.322                                        # the laptop's claude version
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # One binary for both configs: run2 sets AGENTROID_NO_IDLE_FALLBACK=1 at run time (the guard as run 2 had it;
+      # fix (a) only changes the audit's reason text).
+      - run: cargo build --locked -p agentroid-bridged -p agentroid-sandbox
+      - run: cargo test --locked -p agentroid-bridged -p agentroid-core
+      - id: plan
+        env:   # inputs go through env, never straight into the shell line
+          TASKS: ${{ inputs.tasks }}
+          SHARDS: ${{ inputs.shards }}
+          CONFIG: ${{ inputs.config }}
+        run: python3 -B bench/androidworld/ci/plan_shards.py --tasks "$TASKS" --shards "$SHARDS" --config "$CONFIG" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bins
+          path: |
+            target/debug/bridged
+            target/debug/agentroid-sandbox
+          retention-days: 3
+
+  control:
+    # The positive control: a running stopwatch blinds `uiautomator dump`; the fallback must still read it.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bins
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: AndroidWorldAvd
+          disable-animations: false
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics -gpu swiftshader_indirect -grpc 8554
+          script: bash bench/androidworld/ci/control.sh control   # pushes the dex, then probe_idle_dump.py --no-restart --fallback "<the bridged command>"
+      - name: Can a running job read BENCH_STOP? (create the variable as 0 before gate 1)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if v=$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/BENCH_STOP" --jq .value 2>/dev/null); then
+            echo "live BENCH_STOP read works (value $v)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "live BENCH_STOP read FAILED: only the start-of-shard check will apply" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: control-${{ inputs.config }}
+          path: control
+
+  bench:
+    needs: [build, control]
+    if: inputs.config != 'control'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300          # under the 6 h job limit; a shard is about 1-1.5 h
+    environment: bench            # the only place CLAUDE_CODE_OAUTH_TOKEN exists; main branch only
+    strategy:
+      fail-fast: false
+      max-parallel: 3             # the 3-at-a-time rule
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bins
+      - run: chmod +x target/debug/bridged target/debug/agentroid-sandbox
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: AndroidWorld at the laptop's commit (its requirements, then the package)
+        run: |
+          git clone --filter=blob:none https://github.com/google-research/android_world.git /tmp/aw
+          git -C /tmp/aw checkout "${ANDROID_WORLD_COMMIT}"
+          pip install -r /tmp/aw/requirements.txt && pip install /tmp/aw
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }   # the MCP server runs its TypeScript source with --experimental-strip-types (laptop: 22.17)
+      - run: npm ci
+        working-directory: apps/mcp
+      - run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          AGENTROID_BRIDGED: ${{ github.workspace }}/target/debug/bridged
+          AGENTROID_USD_CAP: ${{ inputs.usd_cap }}
+          AGENTROID_NO_IDLE_FALLBACK: ${{ inputs.config == 'run2' && '1' || '' }}
+          BENCH_STOP_AT_START: ${{ vars.BENCH_STOP }}   # the maintainer's usage stop, as it was when this shard started
+          GH_TOKEN: ${{ github.token }}                 # read-only; the shard polls BENCH_STOP with it before each task
+          CONFIG: ${{ inputs.config }}
+          SHARD: ${{ matrix.shard }}
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: AndroidWorldAvd
+          disable-animations: false
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics -gpu swiftshader_indirect -grpc 8554
+          script: bash bench/androidworld/ci/run_shard.sh "$CONFIG" "$SHARD"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: results-${{ inputs.config }}-${{ strategy.job-index }}
+          path: out/
+          retention-days: 30
+
+  merge:
+    needs: bench
+    if: always() && needs.bench.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "results-${{ inputs.config }}-*"
+          path: shards
+      - env:
+          TASKS: ${{ inputs.tasks }}
+          CONFIG: ${{ inputs.config }}
+        run: python3 -B bench/androidworld/ci/merge_shards.py shards --config "$CONFIG" --tasks "$TASKS" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: merged-${{ inputs.config }}
+          path: shards/ci-merged.json
+          retention-days: 90

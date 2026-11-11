@@ -1,0 +1,39 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Exactly these five and no others; KeeperTest checks it.
+         WRITE_SECURE_SETTINGS is granted only by `pm grant` over adb, and the hub refuses that on a read_only device. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application>
+        <!-- NOT exported: BOOT_COMPLETED / LOCKED_BOOT_COMPLETED are protected system broadcasts. -->
+        <receiver
+            android:name="dev.agentroid.helper.keeper.KeeperBootReceiver"
+            android:exported="false"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- NOT exported: reached only by this app's own AlarmManager PendingIntent (the 15-minute backstop). -->
+        <receiver
+            android:name="dev.agentroid.helper.keeper.KeeperTickReceiver"
+            android:exported="false" />
+
+        <!-- EXPORTED: the hub sets the trusted BSSID list with `adb shell am broadcast`, and the adb shell is another uid.
+             Only a caller holding android.permission.DUMP can send to it (the shell has it, ordinary apps cannot). It
+             carries BSSIDs only, each validated; nothing secret. -->
+        <receiver
+            android:name="dev.agentroid.helper.keeper.KeeperConfigReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="dev.agentroid.helper.KEEPER_TRUST" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

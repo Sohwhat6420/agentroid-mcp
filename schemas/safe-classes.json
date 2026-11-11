@@ -1,0 +1,5 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://agentroid.local/schemas/safe-classes.json","title":"runner/safe-classes.json","type":"object",
+"required":["classes"],"additionalProperties":false,
+"properties":{"classes":{"type":"object","minProperties":1,"propertyNames":{"enum":["R0","R1"]},
+"additionalProperties":{"type":"object","required":["step_kinds","packages"],"additionalProperties":false,
+"properties":{"step_kinds":{"type":"array","items":{"type":"string"},"uniqueItems":true},"packages":{"type":"array","items":{"type":"string"},"uniqueItems":true}}}}}}

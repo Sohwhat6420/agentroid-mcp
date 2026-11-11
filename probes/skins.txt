@@ -1,0 +1,6 @@
+# Vendor table for the capability probe (vendor-specific keys live in data, never in code).
+# maker | skin name | getprop key that holds the skin version
+# A maker not listed here is an unknown phone and gets tier T3 (safe slow mode) until it is checked.
+# Every key here must also be a `getprop` line in readonly.txt (a test checks it).
+Xiaomi  | HyperOS | ro.mi.os.version.name
+Samsung | One UI  | ro.build.version.oneui

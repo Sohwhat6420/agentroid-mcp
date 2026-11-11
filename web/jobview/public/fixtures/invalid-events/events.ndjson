@@ -1,0 +1,53 @@
+{"v":1,"ts":"2026-10-20T05:02:07Z","run_id":"r-20261020-1302-7f3a","seq":0,"kind":"progress","msg":"job started: camera-sweep-200 on POCO X6 Pro","temp_c":38.6,"batt":72.4,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:10.670Z","run_id":"r-20261020-1302-7f3a","seq":1,"kind":"step","step_id":"s001","msg":"Open the ISO wheel: ok","eta_s":730,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:15.398Z","run_id":"r-20261020-1302-7f3a","seq":2,"kind":"step","step_id":"s002","msg":"ISO to 100: ok","eta_s":831,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:19.983Z","run_id":"r-20261020-1302-7f3a","seq":3,"kind":"step","step_id":"s003","msg":"Shutter to 1/500 s: ok","eta_s":853,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:28.305Z","run_id":"r-20261020-1302-7f3a","seq":4,"kind":"step","step_id":"s004","msg":"Shoot (ISO 100, 1/500 s): ok","eta_s":1044,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:33.585Z","run_id":"r-20261020-1302-7f3a","seq":5,"kind":"step","step_id":"s005","msg":"Check the new JPEG: ok","eta_s":1037,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:37Z","run_id":"r-20261020-1302-7f3a","seq":6,"kind":"progress","temp_c":38.9,"batt":72.5,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:37.917Z","run_id":"r-20261020-1302-7f3a","seq":7,"kind":"step","step_id":"s006","msg":"Open the ISO wheel: ok","eta_s":1000,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:42.240Z","run_id":"r-20261020-1302-7f3a","seq":8,"kind":"step","step_id":"s007","msg":"ISO to 100: ok","eta_s":972,"display":0}
+{"v":1,"ts":"2026-10-20T05:02:46.744Z","run_id":"r-20261020-1302-7f3a","seq":9,"kind":"step","step_id":"s008","msg":"Shutter to 1/250 s: ok","eta_s":954,"display":0}
+{"v":1,"ts":"2026-10-19T10:00:00Z","run_id":"r-20261020-1302-7f3a","seq":90001,"kind":"progress","batt":120}
+{"v":1,"ts":"2026-10-20T05:02:54.686Z","run_id":"r-20261020-1302-7f3a","seq":10,"kind":"step","step_id":"s009","msg":"Shoot (ISO 100, 1/250 s): ok","eta_s":1012,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:00.599Z","run_id":"r-20261020-1302-7f3a","seq":11,"kind":"step","step_id":"s010","msg":"Check the new JPEG: ok","eta_s":1018,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:04.626Z","run_id":"r-20261020-1302-7f3a","seq":12,"kind":"step","step_id":"s011","msg":"Open the ISO wheel: ok","eta_s":990,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:07Z","run_id":"r-20261020-1302-7f3a","seq":13,"kind":"progress","temp_c":39.2,"batt":72.7,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:09.456Z","run_id":"r-20261020-1302-7f3a","seq":14,"kind":"step","step_id":"s012","msg":"ISO to 100: ok","eta_s":978,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:14.189Z","run_id":"r-20261020-1302-7f3a","seq":15,"kind":"step","step_id":"s013","msg":"Shutter to 1/125 s: ok","eta_s":966,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:21.738Z","run_id":"r-20261020-1302-7f3a","seq":16,"kind":"step","step_id":"s014","msg":"Shoot (ISO 100, 1/125 s): ok","eta_s":993,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:26.276Z","run_id":"r-20261020-1302-7f3a","seq":17,"kind":"step","step_id":"s015","msg":"Check the new JPEG: ok","eta_s":978,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:30.084Z","run_id":"r-20261020-1302-7f3a","seq":18,"kind":"step","step_id":"s016","msg":"Open the ISO wheel: ok","eta_s":955,"display":0}
+{"v":1,"ts":"2026-10-19T10:00:00Z","run_id":"r-20261020-1302-7f3a","seq":90001,"kind":"heartbeat"}
+{"v":1,"ts":"2026-10-20T05:03:33.748Z","run_id":"r-20261020-1302-7f3a","seq":19,"kind":"step","step_id":"s017","msg":"ISO to 100: ok","eta_s":934,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:37Z","run_id":"r-20261020-1302-7f3a","seq":20,"kind":"progress","temp_c":39.5,"batt":72.8,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:38.262Z","run_id":"r-20261020-1302-7f3a","seq":21,"kind":"step","step_id":"s018","msg":"Shutter to 1/60 s: ok","eta_s":923,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:47.553Z","run_id":"r-20261020-1302-7f3a","seq":22,"kind":"step","step_id":"s019","msg":"Shoot (ISO 100, 1/60 s): ok","eta_s":958,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:52.879Z","run_id":"r-20261020-1302-7f3a","seq":23,"kind":"step","step_id":"s020","msg":"Check the new JPEG: ok","eta_s":953,"display":0}
+{"v":1,"ts":"2026-10-20T05:03:57.539Z","run_id":"r-20261020-1302-7f3a","seq":24,"kind":"step","step_id":"s021","msg":"Open the ISO wheel: ok","eta_s":942,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:02.621Z","run_id":"r-20261020-1302-7f3a","seq":25,"kind":"step","step_id":"s022","msg":"ISO to 100: ok","eta_s":935,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:07Z","run_id":"r-20261020-1302-7f3a","seq":26,"kind":"progress","temp_c":39.9,"batt":73,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:07.499Z","run_id":"r-20261020-1302-7f3a","seq":27,"kind":"step","step_id":"s023","msg":"Shutter to 1/30 s: ok","eta_s":927,"display":0}
+{"v":1,"ts":"2026-10-19T10:00:00Z","run_id":"r-20261020-1302-7f3a","kind":"done"}
+{"v":1,"ts":"2026-10-20T05:04:16.831Z","run_id":"r-20261020-1302-7f3a","seq":28,"kind":"step","step_id":"s024","msg":"Shoot (ISO 100, 1/30 s): ok","eta_s":952,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:21.735Z","run_id":"r-20261020-1302-7f3a","seq":29,"kind":"step","step_id":"s025","msg":"Check the new JPEG: ok","eta_s":943,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:25.600Z","run_id":"r-20261020-1302-7f3a","seq":30,"kind":"step","step_id":"s026","msg":"Open the ISO wheel: ok","eta_s":928,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:30.600Z","run_id":"r-20261020-1302-7f3a","seq":31,"kind":"step","step_id":"s027","msg":"ISO to 100: ok","eta_s":920,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:35.235Z","run_id":"r-20261020-1302-7f3a","seq":32,"kind":"step","step_id":"s028","msg":"Shutter to 1/15 s: ok","eta_s":911,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:37Z","run_id":"r-20261020-1302-7f3a","seq":33,"kind":"progress","temp_c":40.2,"batt":73.1,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:43.823Z","run_id":"r-20261020-1302-7f3a","seq":34,"kind":"step","step_id":"s029","msg":"Shoot (ISO 100, 1/15 s): ok","eta_s":925,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:49.022Z","run_id":"r-20261020-1302-7f3a","seq":35,"kind":"step","step_id":"s030","msg":"Check the new JPEG: ok","eta_s":918,"display":0}
+{"v":1,"ts":"2026-10-20T05:04:53.494Z","run_id":"r-20261020-1302-7f3a","seq":36,"kind":"step","step_id":"s031","msg":"Open the ISO wheel: ok","eta_s":908,"display":0}
+{"v":1,"ts":"2026-10-20T05:10:00Z",
+{"v":1,"ts":"2026-10-20T05:04:57.230Z","run_id":"r-20261020-1302-7f3a","seq":37,"kind":"step","step_id":"s032","msg":"ISO to 100: ok","eta_s":894,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:02.413Z","run_id":"r-20261020-1302-7f3a","seq":38,"kind":"step","step_id":"s033","msg":"Shutter to 1/8 s: ok","eta_s":888,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:07Z","run_id":"r-20261020-1302-7f3a","seq":39,"kind":"progress","temp_c":40.6,"batt":73.2,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:11.428Z","run_id":"r-20261020-1302-7f3a","seq":40,"kind":"step","step_id":"s034","msg":"Shoot (ISO 100, 1/8 s): ok","eta_s":900,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:16.119Z","run_id":"r-20261020-1302-7f3a","seq":41,"kind":"step","step_id":"s035","msg":"Check the new JPEG: ok","eta_s":892,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:20.050Z","run_id":"r-20261020-1302-7f3a","seq":42,"kind":"step","step_id":"s036","msg":"Open the ISO wheel: ok","eta_s":879,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:24.623Z","run_id":"r-20261020-1302-7f3a","seq":43,"kind":"step","step_id":"s037","msg":"ISO to 100: ok","eta_s":871,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:29.269Z","run_id":"r-20261020-1302-7f3a","seq":44,"kind":"step","step_id":"s038","msg":"Shutter to 1/4 s: ok","eta_s":862,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:37Z","run_id":"r-20261020-1302-7f3a","seq":45,"kind":"progress","temp_c":40.9,"batt":73.4,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:38.727Z","run_id":"r-20261020-1302-7f3a","seq":46,"kind":"step","step_id":"s039","msg":"Shoot (ISO 100, 1/4 s): ok","eta_s":874,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:44.447Z","run_id":"r-20261020-1302-7f3a","seq":47,"kind":"step","step_id":"s040","msg":"Check the new JPEG: ok","eta_s":870,"display":0}
+{"v":1,"ts":"2026-10-20T05:05:48.174Z","run_id":"r-20261020-1302-7f3a","seq":48,"kind":"step","step_id":"s041","msg":"Open the ISO wheel: ok","eta_s":858,"display":0}

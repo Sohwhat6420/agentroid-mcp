@@ -1,0 +1,42 @@
+[package]
+name = "agentroid-bridged"
+description = "bridged daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bridged"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bridged"
+path = "src/main.rs"
+
+[dependencies]
+agentroid-core = { path = "../core" }
+agentroid-adb-link = { path = "../adb-link" }
+# run_script (task 2.10 slice c), wired into the daemon by slice b
+agentroid-sandbox = { path = "../sandbox" }
+# The link hub (2.12), care (2.13; never its guard-logic-tests feature),
+# handover (2.15) and segments (2.14) run inside the daemon. Path crates only; no new package in Cargo.lock.
+agentroid-link-hub = { path = "../link-hub" }
+agentroid-care = { path = "../care" }
+agentroid-handover = { path = "../handover" }
+agentroid-segments = { path = "../segments" }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+serde_yaml = "0.9.34"
+
+[dev-dependencies]
+# Only to reuse link-hub's FakePhone (tests/common) in the wiring tests: the versions link-hub already locks.
+tokio = { version = "1", features = ["macros"] }
+tokio-tungstenite = "=0.30.0"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory"] }

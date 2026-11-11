@@ -1,0 +1,1 @@
+{"flow":"f","version":1,"app":{"package":"p.q","version_range":"*"},"steps":[{"id":"s1","kind":"swipe"}]}

@@ -1,0 +1,31 @@
+# SYNTHETIC: a fully capable phone from a maker that is not in probes/skins.txt. It must still get T3.
+### getprop ro.serialno
+PLACEHOLDER-UNKNOWN-SERIAL
+### getprop ro.build.version.sdk
+34
+### getprop ro.build.version.release
+14
+### getprop ro.product.manufacturer
+Acme Handsets
+### getprop ro.product.model
+Synthetic One
+### getprop ro.build.version.oneui
+
+### getprop ro.mi.os.version.name
+
+### getevent -pl
+add device 1: /dev/input/event4
+  name:     "synthetic-touchscreen"
+  events:
+    ABS (0003): ABS_MT_POSITION_X     : value 0, min 0, max 1079, fuzz 0 flat 0 resolution 0
+  input props:
+    INPUT_PROP_DIRECT
+### settings list global
+adb_wifi_enabled=1
+### dumpsys display
+  DisplayMode-synthetic: id=1, width=1080, height=2400, fps=60.0, alternativeRefreshRates=[]
+### pm list features
+feature:android.hardware.touchscreen
+### ime list -s
+com.example.synthetic.ime.a/.ImeA
+com.example.synthetic.ime.b/.ImeB

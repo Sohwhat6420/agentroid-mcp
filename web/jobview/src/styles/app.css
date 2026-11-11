@@ -1,0 +1,63 @@
+/* Additions for real data (2.11b). v2.css is the approved design, verbatim; this file only adds what the
+   mock did not need (a real <img> frame, a secure screen, a stale notice, pending controls, the recorder crop)
+   and the CRITIQUE's open small items. Same tokens, same scale, no colour literals. */
+
+/* the phone picture is fixed-colour in both themes, because it is a picture of a phone (DESIGN §2) */
+:root{--screen-bg:oklch(0.2 0.006 250);--screen-ink:oklch(0.9 0.006 250)}
+
+/* ---- frame: a real JPEG plus the ghost overlay drawn from frame.json ---- */
+.phone .screen img.shot{display:block;width:100%;height:100%;object-fit:fill;transition:filter var(--t-ui) ease,opacity var(--t-ui) ease}
+.phone .screen svg.ghost{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.phone.stale .screen img.shot{filter:grayscale(1) contrast(.85);opacity:.55}
+.phone.blink .screen img.shot{animation:blink 160ms var(--ease-out)}
+/* reduced motion: the new-frame blink goes, as v2 does for its mock scene; the stale greying is instant */
+@media (prefers-reduced-motion: reduce){ .phone.blink .screen img.shot{animation:none} .phone .screen img.shot{transition:none} }
+.secure-well{position:absolute;inset:0;background:var(--screen-bg)}
+.secure-note{position:absolute;left:8%;right:8%;top:16%;display:grid;justify-items:center;gap:var(--s1);padding:var(--s3);
+  background:var(--screen-bg);color:var(--screen-ink);border:1px solid oklch(0.9 0.006 250 / .35);border-radius:var(--r-s);
+  text-align:center;font-size:var(--fs-row);line-height:1.4}
+.secure-note svg.g{width:24px;height:24px}
+.secure-note b{font-weight:600}
+.no-frame{position:absolute;inset:0;display:grid;place-content:center;padding:var(--s4);text-align:center;font-size:var(--fs-row);color:var(--ink-2)}
+
+/* the skip link was 42 px tall in v2; held to the target like every other control */
+.skip{display:inline-flex;align-items:center;min-height:max(var(--target),44px)}
+
+/* ---- band: an honest line when the data is stale or unusable ---- */
+.notice{margin-top:var(--s2);max-width:62ch;font-size:var(--fs-row);font-weight:600;color:var(--fail)}
+.notice[hidden]{display:none}
+
+/* ---- CRITIQUE P3: the chart's key help becomes a disclosure, so it is not reading noise in every state ---- */
+.keys{margin-top:var(--s1);font-size:var(--fs-axis);color:var(--ink-3)}
+.keys summary{display:inline-flex;align-items:center;min-height:var(--target);cursor:pointer;color:var(--ink-2)}
+.keys summary::marker{color:var(--ink-3)}
+.keys p{margin:0 0 var(--s1)}
+.rec{margin-top:var(--s6)}
+
+/* ---- CRITIQUE item 8: a real API needs a pending state and a failure message per control ---- */
+.btn[aria-busy="true"]{cursor:progress;border-style:dashed}
+.controls .note.err{color:var(--fail);font-weight:600}
+
+/* ---- flight recorder crop and step notes ---- */
+.crop{margin:0;display:grid;gap:var(--s1);font-size:var(--fs-axis);color:var(--ink-3);max-width:420px}
+.crop img{display:block;width:100%;height:auto;border:1px solid var(--line-strong);border-radius:var(--r-s);background:var(--screen-bg)}
+.notes{margin:0;padding:0;list-style:none;display:grid;gap:var(--s1);font-size:var(--fs-row);color:var(--ink-2)}
+.notes li{display:flex;gap:var(--s2);align-items:baseline}
+.notes svg.g{flex:none;transform:translateY(2px)}
+.row.more{cursor:default}
+.row.more .what b{color:var(--ink-3)}
+
+/* ---- vitals: changes in force with their owner, and the last error ---- */
+.changes .own{display:block;margin-top:2px;font-family:var(--font-ui);font-size:var(--fs-axis);color:var(--ink-3);white-space:normal}
+.changes td{vertical-align:top}
+.changes .own .mono{white-space:nowrap}
+.changes th:not(:first-child),.changes td:not(:first-child){padding-left:var(--s3);white-space:nowrap}
+.changes td:first-child{width:100%}
+
+/* the fixture picker exists only in fixture mode: .dev{display:flex} in v2 would override [hidden] */
+.dev[hidden]{display:none}
+/* the fixture picker: its option labels are long, so it is held to the design's width */
+@media (min-width:721px){ #fix-select{max-width:11rem} }
+.changes .scope-perm{font-weight:600;color:var(--ink)}
+.err-msg{margin-top:var(--s1);font-family:var(--font-mono);font-size:var(--fs-axis);color:var(--ink);word-break:break-word;font-variant-ligatures:none}
+.others{margin:0;padding:0;list-style:none;display:grid;gap:var(--s1);font-size:var(--fs-row);color:var(--ink-2)}

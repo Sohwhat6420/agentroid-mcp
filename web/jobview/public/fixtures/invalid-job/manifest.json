@@ -1,0 +1,12 @@
+{
+ "name": "invalid-job",
+ "label": "Invalid job payload (repo fixture)",
+ "job_id": "7f3a",
+ "now": "2026-10-20T05:03:07Z",
+ "link": "fixture",
+ "files": [
+  "job.json",
+  "jobs.json",
+  "events.ndjson"
+ ]
+}

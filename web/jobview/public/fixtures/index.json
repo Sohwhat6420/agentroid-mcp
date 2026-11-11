@@ -1,0 +1,54 @@
+[
+ {
+  "name": "running",
+  "label": "Running"
+ },
+ {
+  "name": "cooling",
+  "label": "Cooling (heat pause)"
+ },
+ {
+  "name": "waiting",
+  "label": "Waiting for you"
+ },
+ {
+  "name": "stuck",
+  "label": "Stuck"
+ },
+ {
+  "name": "stopped",
+  "label": "Stopped"
+ },
+ {
+  "name": "failed",
+  "label": "Failed"
+ },
+ {
+  "name": "done",
+  "label": "Done"
+ },
+ {
+  "name": "secure",
+  "label": "Secure screen"
+ },
+ {
+  "name": "stale",
+  "label": "Stale (laptop not answering)"
+ },
+ {
+  "name": "invalid-job",
+  "label": "Invalid job payload (repo fixture)"
+ },
+ {
+  "name": "invalid-events",
+  "label": "Some invalid event lines (repo fixtures)"
+ },
+ {
+  "name": "repo-stopped",
+  "label": "Repo fixture: stopped with a change still in force"
+ },
+ {
+  "name": "empty",
+  "label": "Queued, no events yet"
+ }
+]

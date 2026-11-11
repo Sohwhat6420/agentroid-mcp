@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "t": "heartbeat",
+  "epoch": 5,
+  "ts_ms": 1760001000005,
+  "period_s": 15,
+  "ack": 0,
+  "tx_seq": 0,
+  "charging": true,
+  "screen_on": false,
+  "battery_pct": null,
+  "adb_port": null,
+  "adb_port_source": "none",
+  "wifi_adb": null,
+  "a11y_enabled": null,
+  "keeper": "absent",
+  "bssid_trusted": null
+}

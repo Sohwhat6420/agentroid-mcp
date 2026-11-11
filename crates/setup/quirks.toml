@@ -1,0 +1,73 @@
+# Quirks v0. Read by `doctor` and `setup`.
+# Every OEM- or skin-specific check lives here, never in code . AOSP checks (wireless
+# debugging, the accessibility service, the Doze whitelist, RUN_ANY_IN_BACKGROUND, WRITE_SECURE_SETTINGS)
+# are in doctor.rs because every Android phone has them.
+#
+# A [[quirk]] applies when `maker` and `skin` match the probe's answer (case-insensitive) and the SDK is
+# in sdk_min..=sdk_max. `check` is one of:
+#   appops_allow           every op in `ops` must read "allow" in `cmd appops get <helper>`; an op that is
+#                          not listed reads as `absent_means`. The adb fix is `cmd appops set <helper> <op> allow`.
+#   settings_contains_pkg  the settings key `key` (searched in global, secure, system) must exist and list the
+#                          helper package. No adb fix: `human_fix` is the one tap. `absent_fix` is said when the
+#                          key does not exist at all.
+#   note                   nothing to read; `human_fix` is printed once by setup (a one-off human step).
+# `measured` says where the item comes from. Items not measured on a phone say so.
+schema = 1
+
+[[quirk]]
+id = "hyperos_autostart"
+title = "HyperOS Autostart off"
+maker = "Xiaomi"
+skin = "HyperOS"
+sdk_min = 34
+sdk_max = 36
+check = "appops_allow"
+ops = ["10008", "10007", "10021", "10023", "10053"]
+absent_means = "deny"
+human_fix = "Security app > Permissions > Autostart > Agentroid helper: on"
+measured = "HyperOS Autostart app-ops 10008/10007/10021/10023/10053 (17 Oct items). Op names as cmd appops prints them are NOT measured: see SETUP-REPORT.md."
+
+[[quirk]]
+id = "hyperos_no_restrictions"
+title = "HyperOS battery saver \"No restrictions\" missing"
+maker = "Xiaomi"
+skin = "HyperOS"
+sdk_min = 34
+sdk_max = 36
+check = "settings_contains_pkg"
+key = "MILLET_NO_RESTRICT_APP"
+human_fix = "On the phone: Settings > Apps > Manage apps > Agentroid helper > Battery saver > No restrictions (one tap; adb cannot set it reliably)"
+absent_fix = "MILLET_NO_RESTRICT_APP is not in settings global, secure or system, so \"No restrictions\" cannot be confirmed: set it by hand (Settings > Apps > Manage apps > Agentroid helper > Battery saver > No restrictions), then run doctor again"
+measured = "Q 'One-off taps': one tap per app for battery No restrictions; check MILLET_NO_RESTRICT_APP (17 Oct items)."
+
+[[quirk]]
+id = "hyperos_usb_debugging_security"
+title = "HyperOS \"USB debugging (Security settings)\" and \"Install via USB\""
+maker = "Xiaomi"
+skin = "HyperOS"
+sdk_min = 34
+sdk_max = 36
+check = "note"
+human_fix = "Developer options > USB debugging (Security settings) and Install via USB: on. HyperOS asks for a SIM and a signed-in Mi account once."
+measured = "installer: HyperOS needs a SIM and Mi account once for these two switches."
+
+# Other UiAutomation owners (V49). Only one UiAutomation connection exists per phone; any of these can
+# take it from Agentroid's uiautomator fallback. Flagged by doctor on every phone, any skin.
+# `packages` are matched against `pm list packages`; `processes` against `ps -A -o NAME`.
+[[owner]]
+name = "uiautomator2"
+packages = ["com.github.uiautomator", "com.github.uiautomator.test"]
+processes = ["com.github.uiautomator", "com.github.uiautomator.test", "atx-agent"]
+stop_host = "stop the Python uiautomator2 client on the laptop"
+
+[[owner]]
+name = "Appium"
+packages = ["io.appium.uiautomator2.server", "io.appium.uiautomator2.server.test", "io.appium.settings"]
+processes = ["io.appium.uiautomator2.server", "io.appium.uiautomator2.server.test"]
+stop_host = "stop the Appium server on the laptop"
+
+[[owner]]
+name = "mobilecli"
+packages = ["com.mobilenext.devicekit"]
+processes = ["com.mobilenext.devicekit"]
+stop_host = "stop mobilecli / mobile-mcp on the laptop"

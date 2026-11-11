@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch; the version itself comes from rust-toolchain.toml
+      - run: cargo test --workspace --no-fail-fast
+      - run: cargo build --release --workspace --bins
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          $dir = "agentroid-$v-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Get-ChildItem target/release -File -Filter *.exe | Copy-Item -Destination $dir
+          Copy-Item LICENSE, NOTICE, README.md, SECURITY.md, docs/SAFETY.md -Destination $dir
+          Copy-Item generated/redteam/results.md "$dir/redteam-results.md"
+          # The MCP server is TypeScript run by Node 22.6+ directly; ship its source and lock file
+          # (run `npm ci` in mcp/ after unzipping).
+          New-Item -ItemType Directory "$dir/mcp" | Out-Null
+          Copy-Item -Recurse apps/mcp/src "$dir/mcp/src"
+          Copy-Item apps/mcp/package.json, apps/mcp/package-lock.json, apps/mcp/tsconfig.json -Destination "$dir/mcp"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" | Out-File -Encoding ascii SHA256SUMS.txt
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          files: |
+            agentroid-*-windows-x64.zip
+            SHA256SUMS.txt

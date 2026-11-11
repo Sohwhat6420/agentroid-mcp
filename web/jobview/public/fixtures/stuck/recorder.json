@@ -1,0 +1,17 @@
+{
+ "v": 1,
+ "run_id": "r-20261020-1302-7f3a",
+ "ts": "2026-10-20T05:35:33.305Z",
+ "step_id": "s171",
+ "reason": "selector id:camera:id/iso_chip matched 0 nodes after 3 tries",
+ "trees": 10,
+ "frames": 3,
+ "crop": {
+  "url": "/jobs/7f3a/recorder/crop.jpg",
+  "x": 60,
+  "y": 1700,
+  "w": 1100,
+  "h": 520,
+  "bytes": 3155
+ }
+}

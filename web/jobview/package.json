@@ -1,0 +1,29 @@
+{
+  "name": "agentroid-jobview",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Agentroid job view: a small read-mostly page served by bridged on localhost, or on the tailnet in hub mode.",
+  "scripts": {
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "build": "node ./node_modules/vite/bin/vite.js build",
+    "dev": "node ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5179 --strictPort",
+    "preview": "node ./node_modules/vite/bin/vite.js preview --host 127.0.0.1 --port 5180 --strictPort",
+    "fixtures": "node scripts/gen-fixtures.mjs && node scripts/render-frames.mjs",
+    "interact": "node scripts/interact.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "contrast": "node scripts/contrast.mjs",
+    "budget": "node scripts/budget.mjs",
+    "shots": "node scripts/shoot.mjs",
+    "a11y": "node scripts/a11y-check.mjs",
+    "axe": "node scripts/axe.mjs",
+    "mutant": "node scripts/mutant.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "axe-core": "4.14.0",
+    "typescript": "5.6.3",
+    "vite": "6.4.6"
+  }
+}

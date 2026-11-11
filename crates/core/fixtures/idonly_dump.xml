@@ -1,0 +1,4 @@
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0">
+<node class="android.view.ViewGroup" text="" content-desc="" resource-id="com.mi.global.bbs:id/navBarMe" clickable="true" bounds="[810,2500][1110,2660]">
+ <node class="android.widget.TextView" text="ME" content-desc="" resource-id="com.mi.global.bbs:id/navItemTitle" clickable="false" bounds="[900,2590][1020,2630]"/>
+</node></hierarchy>

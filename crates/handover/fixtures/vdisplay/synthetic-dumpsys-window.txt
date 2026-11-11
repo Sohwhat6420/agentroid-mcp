@@ -1,0 +1,21 @@
+WINDOW MANAGER WINDOWS (dumpsys window windows)
+  Window #0 Window{1a2b3c4 u0 StatusBar}:
+    mDisplayId=0 rootTaskId=1 mSession=Session{5d6e7f8 1234:u0a10050} mClient=android.os.BinderProxy@0
+    mOwnerUid=10050 showForAllUsers=true package=com.example.systemui appop=NONE
+    mAttrs={(0,0)(fillx110) gr=TOP CENTER_VERTICAL sim={adjust=resize} layoutInDisplayCutoutMode=always ty=STATUS_BAR fmt=TRANSLUCENT
+      fl=NOT_FOCUSABLE SPLIT_TOUCH HARDWARE_ACCELERATED DRAWS_SYSTEM_BAR_BACKGROUNDS
+  Window #1 Window{2b3c4d5 u0 com.example.securepay/com.example.securepay.CheckoutActivity}:
+    mDisplayId=0 rootTaskId=60 mSession=Session{6e7f809 2345:u0a10123} mClient=android.os.BinderProxy@0
+    mOwnerUid=10123 showForAllUsers=false package=com.example.securepay appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={adjust=resize forwardNavigation} ty=BASE_APPLICATION fmt=TRANSPARENT wanim=0x10302f8
+      fl=LAYOUT_IN_SCREEN LAYOUT_INSET_DECOR SECURE SPLIT_TOUCH HARDWARE_ACCELERATED DRAWS_SYSTEM_BAR_BACKGROUNDS
+  Window #2 Window{3c4d5e6 u0 com.example.jobapp/com.example.jobapp.MainActivity}:
+    mDisplayId=0 rootTaskId=1 mSession=Session{7f80912 3456:u0a10200} mClient=android.os.BinderProxy@0
+    mOwnerUid=10200 showForAllUsers=false package=com.example.jobapp appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={adjust=resize forwardNavigation} ty=BASE_APPLICATION fmt=TRANSPARENT wanim=0x10302f8
+      fl=LAYOUT_IN_SCREEN LAYOUT_INSET_DECOR SPLIT_TOUCH HARDWARE_ACCELERATED DRAWS_SYSTEM_BAR_BACKGROUNDS
+  Window #3 Window{4d5e6f7 u0 com.example.notsecure/com.example.notsecure.Main}:
+    mDisplayId=2 rootTaskId=50 mSession=Session{8091a23 4567:u0a10201} mClient=android.os.BinderProxy@0
+    mOwnerUid=10201 showForAllUsers=false package=com.example.notsecure appop=NONE
+    mAttrs={(0,0)(fillxfill) ty=BASE_APPLICATION fmt=TRANSPARENT
+      fl=LAYOUT_IN_SCREEN SPLIT_TOUCH SECURE_DISPLAY_HINT_NOT_A_FLAG

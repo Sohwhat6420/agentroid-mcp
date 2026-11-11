@@ -1,0 +1,22 @@
+# 12 refusals at 5 records a file: 2 rotated parts + the active file, anchor beside them
+$ agentroid audit verify audit.jsonl --anchor anchor/audit.head
+OK <tmp>\audit.jsonl: 12 records (0 allowed, 0 blocked, 12 asked) across 3 files (2 rotated), head seq 12 de2c1d7e18ddf817cbeb42722b698e9a0010d0072762f80968d8dafcb1b49334, anchor matches
+(exit 0)
+
+# audit.000001.jsonl: one record's decision edited
+BROKEN <tmp>\audit.jsonl: <tmp>\audit.000001.jsonl line 1: hash does not match the record's contents (this line was edited)
+(exit 1)
+
+# audit.000001.jsonl removed
+BROKEN <tmp>\audit.jsonl: <tmp>\audit.000002.jsonl line 0: rotated part 000001 is missing (found part 000002 next)
+(exit 1)
+
+# the whole log rewritten from genesis, head file replaced too; without the anchor:
+OK <tmp>\rewritten\audit.jsonl: 2 records (2 allowed, 0 blocked, 0 asked) across 1 file, head seq 2 e16178860f0b6f473e42ed44aa0c1f57767da010e9991fc0700a96faf233dc22
+(exit 0)
+# with the anchor:
+BROKEN <tmp>\rewritten\audit.jsonl: <tmp>\rewritten\audit.jsonl line 0: the chain ends at seq 2 (e16178860f0b) but the anchor says seq 12 (de2c1d7e18dd): the log or its head file was rewritten, or the anchor is stale
+(exit 1)
+
+# required anchor unwritable: the next allowed tap is refused, nothing sent
+tap refused, nothing was sent: the audit log could not record it (anchor <tmp>\anchor\audit.head could not be written: Cannot create a file when that file already exists. (os error 183))

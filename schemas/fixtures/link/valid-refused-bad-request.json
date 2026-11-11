@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "t": "refused",
+  "epoch": 5,
+  "reason": "bad_request",
+  "id": "bad-1"
+}

@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "t": "challenge",
+  "epoch": 0,
+  "nonce": "UxP+VOV5AblEc1P4MfPKpPk7G0LluTwfq1okkhTMlUQ=",
+  "phone_nonce": "TwwzTDIWxVmWZok1AmxcHtJJOOYGii4DHqAMDMiNnjE=",
+  "serial": "POCOX6TEST01",
+  "hub_key_id": "37f411f6a1fe02121be16db2df19339a4099b2bed8fdf2e171204392ed90db6e",
+  "hub_sig": "MEYCIQCE48Y8XZ7Mo7MJaiadpJmBUob1U1B/hKc9+jQoXAna8gIhAIoj4EGdnpRzRj7j7hX8y5JsJMINWuwS8rF0hK/IPEwz"
+}

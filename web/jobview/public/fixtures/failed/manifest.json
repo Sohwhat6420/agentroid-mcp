@@ -1,0 +1,13 @@
+{
+ "name": "failed",
+ "label": "Failed",
+ "job_id": "7f3a",
+ "now": "2026-10-20T05:39:20.061Z",
+ "link": "fixture",
+ "files": [
+  "job.json",
+  "jobs.json",
+  "events.ndjson",
+  "frame.json"
+ ]
+}

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="a11y_label">Agentroid helper</string>
+    <string name="a11y_desc">Lets the Agentroid laptop agent read the screen and tap or swipe on it while the helper notification is showing.</string>
+</resources>

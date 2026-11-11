@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "needs_repair",
+  "from": "hub",
+  "reason": "unknown_device_key",
+  "fix": "The hub has no record of this phone's link key. On the laptop, with the phone reachable over adb, run: agentroid link pair <serial>",
+  "epoch": 5
+}
