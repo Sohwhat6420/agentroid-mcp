@@ -63,6 +63,7 @@ use std::time::{Duration, Instant};
 const CONTROL_WAIT: Duration = Duration::from_secs(10);
 
 /// An adb [`Runner`] behind an `Arc`, so the daemon can own one and wrap it in a [`GuardedRunner`].
+#[derive(Clone)]
 pub struct DynRunner(pub Arc<dyn Runner + Send + Sync>);
 
 impl Runner for DynRunner {

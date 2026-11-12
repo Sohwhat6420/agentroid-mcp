@@ -194,6 +194,14 @@ class Estimate(unittest.TestCase):
         self.assertEqual(e["input"], (1500 + 5 * 40 - 5 * 40) + (1500 + 5 * 900 - 5 * 300))
         self.assertIsNone(R.estimate_for_calls(calls, texts[:1], "sonnet"), "a call with no surviving prompt file gives no estimate")
 
+    def test_archived_call_files_with_whole_second_mtimes_still_match(self):
+        calls = [{"t": 100.3}, {"t": 107.6}, {"t": 108.2}]
+        live = [{"t": 100.35}, {"t": 107.65}, {"t": 108.25}]
+        archived = [{"t": 100.0}, {"t": 107.0}, {"t": 108.0}]  # tar truncates mtimes to whole seconds
+        self.assertEqual(R.match_texts(calls, live), live)
+        self.assertEqual(R.match_texts(calls, archived), archived, "each row gets its own file, in order")
+        self.assertEqual(R.match_texts([{"t": 100.3}], [{"t": 100.1}]), [None], "live files never match before the row")
+
     def test_call_files_are_read_as_sizes(self):
         with tempfile.TemporaryDirectory() as d:
             for n, (pr, out) in enumerate((("abc", '{"action_type": "wait"}'), ("abcdef", "  "))):

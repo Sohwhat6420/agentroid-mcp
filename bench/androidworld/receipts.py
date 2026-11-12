@@ -374,12 +374,20 @@ def load_call_texts(temp_dir: str | Path) -> list[dict[str, Any]]:
 
 
 def match_texts(calls: Sequence[dict[str, Any]], texts: Sequence[dict[str, Any]], tol: float = 2.0) -> list[dict[str, Any] | None]:
-    """For each ledger row, the call-file record written just after it (within `tol` seconds), else None."""
+    """For each ledger row, the call-file record written just after it (within `tol` seconds), else None.
+
+    Files restored from a tar archive carry whole-second mtimes (tar truncates them), so a file written 0.3 s after its
+    ledger row can read as 0.7 s before it. When every mtime is a whole second the early edge widens to 1.05 s. A file
+    is given to one ledger row at most."""
     ts = [x["t"] for x in texts]
+    early = 1.05 if ts and all(float(t).is_integer() for t in ts) else 0.05
+    used: set[int] = set()
     out = []
     for c in calls:
-        i = bisect.bisect_left(ts, c["t"] - 0.05)
-        cand = [j for j in (i, i + 1) if 0 <= j < len(texts) and -0.05 <= texts[j]["t"] - c["t"] <= tol]
+        i = bisect.bisect_left(ts, c["t"] - early)
+        cand = [j for j in range(i, min(i + 4, len(texts))) if j not in used and -early <= ts[j] - c["t"] <= tol]
+        if cand:
+            used.add(cand[0])
         out.append(texts[cand[0]] if cand else None)
     return out
 

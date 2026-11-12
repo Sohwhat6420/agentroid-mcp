@@ -16,8 +16,9 @@
 
 use std::sync::Arc;
 
+use agentroid_adb_link::guard::S24_SCREEN_AWAKE_KEYS;
 use agentroid_adb_link::runner::Runner;
-use agentroid_core::gate::{effective_mode, DeviceMode};
+use agentroid_core::gate::{effective_mode, is_s24, DeviceMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
@@ -186,6 +187,8 @@ pub struct LeaseManager<S: CareSink> {
     pub pid: u32,
     /// Journal failures after a restore (the restore itself stood).
     pub journal_errors: Vec<String>,
+    /// The protected phone screen-awake exception: off unless [`Self::allow_s24_screen_awake`] was called.
+    s24_screen_awake: bool,
 }
 
 impl<S: CareSink> LeaseManager<S> {
@@ -202,7 +205,28 @@ impl<S: CareSink> LeaseManager<S> {
             pids,
             pid: std::process::id(),
             journal_errors: vec![],
+            s24_screen_awake: false,
         }
+    }
+
+    /// Turn on the protected phone's one exception (its owner's choice, 12 Nov 2026) for this manager: the protected phone may lease and
+    /// restore [`S24_SCREEN_AWAKE_KEYS`] and nothing else; every other `read_only` refusal stands.
+    /// Only session stay-awake calls this, with a runner built by
+    /// `GuardedRunner::with_s24_screen_awake`.
+    pub fn allow_s24_screen_awake(&mut self) {
+        self.s24_screen_awake = true;
+    }
+
+    /// True when the exception covers this key and `ids` name the protected phone (not any other `read_only` phone).
+    fn s24_exempt(&self, ids: &[&str], ns: &str, key: &str) -> bool {
+        self.s24_screen_awake
+            && ids.iter().any(|i| is_s24(i))
+            && S24_SCREEN_AWAKE_KEYS.contains(&(ns, key))
+    }
+
+    /// The exception may apply, but who the phone is is not known yet (an address): step 3 decides.
+    fn s24_may_exempt(&self, ns: &str, key: &str) -> bool {
+        self.s24_screen_awake && S24_SCREEN_AWAKE_KEYS.contains(&(ns, key))
     }
 
     fn ts(&self) -> String {
@@ -270,8 +294,11 @@ impl<S: CareSink> LeaseManager<S> {
         scope: ScopeReq,
     ) -> Result<ChangeInForce, CareError> {
         let sc = scope.scope();
-        // 1. read_only refuses every scope, before anything else (even a read).
-        if effective_mode(&[phone.serial()], mode) == DeviceMode::ReadOnly {
+        // 1. read_only refuses every scope, before anything else (even a read). The protected phone exception's
+        //    two keys go on to step 3, where the identity read decides.
+        if effective_mode(&[phone.serial()], mode) == DeviceMode::ReadOnly
+            && !self.s24_may_exempt(ns, key)
+        {
             let e = CareError::Refused {
                 class: Some("read_only"),
                 reason: format!(
@@ -319,7 +346,9 @@ impl<S: CareSink> LeaseManager<S> {
         };
         // 3. identity: the protected phone behind an address is read_only too.
         let ro = phone.ro_serial()?;
-        if effective_mode(&[phone.serial(), &ro], mode) == DeviceMode::ReadOnly {
+        if effective_mode(&[phone.serial(), &ro], mode) == DeviceMode::ReadOnly
+            && !self.s24_exempt(&[phone.serial(), &ro], ns, key)
+        {
             let e = CareError::Refused {
                 class: Some("read_only"),
                 reason: format!("{ro} is read_only: every lease scope is refused"),
@@ -382,7 +411,9 @@ impl<S: CareSink> LeaseManager<S> {
         mode: DeviceMode,
         e: &LeaseEntry,
     ) -> RestoreStatus {
-        if effective_mode(&[phone.serial(), e.ident()], mode) == DeviceMode::ReadOnly {
+        if effective_mode(&[phone.serial(), e.ident()], mode) == DeviceMode::ReadOnly
+            && !self.s24_exempt(&[phone.serial(), e.ident()], &e.namespace, &e.key)
+        {
             return RestoreStatus::Refused;
         }
         let status = match e.namespace.as_str() {

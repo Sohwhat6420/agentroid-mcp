@@ -51,6 +51,16 @@ Before matching, text is folded: full-width letters, zero-width and bidirectiona
 
 The same guard covers the two ways round the screen. Raw shell lines from the script sandbox are refused if they could wipe the phone, change security settings, read message or credential stores, or inject input (injected input would skip the screen check). The shell guard also has an `asked` tier for other state changes, and the suite tests it, but in this build `run_script` never reaches it: the sandbox refuses every line that is not on its read-only list before the shell guard sees it. File pushes and pulls are allowed only in shared storage on the phone, and pushing an installable file is asked.
 
+**What the daemon changes on its own.** Two settings: `system screen_off_timeout` (raised to 30 minutes) and `global stay_on_while_plugged_in` (7), so the screen does not time out under a working session.
+- **When.** A session's first call on a phone, whether a tool or `doctor`, `push` or `pull_new`, queues the change on one worker thread, so the call itself does not wait for it.
+- **How it comes back.** They are settings leases: the record goes to `leases.json` before the phone is touched. The phone's own values come back by compare-and-swap when the last session leaves, after 15 idle minutes, or when the daemon stops. After a crash they come back at the next daemon's first call to that phone; until then a crashed daemon leaves the screen on.
+- **Never.** No lock, PIN, password or keyguard setting is ever written, and emulators are skipped. `read_only` phones are refused by the same lease code that refuses every other change there, with one exception, below.
+- **The protected phone's one exception.** The hardcoded protected phone (`S24_SERIAL` in `crates/adb-link/src/guard.rs`) is `read_only` whatever it is configured as. On 12 Nov 2026 its owner chose to have its screen kept on too. The exception is these two keys and nothing else:
+  - only stay-awake's own adb runner (`GuardedRunner::with_s24_screen_awake`) may send it the exact `settings get`, `settings put` (a plain number) and `settings delete` lines for the two keys;
+  - care's lease manager allows only those two keys there;
+  - every other command to it is refused as before, and the plain guard refuses these lines too.
+- **Off switches.** `AGENTROID_NO_S24_AWAKE=1` turns the exception off; `AGENTROID_NO_STAY_AWAKE=1` turns stay-awake off altogether.
+
 **The laptop side is fenced too.** `push` (full devices only) reads only files inside `%LOCALAPPDATA%\agentroid\files\outbox`, and `pull_new` writes only inside `%LOCALAPPDATA%\agentroid\files\inbox` (both under the daemon's `--state-dir`). A plain name is taken inside that folder. An absolute path must resolve, links followed, to a place inside it. Anything else, such as an SSH key, a `.env` file, a `..` name or a pull into your Startup folder, is refused before the phone is touched. To send a file to the phone, copy it into the outbox first. Until 11 Nov the laptop side was not restricted at all, so a `full` token could copy any file your Windows user can read.
 
 ## What it catches

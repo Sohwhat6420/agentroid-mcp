@@ -177,6 +177,7 @@ impl Daemon {
         let info = self.resolve(name)?;
         let key = device_key(&info);
         self.require_holder(&key, conn)?;
+        self.keep_awake(conn, &key, &info);
         let (mode, allowed) = {
             let b = self.backend();
             (b.mode_of(&info), b.allowed(&info))

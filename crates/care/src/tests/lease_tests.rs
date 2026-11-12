@@ -328,6 +328,125 @@ fn permanent_is_refused_as_r2_and_read_only_refuses_every_scope() {
         .is_err());
 }
 
+/// The protected phone's one exception (12 Nov 2026): with the manager's opt-in AND the opt-in runner, the protected phone may
+/// lease and restore the two screen keys, by name or behind an address; nothing else; no other
+/// read_only phone; and without either opt-in nothing changes.
+#[test]
+fn the_s24_exception_is_two_screen_keys_on_the_s24_only() {
+    let rig = Rig::new("s24-awake", "POCO0014");
+    let owner = Owner::here("session-awake", "awake:s24");
+    let s24 = FakePhone::new(S24_SERIAL);
+    s24.set("system", "screen_off_timeout", "30000");
+    s24.set("global", "stay_on_while_plugged_in", "0");
+    let awake_runner = GuardedRunner::with_s24_screen_awake(s24.clone());
+    let plain_runner = GuardedRunner::new(s24.clone());
+    let ro = DeviceMode::ReadOnly;
+
+    // without the manager's opt-in: refused as read_only, before a read
+    let mut off = rig.manager();
+    let p = AdbPhone::new(&awake_runner, S24_SERIAL);
+    let e = off
+        .apply(
+            &p,
+            ro,
+            &owner,
+            "system",
+            "screen_off_timeout",
+            "1800000",
+            ScopeReq::Session,
+        )
+        .unwrap_err();
+    assert_eq!(e.class(), Some("read_only"));
+    // with it, but through the ordinary runner: the guard refuses the read, nothing is written
+    let mut on = rig.manager();
+    on.allow_s24_screen_awake();
+    let p_plain = AdbPhone::new(&plain_runner, S24_SERIAL);
+    assert!(on
+        .apply(
+            &p_plain,
+            ro,
+            &owner,
+            "system",
+            "screen_off_timeout",
+            "1800000",
+            ScopeReq::Session
+        )
+        .is_err());
+    assert_eq!(
+        s24.get("system", "screen_off_timeout").as_deref(),
+        Some("30000")
+    );
+    assert!(on.store.entries().unwrap().is_empty());
+
+    // both opt-ins, behind an address (found by ro.serialno): the two keys lease, others refuse
+    s24.state().tokens = vec!["192.0.2.99:40000".into()];
+    let p = AdbPhone::new(&awake_runner, "192.0.2.99:40000");
+    for (ns, k, v) in [
+        ("system", "screen_off_timeout", "1800000"),
+        ("global", "stay_on_while_plugged_in", "7"),
+    ] {
+        on.apply(&p, ro, &owner, ns, k, v, ScopeReq::Session)
+            .unwrap_or_else(|e| panic!("{ns}/{k}: {e}"));
+        assert_eq!(s24.get(ns, k).as_deref(), Some(v));
+    }
+    for (ns, k, v) in [
+        ("system", "screen_brightness", "1"),
+        ("secure", "lockscreen.disabled", "1"),
+        ("global", "adb_enabled", "1"),
+    ] {
+        let e = on
+            .apply(&p, ro, &owner, ns, k, v, ScopeReq::Session)
+            .unwrap_err();
+        assert_eq!(e.class(), Some("read_only"), "{ns}/{k}: {e}");
+        assert_eq!(s24.get(ns, k), None, "{ns}/{k} was written");
+    }
+    // the session ends: both come back by compare-and-swap, and the store is empty
+    let rs = on.restore_session(&p, ro, "awake:s24").unwrap();
+    assert_eq!(rs.len(), 2);
+    assert!(
+        rs.iter().all(|(_, st)| *st == RestoreStatus::Restored),
+        "{rs:?}"
+    );
+    assert_eq!(
+        s24.get("system", "screen_off_timeout").as_deref(),
+        Some("30000")
+    );
+    assert_eq!(
+        s24.get("global", "stay_on_while_plugged_in").as_deref(),
+        Some("0")
+    );
+    assert!(on.store.entries().unwrap().is_empty());
+    // only settings get/put on the two keys (and the identity probe) ever reached the protected phone
+    for l in s24.state().log.iter() {
+        assert!(
+            l == "getprop ro.serialno"
+                || l.ends_with("system screen_off_timeout")
+                || l.ends_with("global stay_on_while_plugged_in")
+                || l.contains("system screen_off_timeout ")
+                || l.contains("global stay_on_while_plugged_in "),
+            "{l}"
+        );
+    }
+
+    // any other read_only phone stays refused, opt-ins or not, and gets only the identity probe
+    let other = FakePhone::new("ROPHONE01");
+    let other_runner = GuardedRunner::with_s24_screen_awake(other.clone());
+    let po = AdbPhone::new(&other_runner, "ROPHONE01");
+    let e = on
+        .apply(
+            &po,
+            ro,
+            &owner,
+            "system",
+            "screen_off_timeout",
+            "1800000",
+            ScopeReq::Session,
+        )
+        .unwrap_err();
+    assert_eq!(e.class(), Some("read_only"));
+    assert!(other.commands().is_empty(), "{:?}", other.commands());
+}
+
 /// The item schema of `schemas/job-view.json` `changes_in_force`, checked by hand.
 fn check_job_view_item(v: &Value) {
     let o = v.as_object().unwrap();

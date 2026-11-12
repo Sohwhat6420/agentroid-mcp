@@ -136,6 +136,7 @@ impl Transport for Shared {
 }
 
 struct Harness {
+    daemon: Arc<Daemon>,
     connector: DuplexConnector,
     _shutdown: watch::Sender<bool>,
     phone: Arc<Mutex<Phone>>,
@@ -147,6 +148,19 @@ fn start(poco_mode: DeviceMode) -> Harness {
 
 /// `start`, with core's audit log at `audit` (D3b: the file guard's decisions are logged there).
 fn start_audited(poco_mode: DeviceMode, audit: Option<&Path>) -> Harness {
+    start_full(poco_mode, audit, None)
+}
+
+/// `start`, with session stay-awake attached over `awake` (care's fake phone and a leases file).
+fn start_awake(poco_mode: DeviceMode, awake: bridged::awake::AwakeConfig) -> Harness {
+    start_full(poco_mode, None, Some(awake))
+}
+
+fn start_full(
+    poco_mode: DeviceMode,
+    audit: Option<&Path>,
+    awake: Option<bridged::awake::AwakeConfig>,
+) -> Harness {
     let phone = Arc::new(Mutex::new(Phone::default()));
     let mut core = Core::new(Shared(phone.clone()), FakeClock::new());
     if let Some(p) = audit {
@@ -155,14 +169,18 @@ fn start_audited(poco_mode: DeviceMode, audit: Option<&Path>) -> Harness {
     let mut backend = CoreBackend::new(core);
     backend.set_mode(POCO, poco_mode);
     let daemon = Daemon::new(Registry::in_memory(), Box::new(backend));
+    if let Some(cfg) = awake {
+        daemon.attach_awake(cfg, Duration::from_secs(3600)).unwrap();
+    }
     // the laptop folder of the test that called `tmp_dir` on this thread (outbox/ and inbox/)
     if let Some(files) = FILES.with(|f| f.borrow().clone()) {
         daemon.set_files_dir(files);
     }
     let (listener, connector) = duplex_listener();
     let (shutdown, rx) = watch::channel(false);
-    tokio::spawn(server::serve(daemon, listener, rx));
+    tokio::spawn(server::serve(daemon.clone(), listener, rx));
     Harness {
+        daemon,
         connector,
         _shutdown: shutdown,
         phone,
@@ -759,5 +777,64 @@ fn doctor_without_a_command_asks_the_phone_nothing_and_every_call_is_journalled(
                 && l.contains("settings put")),
             "{log:?}"
         );
+    });
+}
+
+/// Session stay-awake counts the devtools route too (12 Nov 2026: on the protected phone, a session of `doctor`
+/// calls alone never held the screen, because only the tool route told stay-awake).
+#[test]
+fn a_doctor_call_holds_the_screen_awake_and_the_session_ending_restores_it() {
+    run(async {
+        let dir = tmp_dir("awake-doctor");
+        let phone = care::fake::FakePhone::new(POCO);
+        phone.state().tokens.push("192.0.2.50:37123".into()); // the fake core's adb serial for the POCO
+        phone.set("system", "screen_off_timeout", "30000");
+        phone.set("global", "stay_on_while_plugged_in", "0");
+        let h = start_awake(
+            DeviceMode::Full,
+            bridged::awake::AwakeConfig {
+                adb: bridged::jobs::DynRunner(Arc::new(phone.clone())),
+                s24: true,
+                leases: dir.join("leases.json"),
+                clock: Arc::new(care::clock::FakeClock::new(care::clock::TEST_EPOCH_MS)),
+                pids: Arc::new(care::pid::FakePids::default()),
+                idle_ms: 60_000,
+            },
+        );
+        let mut c = Client::leased(&h, POCO).await;
+        let held = || {
+            (
+                phone.get("system", "screen_off_timeout"),
+                phone.get("global", "stay_on_while_plugged_in"),
+            )
+        };
+        assert_eq!(
+            held(),
+            (Some("30000".into()), Some("0".into())),
+            "the lease alone holds nothing"
+        );
+        let r = c.diagnose(POCO, "dumpsys battery").await;
+        assert!(r["result"].is_object(), "{r}");
+        // the hold runs on stay-awake's worker, so the call did not wait for it
+        for _ in 0..200 {
+            if held().1.as_deref() == Some("7") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let notes = h.daemon.awake().unwrap().take_notes();
+        assert_eq!(
+            held(),
+            (Some("1800000".into()), Some("7".into())),
+            "{notes:?}"
+        );
+        drop(c); // the session ends: the restore runs on its own thread
+        for _ in 0..200 {
+            if held().0.as_deref() == Some("30000") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(held(), (Some("30000".into()), Some("0".into())));
     });
 }

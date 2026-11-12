@@ -486,6 +486,43 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
     }
     let _ = &args.profiles; // the take-over needs care, which needs the live adb runner (not wired)
     let daemon = Daemon::with_jobs(registry, backend, Some(jobs));
+    // session stay-awake (bridged::awake): live adb only; read_only devices are refused by care,
+    // except the protected phone's one exception (the two screen keys, nothing else) unless AGENTROID_NO_S24_AWAKE=1
+    if let Some(path) = &adb_path {
+        let (on, idle_ms) = bridged::awake::from_env();
+        if on {
+            let s24 = bridged::awake::s24_from_env();
+            let cfg = bridged::awake::AwakeConfig {
+                adb: bridged::jobs::DynRunner(std::sync::Arc::new(AdbRunner::new(path))),
+                s24,
+                // phone-guard's store when PHONE_GUARD_LEASES names it, as care's LeaseStore::from_env_or does
+                leases: std::env::var_os("PHONE_GUARD_LEASES")
+                    .filter(|p| !p.is_empty())
+                    .map_or_else(|| args.state_dir.join("leases.json"), PathBuf::from),
+                clock: std::sync::Arc::new(care::clock::SystemClock::new()),
+                pids: std::sync::Arc::new(care::pid::OsPids),
+                idle_ms,
+            };
+            daemon.attach_awake(cfg, Duration::from_secs(30))?;
+            log(
+                &args.state_dir,
+                &format!(
+                    "stay-awake on: idle restore after {} s; S24 screen keys {}",
+                    idle_ms / 1000,
+                    if s24 {
+                        "on"
+                    } else {
+                        "off (AGENTROID_NO_S24_AWAKE=1)"
+                    }
+                ),
+            );
+        } else {
+            log(
+                &args.state_dir,
+                "stay-awake off (AGENTROID_NO_STAY_AWAKE=1)",
+            );
+        }
+    }
     // push reads only <state dir>\files\outbox; pull_new writes only <state dir>\files\inbox
     daemon.set_files_dir(args.state_dir.join("files"));
     // the link hub (2.12): only when an address is given; link-hub refuses 0.0.0.0 and the LAN
@@ -591,10 +628,28 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
                 args.pipe
             ),
         );
+        let awake = daemon.awake().cloned();
+        if let Some(a) = awake.clone() {
+            let dir = args.state_dir.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    for n in a.take_notes() {
+                        log(&dir, &n);
+                    }
+                }
+            });
+        }
         let r = server::serve(daemon, listener, rx)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(true);
+        if let Some(a) = awake {
+            a.shutdown();
+            for n in a.take_notes() {
+                log(&args.state_dir, &n);
+            }
+        }
         log(&args.state_dir, "bridged stopped");
         r
     })

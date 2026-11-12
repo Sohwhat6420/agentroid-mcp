@@ -369,12 +369,29 @@ fn value_text(v: &Value) -> Result<String, Failure> {
 }
 
 impl Daemon {
+    /// Session stay-awake (`awake.rs`): a call that passed the lease check counts as the session
+    /// working this phone. Both `device.call` routes (tools and devtools) come here.
+    pub(crate) fn keep_awake(&self, conn_id: u64, key: &str, dev: &DeviceInfo) {
+        let Some(a) = self.awake.get() else {
+            return;
+        };
+        let (allowed, mode) = {
+            let b = self.backend();
+            (b.allowed(dev), b.mode_of(dev))
+        };
+        // the protected phone is never `allowed`; its one exception still keeps its screen on (two keys only)
+        if allowed || a.covers_s24(key, &dev.serial) {
+            a.touch_later(conn_id, key, &dev.serial, mode); // queued: the call does not wait
+        }
+    }
+
     /// `device.call`: resolve, check the lease, run the call with its options, attach `health`.
     pub(crate) fn device_call(&self, conn_id: u64, params: &Value) -> Result<Value, RpcError> {
         let p: DeviceCallParams = parse_params(params)?;
         let dev = self.resolve(&p.device)?;
         let key = device_key(&dev);
         self.require_holder(&key, conn_id)?;
+        self.keep_awake(conn_id, &key, &dev);
         match self.run_tool(&dev, &key, &p.call) {
             Ok((d, attempts)) => {
                 let health = self.health_member(&dev);

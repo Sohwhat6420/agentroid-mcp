@@ -247,6 +247,8 @@ pub struct Daemon {
     /// The laptop folder `push` reads from (`outbox`) and `pull_new` writes to (`inbox`).
     /// Unset: `devtools::default_files_dir()`. `bridged` sets `<state dir>/files`.
     pub(crate) files_dir: OnceLock<PathBuf>,
+    /// Session stay-awake (`crate::awake`), once attached (live adb only).
+    pub(crate) awake: OnceLock<Arc<crate::awake::SessionAwake>>,
     /// The `Arc` this daemon lives in, so a job thread can own a handle to it.
     me: Weak<Daemon>,
 }
@@ -303,6 +305,10 @@ struct ConnGuard<'a> {
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
         self.daemon.registry.release_conn(self.id);
+        if let Some(a) = self.daemon.awake.get() {
+            // the restore talks to the phone: queued on stay-awake's worker, after this session's hold
+            a.leave_later(self.id);
+        }
     }
 }
 
@@ -355,6 +361,7 @@ impl Daemon {
             link: OnceLock::new(),
             waits: OnceLock::new(),
             files_dir: OnceLock::new(),
+            awake: OnceLock::new(),
             me: me.clone(),
         })
     }
@@ -396,12 +403,36 @@ impl Daemon {
         self.link.get()
     }
 
-    /// care's settings leases in force on a phone (`leases.json`; empty without care).
+    /// care's settings leases in force on a phone (`leases.json`; empty without care or stay-awake).
     pub fn changes_in_force(&self, key: &str) -> Vec<care::settings::ChangeInForce> {
-        let Some(care) = self.jobs_cfg.as_ref().and_then(|c| c.care.as_ref()) else {
-            return vec![];
+        let path = match (
+            self.jobs_cfg.as_ref().and_then(|c| c.care.as_ref()),
+            self.awake.get(),
+        ) {
+            (Some(care), _) => care.leases.clone(),
+            (None, Some(a)) => a.leases_path().to_path_buf(),
+            (None, None) => return vec![],
         };
-        crate::jobcare::changes_in_force(&care.leases, key).unwrap_or_default()
+        crate::jobcare::changes_in_force(&path, key).unwrap_or_default()
+    }
+
+    /// Attach session stay-awake (once) and start its idle sweep.
+    pub fn attach_awake(
+        &self,
+        cfg: crate::awake::AwakeConfig,
+        sweep_every: std::time::Duration,
+    ) -> Result<(), String> {
+        let a = Arc::new(crate::awake::SessionAwake::new(cfg));
+        a.start_worker();
+        crate::awake::spawn_sweeper(Arc::downgrade(&a), sweep_every);
+        self.awake
+            .set(a)
+            .map_err(|_| "stay-awake is already attached".to_string())
+    }
+
+    /// Stay-awake, if attached.
+    pub fn awake(&self) -> Option<&Arc<crate::awake::SessionAwake>> {
+        self.awake.get()
     }
 
     fn change_rows(&self, key: &str) -> Vec<ChangeRow> {

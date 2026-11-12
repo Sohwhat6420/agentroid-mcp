@@ -14,16 +14,19 @@
 //!   the bytes sit in `Screenshot::jpeg` although they are PNG;
 //! * screen rotation is read from `dumpsys input` (SurfaceOrientation of the first input device, as
 //!   phone-hands does); portrait is checked on the POCO, landscape only on paper;
-//! * `health_hint` says nothing (health rides on replies, and no reply carries it yet).
+//! * `health_hint` carries only what replies already asked for said: battery, power and temperature
+//!   after a `dumpsys battery` read, the screen after a wakefulness read or an unlock, the lock after an
+//!   unlock. Nothing is probed for it, so a phone nobody has read the battery of still shows unknown.
 
 use agentroid_adb_link::parse::parse_devices;
 use agentroid_adb_link::runner::{RunError, RunOutput, Runner};
 use agentroid_core::frame::Shot;
 use agentroid_core::transport::{
-    Backend, DeviceInfo, Input, Screenshot, Transport, TransportError,
+    Backend, DeviceInfo, HealthHint, Input, Screenshot, Transport, TransportError,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 const SHELL_MS: u64 = 30_000;
 const DUMP_MS: u64 = 45_000;
@@ -50,6 +53,117 @@ pub struct AdbTransport<R: Runner> {
     dex_on: HashSet<String>,
     /// Off only for the benchmark's "guard as run 2 had it" configuration (`AGENTROID_NO_IDLE_FALLBACK=1`).
     idle_fallback: bool,
+    /// adb serial -> what this transport's own replies said about the phone (the `health_hint` source).
+    seen: HashMap<String, Seen>,
+}
+
+/// What the replies served so far said about one phone, each with when it was read (field notes,
+/// 11 Nov 2026: the POCO's header showed battery, power and temperature as unknown on every call, and
+/// the screen as off after an unlock that had woken it). Filled only from output already asked for:
+/// `dumpsys battery` (a `doctor` read or a job's care check), the wakefulness read, the unlock script.
+#[derive(Debug, Default, Clone)]
+struct Seen {
+    battery: Option<(u8, Instant)>,
+    powered: Option<(bool, Instant)>,
+    temp_c: Option<(f64, Instant)>,
+    screen: Option<(String, Instant)>,
+    lock: Option<(String, Instant)>,
+}
+
+impl Seen {
+    /// `Awake` is on; `Asleep`, `Dozing` and `Dreaming` are off (as `Core::health_of` maps it).
+    fn note_wake(&mut self, wake: &str, at: Instant) {
+        let s = if wake == "Awake" { "on" } else { "off" };
+        self.screen = Some((s.to_string(), at));
+    }
+
+    fn note_reply(&mut self, line: &str, text: &str, at: Instant) {
+        if line.trim() == "dumpsys battery" {
+            self.note_battery(text, at);
+        }
+        // the unlock script's last state line: `after:mWakefulness=Awake isKeyguardShowing=false`
+        if let Some(after) = text.lines().find_map(|l| l.trim().strip_prefix("after:")) {
+            if let Some(w) = after
+                .strip_prefix("mWakefulness=")
+                .and_then(|r| r.split_whitespace().next())
+            {
+                self.note_wake(w, at);
+            }
+            if after.contains("isKeyguardShowing=true") || after.contains("mShowingLockscreen=true")
+            {
+                self.lock = Some(("locked".into(), at));
+            } else if after.contains("isKeyguardShowing=false")
+                || after.contains("mShowingLockscreen=false")
+            {
+                self.lock = Some(("unlocked".into(), at));
+            }
+        }
+    }
+
+    /// `dumpsys battery`: `level` over `scale` as a percent, `temperature` in tenths of a degree, and
+    /// powered when any of the AC, USB, wireless or dock lines says true.
+    fn note_battery(&mut self, text: &str, at: Instant) {
+        let (mut level, mut scale) = (None::<u32>, 100u32);
+        let (mut any_true, mut any_false) = (false, false);
+        for l in text.lines() {
+            let Some((k, v)) = l.trim().split_once(':') else {
+                continue;
+            };
+            let v = v.trim();
+            match k.trim() {
+                "level" => level = v.parse().ok(),
+                "scale" => scale = v.parse().ok().filter(|s| *s > 0).unwrap_or(100),
+                "temperature" => {
+                    if let Ok(t) = v.parse::<i32>() {
+                        self.temp_c = Some((f64::from(t) / 10.0, at));
+                    }
+                }
+                "AC powered" | "USB powered" | "Wireless powered" | "Dock powered" => match v {
+                    "true" => any_true = true,
+                    "false" => any_false = true,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if let Some(n) = level {
+            let pct = (n.saturating_mul(100) / scale).min(100);
+            self.battery = Some((u8::try_from(pct).unwrap_or(100), at));
+        }
+        if any_true || any_false {
+            self.powered = Some((any_true, at));
+        }
+    }
+
+    fn hint(&self, now: Instant) -> HealthHint {
+        let mut oldest = 0.0f64;
+        let mut age = |at: &Instant| {
+            oldest = oldest.max(now.saturating_duration_since(*at).as_secs_f64());
+        };
+        let mut h = HealthHint::default();
+        if let Some((v, at)) = &self.battery {
+            h.battery = Some(*v);
+            age(at);
+        }
+        if let Some((v, at)) = &self.powered {
+            h.powered = Some(*v);
+            age(at);
+        }
+        if let Some((v, at)) = &self.temp_c {
+            h.temp_c = Some(*v);
+            age(at);
+        }
+        if let Some((v, at)) = &self.screen {
+            h.screen = Some(v.clone());
+            age(at);
+        }
+        if let Some((v, at)) = &self.lock {
+            h.lock = Some(v.clone());
+            age(at);
+        }
+        h.age_s = oldest;
+        h
+    }
 }
 
 impl<R: Runner> AdbTransport<R> {
@@ -60,6 +174,7 @@ impl<R: Runner> AdbTransport<R> {
             hw: HashMap::new(),
             dex_on: HashSet::new(),
             idle_fallback: !off,
+            seen: HashMap::new(),
         }
     }
 
@@ -334,7 +449,8 @@ impl<R: Runner> Transport for AdbTransport<R> {
             "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -1",
             SHELL_MS,
         )?;
-        text.trim()
+        let wake = text
+            .trim()
             .strip_prefix("mWakefulness=")
             .map(str::to_string)
             .filter(|s| !s.is_empty())
@@ -343,7 +459,12 @@ impl<R: Runner> Transport for AdbTransport<R> {
                     "cannot read the wakefulness from {:?}",
                     text.trim()
                 ))
-            })
+            })?;
+        self.seen
+            .entry(serial.to_string())
+            .or_default()
+            .note_wake(&wake, Instant::now());
+        Ok(wake)
     }
 
     fn screenshot(&mut self, serial: &str, _max_width: i32) -> Result<Screenshot, TransportError> {
@@ -432,7 +553,19 @@ impl<R: Runner> Transport for AdbTransport<R> {
     }
 
     fn shell(&mut self, serial: &str, line: &str) -> Result<String, TransportError> {
-        self.sh(serial, line, SHELL_MS)
+        let text = self.sh(serial, line, SHELL_MS)?;
+        // health rides on replies already asked for (a `doctor` battery read, the unlock script); never a probe
+        self.seen
+            .entry(serial.to_string())
+            .or_default()
+            .note_reply(line, &text, Instant::now());
+        Ok(text)
+    }
+
+    fn health_hint(&mut self, serial: &str) -> HealthHint {
+        self.seen
+            .get(serial)
+            .map_or_else(HealthHint::default, |s| s.hint(Instant::now()))
     }
 
     fn helper_status(&mut self, _serial: &str) -> Result<(), String> {
@@ -565,6 +698,11 @@ mod tests {
                 }
             } else if line == "pm list packages" {
                 ok("package:com.android.settings\r\npackage:org.tasks\r\n")
+            } else if line == "dumpsys battery" {
+                // the POCO's reply, 11 Nov 2026 (trimmed)
+                ok("Current Battery Service state:\n  AC powered: false\n  USB powered: true\n  Wireless powered: false\n  Dock powered: false\n  level: 98\n  scale: 100\n  temperature: 315\n")
+            } else if line.starts_with("echo before:") {
+                ok("before:mWakefulness=Dozing\nafter:mWakefulness=Awake isKeyguardShowing=false\ndisabled:true\n")
             } else {
                 ok("")
             })
@@ -720,6 +858,65 @@ mod tests {
                 .unwrap(),
             (1080, 2400)
         );
+    }
+
+    #[test]
+    fn health_hint_is_empty_until_a_reply_carries_health() {
+        let log: Log = Default::default();
+        let mut t = live(Script::new(&log));
+        assert!(t.health_hint("emulator-5554").is_empty());
+        t.shell("emulator-5554", "getprop ro.product.model")
+            .unwrap();
+        assert!(t.health_hint("emulator-5554").is_empty());
+        // reading the hint sends nothing
+        let before = log.borrow().len();
+        let _ = t.health_hint("emulator-5554");
+        assert_eq!(log.borrow().len(), before);
+    }
+
+    #[test]
+    fn a_battery_read_fills_battery_power_and_temperature() {
+        let log: Log = Default::default();
+        let mut t = live(Script::new(&log));
+        t.shell("emulator-5554", "dumpsys battery").unwrap();
+        let h = t.health_hint("emulator-5554");
+        assert_eq!(h.battery, Some(98));
+        assert_eq!(h.powered, Some(true));
+        assert_eq!(h.temp_c, Some(31.5));
+        assert!(h.age_s >= 0.0 && h.age_s < 5.0);
+        // another phone's hint is untouched
+        assert!(t.health_hint("emulator-5556").is_empty());
+    }
+
+    #[test]
+    fn an_unlock_refreshes_screen_and_lock() {
+        let log: Log = Default::default();
+        let mut t = live(Script::new(&log));
+        t.shell(
+            "emulator-5554",
+            &agentroid_core::shell::unlock_script(1080, 2400),
+        )
+        .unwrap();
+        let h = t.health_hint("emulator-5554");
+        assert_eq!(h.screen.as_deref(), Some("on"));
+        assert_eq!(h.lock.as_deref(), Some("unlocked"));
+    }
+
+    #[test]
+    fn battery_text_scales_and_reads_unpowered() {
+        let mut s = Seen::default();
+        let at = Instant::now();
+        s.note_battery(
+            "  AC powered: false\n  USB powered: false\n  level: 40\n  scale: 50\n  temperature: -12\n",
+            at,
+        );
+        let h = s.hint(at);
+        assert_eq!(h.battery, Some(80));
+        assert_eq!(h.powered, Some(false));
+        assert_eq!(h.temp_c, Some(-1.2));
+        let mut w = Seen::default();
+        w.note_wake("Dozing", at);
+        assert_eq!(w.hint(at).screen.as_deref(), Some("off"));
     }
 
     #[test]

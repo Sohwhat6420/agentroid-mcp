@@ -11,6 +11,7 @@
 //! TCP listener, 127.0.0.1 and in hub mode the tailnet, never `0.0.0.0` or the LAN).
 
 pub mod allow;
+pub mod awake;
 pub mod devcall;
 pub mod devtools;
 pub mod diagnose;

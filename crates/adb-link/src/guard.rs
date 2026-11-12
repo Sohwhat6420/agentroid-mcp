@@ -33,6 +33,38 @@ pub const S24_READS: &[&str] = &[
     "shell dumpsys thermalservice",
 ];
 
+/// The one exception to the protected phone rule, chosen by its owner on 12 Nov 2026: keep its screen on while a
+/// session works (screen timeout and stay-on only, put back after each session), and nothing else.
+///
+/// Only a runner built with [`GuardedRunner::with_s24_screen_awake`] (session stay-awake's, and no
+/// other) lets these two keys through to the protected phone, and only as the exact lines
+/// [`Checked::is_s24_screen_awake`] accepts. Every other runner and the plain [`Guard`] still refuse
+/// them for the protected phone.
+pub const S24_SCREEN_AWAKE_KEYS: [(&str, &str); 2] = [
+    ("system", "screen_off_timeout"),
+    ("global", "stay_on_while_plugged_in"),
+];
+
+/// A value the protected phone exception may write: a plain decimal (no sign, no leading zero), at most
+/// `i32::MAX` ms for the timeout and at most 15 (the AC, USB, wireless and dock bits) for stay-on.
+fn screen_awake_value(key: &str, v: &str) -> bool {
+    if v.is_empty()
+        || v.len() > 10
+        || !v.bytes().all(|c| c.is_ascii_digit())
+        || (v.len() > 1 && v.starts_with('0'))
+    {
+        return false;
+    }
+    let Ok(n) = v.parse::<u64>() else {
+        return false;
+    };
+    match key {
+        "screen_off_timeout" => n <= i32::MAX as u64,
+        "stay_on_while_plugged_in" => n <= 15,
+        _ => false,
+    }
+}
+
 /// Server-wide, read-only commands that never touch one device.
 pub const GLOBAL_SAFE: [&str; 3] = ["devices", "version", "mdns"];
 /// Commands that act on a device's transport or state: refused without an explicit target.
@@ -259,6 +291,22 @@ impl Checked {
         S24_READS.contains(&words.join(" ").as_str())
     }
 
+    /// True when this is exactly one of the protected phone exception's lines, as care's `AdbPhone` sends them
+    /// (`shell` plus one argument): `settings get|delete <ns> <key>` or `settings put <ns> <key> <n>`
+    /// for one of [`S24_SCREEN_AWAKE_KEYS`], words split by single spaces, `<n>` a plain number.
+    pub fn is_s24_screen_awake(&self) -> bool {
+        if self.sub != "shell" || self.rest.len() != 1 {
+            return false;
+        }
+        let w: Vec<&str> = self.rest[0].split(' ').collect();
+        let key_ok = |ns: &str, k: &str| S24_SCREEN_AWAKE_KEYS.contains(&(ns, k));
+        match w.as_slice() {
+            ["settings", "get" | "delete", ns, k] => key_ok(ns, k),
+            ["settings", "put", ns, k, v] => key_ok(ns, k) && screen_awake_value(k, v),
+            _ => false,
+        }
+    }
+
     /// True when `sub` + `rest` is exactly one of [`GETEVENT_SHAPES`].
     pub fn is_getevent_shape(&self) -> bool {
         let mut words = vec![self.sub.as_str()];
@@ -312,6 +360,9 @@ impl Checked {
 #[derive(Debug, Default)]
 pub struct Guard {
     denied: Mutex<HashSet<String>>,
+    /// The protected phone screen-awake exception (see [`S24_SCREEN_AWAKE_KEYS`]). Off unless the runner was
+    /// built with [`GuardedRunner::with_s24_screen_awake`].
+    s24_screen_awake: bool,
 }
 
 fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -335,26 +386,21 @@ impl Guard {
     /// Check a full adb argv (without the executable).
     pub fn check(&self, argv: &[String]) -> Result<Checked, GuardError> {
         let (selector, sub, rest) = parse_argv(argv)?;
-        if let Some(sel) = &selector {
-            if let Some(v) = sel.get(1) {
-                let read = Checked {
-                    selector: None,
-                    sub: sub.clone(),
-                    rest: rest.clone(),
-                    addresses: vec![],
-                }
-                .is_s24_read();
-                if self.is_forbidden(v) && !read {
-                    return refuse(format!("{v} is the read-only S24, never a target"));
-                }
-            }
-        }
         let probe = Checked {
             selector: None,
             sub: sub.clone(),
             rest: rest.clone(),
             addresses: vec![],
         };
+        if let Some(sel) = &selector {
+            if let Some(v) = sel.get(1) {
+                let read =
+                    probe.is_s24_read() || (self.s24_screen_awake && probe.is_s24_screen_awake());
+                if self.is_forbidden(v) && !read {
+                    return refuse(format!("{v} is the read-only S24, never a target"));
+                }
+            }
+        }
         if probe.touches_link() && probe.link_command().is_none() {
             return refuse(
                 "only the two exact link-pairing shapes (dumpsys of the LinkService, am broadcast of PAIR with a P-256 public key, a tailnet hub address and a serial) may name the helper's link",
@@ -510,6 +556,18 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
+    /// The runner session stay-awake uses, and nothing else: as [`GuardedRunner::new`], plus the
+    /// S24 exception's exact lines ([`Checked::is_s24_screen_awake`]) on the protected phone.
+    pub fn with_s24_screen_awake(inner: R) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                s24_screen_awake: true,
+                ..Guard::default()
+            },
+        }
+    }
+
     pub fn guard(&self) -> &Guard {
         &self.guard
     }
@@ -575,7 +633,8 @@ impl<R: Runner> GuardedRunner<R> {
                     if let Some(v) = sel.get(1) {
                         self.guard.deny(v);
                     }
-                    if !c.is_s24_read() {
+                    if !c.is_s24_read() && !(self.guard.s24_screen_awake && c.is_s24_screen_awake())
+                    {
                         return Err(RunError::Refused(
                             "target is the read-only S24, never a target".into(),
                         ));
@@ -1359,5 +1418,157 @@ mod tests {
         assert!(S24_READS.iter().all(|r| !r.contains("agentroid")
             && !r.contains("broadcast")
             && !r.contains("activity service")));
+    }
+
+    // ---- the protected phone screen-awake exception (its owner's choice, 12 Nov 2026) ----
+
+    /// Every line care's AdbPhone sends to lease and restore the two keys.
+    const AWAKE_LINES: [&str; 8] = [
+        "settings get system screen_off_timeout",
+        "settings get global stay_on_while_plugged_in",
+        "settings put system screen_off_timeout 1800000",
+        "settings put global stay_on_while_plugged_in 7",
+        "settings put system screen_off_timeout 30000",
+        "settings put global stay_on_while_plugged_in 0",
+        "settings delete system screen_off_timeout",
+        "settings delete global stay_on_while_plugged_in",
+    ];
+
+    fn s24_spy() -> Spy {
+        Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn without_the_opt_in_the_s24_refuses_the_screen_awake_lines() {
+        for line in AWAKE_LINES {
+            for sel in [S24_SERIAL, "protected0000example", "192.0.2.99:40000"] {
+                let argv = args(&["-s", sel, "shell", line]);
+                if sel != "192.0.2.99:40000" {
+                    assert!(Guard::new().check(&argv).is_err(), "{sel} {line}");
+                }
+                let r = GuardedRunner::new(s24_spy());
+                assert!(
+                    matches!(r.run(&argv, 1000), Err(RunError::Refused(_))),
+                    "{sel} {line}"
+                );
+                assert!(
+                    !r.inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&line.to_string())),
+                    "{line} reached adb"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_opt_in_runner_lets_exactly_the_screen_awake_lines_through_to_the_s24() {
+        for line in AWAKE_LINES {
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let r = GuardedRunner::with_s24_screen_awake(s24_spy());
+                let argv = args(&["-s", sel, "shell", line]);
+                r.run(&argv, 1000)
+                    .unwrap_or_else(|e| panic!("{sel} {line}: {e:?}"));
+                assert_eq!(r.inner.calls.borrow().last(), Some(&argv), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_opt_in_runner_refuses_everything_else_on_the_s24() {
+        let near = [
+            "settings get system screen_brightness",
+            "settings put system screen_brightness 1",
+            "settings put secure lockscreen.disabled 1",
+            "settings put global adb_enabled 0",
+            "settings put system screen_off_timeout_x 1",
+            "settings put global stay_on_while_plugged_in 16",
+            "settings put global stay_on_while_plugged_in 07",
+            "settings put system screen_off_timeout -1",
+            "settings put system screen_off_timeout 2147483648",
+            "settings put system screen_off_timeout 99999999999",
+            "settings put system screen_off_timeout 1800000;reboot",
+            "settings put system screen_off_timeout 1800000 extra",
+            "settings put system screen_off_timeout '1800000'",
+            "settings put system screen_off_timeout",
+            "settings  get system screen_off_timeout",
+            "settings get system screen_off_timeout ",
+            "settings get system screen_off_timeout; input tap 1 1",
+            "settings list system",
+            "settings get secure screen_off_timeout",
+            "settings put --user 0 system screen_off_timeout 1800000",
+            "svc power stayon true",
+            "input keyevent 224",
+            "input tap 1 1",
+            "ls",
+        ];
+        for line in near {
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let r = GuardedRunner::with_s24_screen_awake(s24_spy());
+                let argv = args(&["-s", sel, "shell", line]);
+                assert!(
+                    matches!(r.run(&argv, 1000), Err(RunError::Refused(_))),
+                    "{sel} {line}"
+                );
+                assert!(
+                    !r.inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&line.to_string())),
+                    "{line} reached adb"
+                );
+            }
+        }
+        // the multi-word spelling and exec-out are not the shape care sends
+        for a in [
+            &[
+                "-s",
+                S24_SERIAL,
+                "shell",
+                "settings",
+                "get",
+                "system",
+                "screen_off_timeout",
+            ][..],
+            &[
+                "-s",
+                S24_SERIAL,
+                "exec-out",
+                "settings get system screen_off_timeout",
+            ][..],
+        ] {
+            let r = GuardedRunner::with_s24_screen_awake(s24_spy());
+            assert!(r.run(&args(a), 1000).is_err(), "{a:?}");
+        }
+        // getevent and link pairing stay refused for the protected phone on this runner too
+        let r = GuardedRunner::with_s24_screen_awake(s24_spy());
+        assert!(r
+            .admit_getevent(
+                &args(&["-s", "192.0.2.99:40000", "exec-out", "getevent", "-lt"]),
+                true
+            )
+            .is_err());
+        assert!(r.run(&link_dump_argv(S24_SERIAL), 1000).is_err());
+    }
+
+    #[test]
+    fn the_opt_in_runner_drives_other_phones_as_before() {
+        let r = GuardedRunner::with_s24_screen_awake(Spy {
+            hw: POCO_HW.into(),
+            calls: RefCell::new(vec![]),
+        });
+        assert!(r
+            .run(
+                &args(&["-s", "192.0.2.78:37123", "shell", "input tap 1 1"]),
+                1000
+            )
+            .is_ok());
+        assert!(r.run(&args(&["kill-server"]), 1000).is_err());
     }
 }
