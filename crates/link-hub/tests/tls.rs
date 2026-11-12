@@ -96,7 +96,7 @@ async fn a_plain_websocket_client_is_refused_by_a_tls_hub() {
 #[tokio::test]
 async fn link_lan_without_tls_is_refused_before_anything_listens() {
     let dir = TempDir::new("tls-lan-plain");
-    let mut cfg = HubConfig::new(dir.path(), "192.0.2.147", 0, hub_key());
+    let mut cfg = HubConfig::new(dir.path(), "192.168.1.147", 0, hub_key());
     cfg.lan = true;
     let err = match Hub::start(cfg).await {
         Err(e) => e.to_string(),
@@ -109,7 +109,7 @@ async fn link_lan_without_tls_is_refused_before_anything_listens() {
 async fn without_link_lan_a_lan_address_is_still_refused() {
     let dir = TempDir::new("tls-nolan");
     let (tls, _) = HubTls::generate().unwrap();
-    let mut cfg = HubConfig::new(dir.path(), "192.0.2.147", 0, hub_key());
+    let mut cfg = HubConfig::new(dir.path(), "192.168.1.147", 0, hub_key());
     cfg.tls = Some(Arc::new(tls));
     let err = match Hub::start(cfg).await {
         Err(e) => e.to_string(),
@@ -125,7 +125,7 @@ fn the_lan_rule_adds_exactly_the_private_ranges() {
         "10.255.255.254",
         "172.16.0.1",
         "172.31.255.1",
-        "192.0.2.147",
+        "192.168.1.147",
         "127.0.0.1",
         "100.64.0.35",
     ] {
