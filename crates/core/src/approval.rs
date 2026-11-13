@@ -472,6 +472,10 @@ pub struct NtfyConfig {
     /// The base URL the phone's buttons post to, when it differs from `base` (a loopback server
     /// the phone reaches at a tailnet address). Defaults to `base`.
     pub tap_base: Option<String>,
+    /// The server refuses anonymous reads and writes (a self-hosted ntfy with `auth-default-access:
+    /// deny-all`), so a short topic name such as `alerts` is safe. Only with `token_file` set, and
+    /// never for ntfy.sh, where anyone may read an unreserved topic.
+    pub login_topics: bool,
 }
 
 impl NtfyConfig {
@@ -484,6 +488,7 @@ impl NtfyConfig {
             token_file: None,
             tap_token_file: None,
             tap_base: None,
+            login_topics: false,
         }
     }
 }
@@ -499,7 +504,10 @@ impl<H: Http> NtfyChannel<H> {
     }
 
     fn topics(&self) -> Result<(String, String), String> {
-        let login = self.cfg.token_file.is_some();
+        let login = self.cfg.token_file.is_some() && self.cfg.login_topics;
+        if login && host_of(&self.cfg.base).is_some_and(|h| h.eq_ignore_ascii_case("ntfy.sh")) {
+            return Err("short topics are never safe on ntfy.sh: drop login_topics".into());
+        }
         let out = read_topic_for(&self.cfg.topic_file, login)?;
         let inb = match &self.cfg.inbound_topic_file {
             Some(p) => read_topic_for(p, login)?,
@@ -512,7 +520,15 @@ impl<H: Http> NtfyChannel<H> {
     /// read makes the channel unavailable (the ask is refused), never anonymous.
     fn tokens(&self) -> Result<(Option<String>, Option<String>), String> {
         let t = match &self.cfg.token_file {
-            Some(p) => Some(read_token(p)?),
+            Some(p) => {
+                // a token travels in clear over plain http, so only to this machine
+                if !self.cfg.base.starts_with("https://")
+                    && !host_of(&self.cfg.base).is_some_and(is_loopback_host)
+                {
+                    return Err("a token is sent only to an https or loopback base".into());
+                }
+                Some(read_token(p)?)
+            }
             None => None,
         };
         let tap = match &self.cfg.tap_token_file {
@@ -629,6 +645,22 @@ impl<H: Http> Channel for NtfyChannel<H> {
         .map_err(|e| format!("poll failed: {}", scrub(&e, &secrets)))?;
         Ok(parse_ntfy_lines(&text))
     }
+}
+
+/// The host of an `http(s)://host[:port]/...` URL.
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let hostport = rest.split('/').next()?;
+    if let Some(v6) = hostport.strip_prefix('[') {
+        return v6.split(']').next();
+    }
+    hostport.split(':').next()
+}
+
+fn is_loopback_host(h: &str) -> bool {
+    h == "localhost" || h == "::1" || h.starts_with("127.")
 }
 
 /// Several channels as one: the ask goes out on every channel that can carry it (it is refused
@@ -753,22 +785,20 @@ impl CurlHttp {
 }
 
 impl Http for CurlHttp {
+    // Every call passes its URL (which holds the topic, a secret on a public server) and body to
+    // curl in a config on stdin, never on the command line, and fails on an HTTP error status.
     fn post_json(&mut self, url: &str, body: &str) -> Result<String, String> {
-        self.run(
-            &[
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-                url,
-            ],
-            Some(body),
-        )
+        let cfg = format!(
+            "url = {}\nfail-with-body\nheader = {}\ndata-binary = {}\n",
+            curl_quote(url),
+            curl_quote("Content-Type: application/json"),
+            curl_quote(body)
+        );
+        self.run(&["--config", "-"], Some(&cfg))
     }
     fn get(&mut self, url: &str) -> Result<String, String> {
-        self.run(&[url], None)
+        let cfg = format!("url = {}\nfail-with-body\n", curl_quote(url));
+        self.run(&["--config", "-"], Some(&cfg))
     }
     fn post_json_auth(&mut self, url: &str, body: &str, bearer: &str) -> Result<String, String> {
         let cfg = format!(
@@ -1356,6 +1386,7 @@ mod tests {
         cfg.inbound_topic_file = Some(d.join("taps.topic"));
         cfg.token_file = Some(d.join("laptop.token"));
         cfg.tap_token_file = Some(d.join("tap.token"));
+        cfg.login_topics = true;
         let mut a = Approver::new(Box::new(FakeChannel::default()));
         let r = req(&mut a, 1_700_000_000_000);
         let log: AuthLog = Default::default();
@@ -1382,8 +1413,62 @@ mod tests {
         assert!(ch.send(&r).is_err());
         // short topics need a login
         let plain = NtfyConfig::new(d.join("alerts.topic"));
-        let mut ch = NtfyChannel::new(plain, AuthHttp(log));
+        let mut ch = NtfyChannel::new(plain, AuthHttp(log.clone()));
         assert!(ch.send(&r).is_err());
+        std::fs::write(
+            d.join("laptop.token"),
+            "tk_LAPTOP000000000000000000000000\n",
+        )
+        .unwrap();
+        // a token alone does not make short topics safe: the route must say the server enforces logins
+        let mut no_flag = cfg_with_token(&d);
+        no_flag.login_topics = false;
+        assert!(NtfyChannel::new(no_flag, AuthHttp(log.clone()))
+            .send(&r)
+            .is_err());
+        // never on ntfy.sh
+        let mut public = cfg_with_token(&d);
+        public.base = "https://ntfy.sh".into();
+        assert!(NtfyChannel::new(public, AuthHttp(log.clone()))
+            .send(&r)
+            .is_err());
+        // a token over plain http only to this machine
+        let mut far = cfg_with_token(&d);
+        far.base = "http://192.0.2.7:2586".into();
+        assert!(NtfyChannel::new(far, AuthHttp(log.clone()))
+            .send(&r)
+            .is_err());
+        let mut v6 = cfg_with_token(&d);
+        v6.base = "http://[::1]:2586".into();
+        assert!(NtfyChannel::new(v6, AuthHttp(log)).send(&r).is_ok());
+    }
+
+    fn cfg_with_token(d: &Path) -> NtfyConfig {
+        let mut c = NtfyConfig::new(d.join("alerts.topic"));
+        c.base = "http://127.0.0.1:2586".into();
+        c.inbound_topic_file = Some(d.join("taps.topic"));
+        c.token_file = Some(d.join("laptop.token"));
+        c.login_topics = true;
+        c
+    }
+
+    #[test]
+    fn curl_anonymous_calls_fail_on_an_http_error_and_keep_the_url_off_the_command_line() {
+        // an ntfy.sh 429 or 403 is not a sent ask
+        let (port, h) = one_shot_server("429 Too Many Requests");
+        let r = CurlHttp::default().post_json(&format!("http://127.0.0.1:{port}/"), "{}");
+        h.join().unwrap();
+        assert!(r.is_err(), "{r:?}");
+        let (port, h) = one_shot_server("200 OK");
+        CurlHttp::default()
+            .get(&format!(
+                "http://127.0.0.1:{port}/secret-topic-0123456789abcdef/json?poll=1"
+            ))
+            .unwrap();
+        assert!(h
+            .join()
+            .unwrap()
+            .starts_with("GET /secret-topic-0123456789abcdef/json?poll=1 HTTP/1.1"));
     }
 
     #[test]

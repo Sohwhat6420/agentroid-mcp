@@ -5,20 +5,25 @@
 //!
 //! ```text
 //! agentroid ask-screen --device <serial|ip:port> --minutes N --why "TEXT"
-//!     [--route FILE] [--adb PATH] [--name LABEL] [--idle-min M] [--wait-s S] [--state-dir DIR]
+//!     [--session LABEL] [--route FILE] [--adb PATH] [--name LABEL] [--idle-min M]
+//!     [--wait-s S] [--in-use-app PKG]... [--state-dir DIR]
 //! ```
 //!
 //! * **In use** means the screen is on and any of these holds: the focused app is one the owner
 //!   is likely typing in (the Claude app, WhatsApp, Gmail, plus `--in-use-app`), the keyboard is
-//!   open, or the last touch was under `--idle-min` minutes ago (default 5). Anything that cannot
-//!   be read counts as in use, so a phone that answers only `dumpsys power` (a protected phone)
-//!   is in use whenever its screen is on.
-//! * **Not in use** (screen off or dozing, or on but untouched, no keyboard, no listed app):
-//!   allowed at once, with no push. Run the command again before each burst of actions.
+//!   open, the last touch was under `--idle-min` minutes ago (default 5), or an app is holding the
+//!   screen on (a video, a reader with keep-screen-on). Anything that cannot be read counts as in
+//!   use, so a phone that answers only `dumpsys power` (a protected phone) is in use whenever its
+//!   screen is on.
+//! * **Not in use** (screen off or dozing; or on, untouched, nothing holding it on, no keyboard,
+//!   no listed app): allowed at once, with no push. Run the command again before each burst.
 //! * **In use:** one push with what the session wants and for how long. Yes gives a lease of
-//!   `ceil(1.5 x N)` minutes (at most 60), and calls inside the lease are allowed without a push.
-//!   No, or no answer within `--wait-s` (default 120), is a refusal, and every call in the next
-//!   5 minutes is refused without a push (no spam; the owner's "No stops it, re-ask in 5 min").
+//!   `ceil(1.5 x N)` minutes (at most 60) to that session and purpose only (`--session`, default
+//!   the `--why` text). No, or no answer within `--wait-s` (default 90, so the command ends inside
+//!   a two-minute tool timeout), is a refusal, and every call for that phone in the next 5 minutes
+//!   is refused without a push (the owner's "No stops it, re-ask in 5 min").
+//! * **One ask at a time per phone:** while an ask is waiting on the owner, other calls for that
+//!   phone are refused without a second push.
 //! * **INTERIM:** the Yes is a plain tap, not yet a fingerprint. The push title says so.
 //!
 //! Prints one line of JSON. Exit codes: 0 allowed, 1 refused, 2 usage, 3 the phone could not be
@@ -29,15 +34,19 @@
 //! ```json
 //! {"routes": [{"base": "http://127.0.0.1:2586", "tap_base": "http://100.64.0.1:2586",
 //!              "topic_file": "alerts.topic", "inbound_topic_file": "taps.topic",
-//!              "token_file": "laptop.token", "tap_token_file": "tap.token"}]}
+//!              "token_file": "laptop.token", "tap_token_file": "tap.token",
+//!              "login_topics": true}]}
 //! ```
 //!
 //! Every field but `topic_file` is optional (`base` defaults to `https://ntfy.sh`). Relative paths
-//! are read from the route file's folder.
+//! are read from the route file's folder. `login_topics` says the server refuses anonymous access,
+//! so short topic names are safe; it needs `token_file` and is refused for ntfy.sh. A token is
+//! sent only to an https or loopback `base`.
 
 use crate::approval::{AnyChannel, Approver, Channel, CurlHttp, NtfyChannel, NtfyConfig, Outcome};
 use agentroid_adb_link::runner::{AdbRunner, Runner};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The apps a person is likely typing in or reading: in use whatever the idle time.
@@ -46,10 +55,16 @@ pub const IN_USE_APPS: [&str; 3] = [
     "com.whatsapp",
     "com.google.android.gm",
 ];
-/// After a No (or no answer), every call is refused without a push for this long.
+/// After a No (or no answer), every call for that phone is refused without a push for this long.
 pub const REASK_AFTER_MS: u64 = 5 * 60_000;
 /// The longest lease a Yes gives.
 pub const MAX_LEASE_MIN: u64 = 60;
+/// The longest `--wait-s`.
+pub const MAX_WAIT_S: u64 = 300;
+/// The default `--wait-s`: short enough that the whole command ends inside a 2-minute timeout.
+pub const DEFAULT_WAIT_S: u64 = 90;
+/// Room for sending the push and the last poll, on top of the wait, in the pending marker.
+const PENDING_SLACK_MS: u64 = 15_000;
 /// The title of the push. It says INTERIM until the fingerprint step ships.
 pub const TITLE: &str =
     "INTERIM ask (plain Yes/No, no fingerprint yet): Agentroid wants your screen";
@@ -59,8 +74,10 @@ pub const TITLE: &str =
 pub struct Signals {
     /// `mWakefulness` from `dumpsys power`: Awake, Dozing, Asleep, Dreaming.
     pub wakefulness: Option<String>,
-    /// Milliseconds since the last user activity (touch, key), on the phone's uptime clock.
+    /// Milliseconds since the last user activity (touch, key).
     pub idle_ms: Option<u64>,
+    /// Whether an app holds a screen wake lock (a video, keep-screen-on): someone is watching.
+    pub screen_kept_on: Option<bool>,
     /// The package of the focused window (`mCurrentFocus`), or `""` when nothing has focus.
     pub focus: Option<String>,
     /// Whether the keyboard is on screen (`mInputShown`).
@@ -82,19 +99,65 @@ pub enum Use {
     InUse(Vec<String>),
 }
 
-/// Parse `dumpsys power`: the wakefulness and the idle time. The phone's "now" on the uptime
-/// clock is any `name=<ms> (<n> ms ago)` line's sum; the last activity is
-/// `mLastUserActivityTime(excludingAttention)=<ms>` (or `mLastUserActivityTime=<ms>`).
-pub fn parse_power(text: &str) -> (Option<String>, Option<u64>) {
+/// What `dumpsys power` gives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Power {
+    pub wakefulness: Option<String>,
+    pub idle_ms: Option<u64>,
+    pub screen_kept_on: Option<bool>,
+}
+
+/// `key<value> (<n> ms ago)`, with `key` ending in `=`: (value, n).
+fn ms_ago(line: &str, key: &str) -> Option<(u64, u64)> {
+    let (val, ago) = line.strip_prefix(key)?.split_once(" (")?;
+    let ago = ago.strip_suffix(" ms ago)")?;
+    Some((val.parse().ok()?, ago.parse().ok()?))
+}
+
+/// The screen wake-lock bits of `mWakeLockSummary`: SCREEN_BRIGHT (0x2) and SCREEN_DIM (0x4).
+const SCREEN_LOCK_BITS: u64 = 0x2 | 0x4;
+const SCREEN_LOCK_TYPES: [&str; 3] = [
+    "SCREEN_BRIGHT_WAKE_LOCK",
+    "SCREEN_DIM_WAKE_LOCK",
+    "FULL_WAKE_LOCK",
+];
+
+/// Parse `dumpsys power`.
+///
+/// * The idle time comes from the display group's `lastUserActivityTime=<ms> (<n> ms ago)`
+///   (the most recent group), which states it directly. Without that line, the phone's "now" on
+///   the uptime clock is `mLastWakeTime` (or `mLastSleepTime`) plus its "ms ago", and the idle
+///   time is that minus `mLastUserActivityTime(excludingAttention)`. Other "ms ago" lines are on
+///   other clocks (`mLastGlobalWakeTimeRealtime` is on the realtime clock) and are never used. If
+///   the wake and sleep lines disagree on "now" by more than a second, the idle time is unknown.
+/// * The screen is kept on when `mWakeLockSummary` has a screen bit or the wake-lock list names
+///   a screen lock.
+pub fn parse_power(text: &str) -> Power {
     let mut wake = None;
-    let mut now: Option<u64> = None;
+    let mut group_idle: Option<u64> = None;
+    let mut wake_now: Option<u64> = None;
+    let mut sleep_now: Option<u64> = None;
     let mut last: Option<u64> = None;
+    let mut summary: Option<u64> = None;
+    let mut screen_lock_line = false;
     for line in text.lines() {
         let l = line.trim();
         if let Some(v) = l.strip_prefix("mWakefulness=") {
             if wake.is_none() && !v.is_empty() && v.chars().all(|c| c.is_ascii_alphabetic()) {
                 wake = Some(v.to_string());
             }
+            continue;
+        }
+        if let Some((_, ago)) = ms_ago(l, "lastUserActivityTime=") {
+            group_idle = Some(group_idle.map_or(ago, |g| g.min(ago)));
+            continue;
+        }
+        if let Some((v, a)) = ms_ago(l, "mLastWakeTime=") {
+            wake_now = wake_now.or(v.checked_add(a));
+            continue;
+        }
+        if let Some((v, a)) = ms_ago(l, "mLastSleepTime=") {
+            sleep_now = sleep_now.or(v.checked_add(a));
             continue;
         }
         for key in [
@@ -108,43 +171,70 @@ pub fn parse_power(text: &str) -> (Option<String>, Option<u64>) {
                 }
             }
         }
-        // "mLastWakeTime=170339786 (870480 ms ago)"
-        if now.is_none() {
-            if let Some((name_val, rest)) = l.split_once(" (") {
-                if let (Some((_, val)), Some(ago)) =
-                    (name_val.split_once('='), rest.strip_suffix(" ms ago)"))
-                {
-                    if let (Ok(v), Ok(a)) = (val.parse::<u64>(), ago.parse::<u64>()) {
-                        now = v.checked_add(a);
-                    }
-                }
+        if let Some(v) = l.strip_prefix("mWakeLockSummary=0x") {
+            if summary.is_none() {
+                summary = u64::from_str_radix(v.trim(), 16).ok();
             }
         }
+        if SCREEN_LOCK_TYPES.contains(&l.split_whitespace().next().unwrap_or("")) {
+            screen_lock_line = true;
+        }
     }
-    let idle = match (now, last) {
-        (Some(n), Some(l)) => Some(n.saturating_sub(l)),
-        _ => None,
+    let idle_ms = group_idle.or_else(|| {
+        let now = match (wake_now, sleep_now) {
+            (Some(a), Some(b)) if a.abs_diff(b) > 1000 => return None,
+            (Some(a), _) | (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        Some(now.saturating_sub(last?))
+    });
+    let screen_kept_on = if screen_lock_line {
+        Some(true)
+    } else {
+        summary.map(|s| s & SCREEN_LOCK_BITS != 0)
     };
-    (wake, idle)
+    Power {
+        wakefulness: wake,
+        idle_ms,
+        screen_kept_on,
+    }
+}
+
+fn is_user_token(t: &str) -> bool {
+    t.len() > 1 && t.starts_with('u') && t[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// The package in `Window{<hash> u0 [<STATE>] com.example.app/com.example.app.Main [EXITING]}`:
+/// the token with a `/`; else one that looks like a package; else the first plain name. Window
+/// states such as `EXITING` are never taken. `None` when no token fits.
+fn focus_package(v: &str) -> Option<String> {
+    let inner = v.trim_start_matches("Window{").trim_end_matches('}');
+    let toks: Vec<&str> = inner.split_whitespace().skip(1).collect();
+    let state = |t: &&&str| t.chars().all(|c| c.is_ascii_uppercase() || c == '_');
+    let pick = toks
+        .iter()
+        .find(|t| t.contains('/'))
+        .or_else(|| toks.iter().find(|t| t.contains('.') && !state(t)))
+        .or_else(|| toks.iter().find(|t| !is_user_token(t) && !state(t)))?;
+    Some(pick.split('/').next().unwrap_or("").to_string())
 }
 
 /// Parse `dumpsys window` (or its `mCurrentFocus=` / `isKeyguardShowing=` lines): the focused
 /// package and whether the lock screen shows.
 pub fn parse_window(text: &str) -> (Option<String>, Option<bool>) {
     let mut focus = None;
+    let mut seen_focus = false;
     let mut keyguard = None;
     for line in text.lines() {
         let l = line.trim();
-        if focus.is_none() {
+        if !seen_focus {
             if let Some(v) = l.strip_prefix("mCurrentFocus=") {
-                focus = Some(if v == "null" {
-                    String::new()
+                seen_focus = true;
+                focus = if v == "null" {
+                    Some(String::new())
                 } else {
-                    // Window{1a2b3c u0 com.example.app/com.example.app.Main}
-                    let inner = v.trim_start_matches("Window{").trim_end_matches('}');
-                    let last = inner.split_whitespace().last().unwrap_or("");
-                    last.split('/').next().unwrap_or("").to_string()
-                });
+                    focus_package(v)
+                };
             }
         }
         if keyguard.is_none() {
@@ -209,9 +299,14 @@ pub fn judge(s: &Signals, idle_limit_ms: u64, extra_apps: &[String]) -> Use {
         Some(ms) if ms < idle_limit_ms => why.push(format!("touched {} s ago", ms / 1000)),
         Some(_) => {}
     }
+    match s.screen_kept_on {
+        None => why.push("whether an app holds the screen on is unknown".into()),
+        Some(true) => why.push("an app is holding the screen on (a video or a reader)".into()),
+        Some(false) => {}
+    }
     if why.is_empty() {
         Use::Free(format!(
-            "screen on but untouched for {} s, no keyboard, no listed app",
+            "screen on but untouched for {} s, nothing holding it on, no keyboard, no listed app",
             s.idle_ms.unwrap_or(0) / 1000
         ))
     } else {
@@ -235,11 +330,11 @@ fn shell(r: &dyn Runner, device: &str, cmd: &str) -> Option<String> {
 /// Read the signals through `r` (production: the guarded adb runner, so a protected phone answers
 /// `dumpsys power` and nothing else). `None` when not even `dumpsys power` could be read.
 pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
-    let power = shell(r, device, "dumpsys power")?;
-    let (wakefulness, idle_ms) = parse_power(&power);
+    let power = parse_power(&shell(r, device, "dumpsys power")?);
     let mut s = Signals {
-        wakefulness,
-        idle_ms,
+        wakefulness: power.wakefulness,
+        idle_ms: power.idle_ms,
+        screen_kept_on: power.screen_kept_on,
         ..Signals::default()
     };
     if s.screen_on() == Some(true) {
@@ -257,41 +352,105 @@ pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
     Some(s)
 }
 
-/// What the state file remembers per device: a Yes lease and a No cool-down (Unix ms).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What the state file remembers per phone (Unix ms): the Yes leases, one per session and
+/// purpose; the No cool-down; and the end of an ask that is still waiting on the owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Memory {
-    pub allowed_until_ms: u64,
+    pub leases: BTreeMap<String, u64>,
     pub denied_until_ms: u64,
+    pub asking_until_ms: u64,
+}
+
+fn short_hash(s: &str) -> String {
+    let d = Sha256::digest(s.as_bytes());
+    d.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 fn device_key(device: &str) -> String {
-    let d = Sha256::digest(device.to_ascii_lowercase().as_bytes());
-    d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    short_hash(&device.to_ascii_lowercase())
+}
+
+/// A lease covers one session and one purpose.
+pub fn lease_key(session: &str, why: &str) -> String {
+    short_hash(&format!("{session}\n{why}"))
 }
 
 fn memory_path(dir: &Path, device: &str) -> PathBuf {
     dir.join(format!("ask-screen-{}.json", device_key(device)))
 }
 
-pub fn load_memory(dir: &Path, device: &str) -> Memory {
+/// Load the memory for a phone. Values further ahead than this program ever writes (a lease past
+/// 60 minutes, a cool-down past 5, a pending ask past the longest wait) are ignored, as are
+/// leases that have run out: a damaged or edited file can only make it ask, never allow.
+pub fn load_memory(dir: &Path, device: &str, now: u64) -> Memory {
     let Ok(t) = std::fs::read_to_string(memory_path(dir, device)) else {
         return Memory::default();
     };
     let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
-    Memory {
-        allowed_until_ms: v["allowed_until_ms"].as_u64().unwrap_or(0),
-        denied_until_ms: v["denied_until_ms"].as_u64().unwrap_or(0),
+    let mut m = Memory::default();
+    if let Some(obj) = v["leases"].as_object() {
+        for (k, x) in obj {
+            let ok_key = k.len() == 16 && k.chars().all(|c| c.is_ascii_hexdigit());
+            if let Some(u) = x.as_u64() {
+                if ok_key && u > now && u <= now + MAX_LEASE_MIN * 60_000 {
+                    m.leases.insert(k.clone(), u);
+                }
+            }
+        }
     }
+    let d = v["denied_until_ms"].as_u64().unwrap_or(0);
+    if d <= now + REASK_AFTER_MS {
+        m.denied_until_ms = d;
+    }
+    let a = v["asking_until_ms"].as_u64().unwrap_or(0);
+    if a <= now + MAX_WAIT_S * 1000 + PENDING_SLACK_MS {
+        m.asking_until_ms = a;
+    }
+    m
 }
 
-pub fn save_memory(dir: &Path, device: &str, m: Memory) -> Result<(), String> {
+/// Write the memory for a phone: a temporary file, then a rename, so a reader never sees half.
+pub fn save_memory(dir: &Path, device: &str, m: &Memory) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("state dir {}: {e}", dir.display()))?;
     let body = serde_json::json!({
-        "allowed_until_ms": m.allowed_until_ms,
+        "leases": m.leases,
         "denied_until_ms": m.denied_until_ms,
+        "asking_until_ms": m.asking_until_ms,
     });
-    std::fs::write(memory_path(dir, device), body.to_string())
-        .map_err(|e| format!("state file: {e}"))
+    let path = memory_path(dir, device);
+    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    std::fs::write(&tmp, body.to_string()).map_err(|e| format!("state file: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("state file: {e}")
+    })
+}
+
+/// Write only what changed between `before` and `after` onto the file as it is now, so another
+/// session's lease or cool-down written in the meantime is kept.
+pub fn save_changes(
+    dir: &Path,
+    device: &str,
+    before: &Memory,
+    after: &Memory,
+    now: u64,
+) -> Result<(), String> {
+    if before == after {
+        return Ok(());
+    }
+    let mut cur = load_memory(dir, device, now);
+    for (k, v) in &after.leases {
+        if before.leases.get(k) != Some(v) {
+            cur.leases.insert(k.clone(), *v);
+        }
+    }
+    if after.denied_until_ms != before.denied_until_ms {
+        cur.denied_until_ms = after.denied_until_ms;
+    }
+    if after.asking_until_ms != before.asking_until_ms {
+        cur.asking_until_ms = after.asking_until_ms;
+    }
+    save_memory(dir, device, &cur)
 }
 
 /// The request as the command line gives it.
@@ -300,6 +459,8 @@ pub struct Ask {
     pub device: String,
     pub minutes: u64,
     pub why: String,
+    /// Who is asking; a lease covers this session and this `why` only.
+    pub session: String,
     pub name: String,
     pub idle_limit_ms: u64,
     pub wait_ms: u64,
@@ -318,8 +479,19 @@ pub struct Decision {
     pub asked: bool,
 }
 
+fn refused(why: String, retry_after_s: u64, asked: bool) -> Decision {
+    Decision {
+        allowed: false,
+        why,
+        lease_minutes: 0,
+        retry_after_s,
+        asked,
+    }
+}
+
 /// The decision, given the signals, the memory and a channel. `now` and `sleep` are Unix-ms
-/// clock functions (tests pass fakes). Updates `mem`.
+/// clock functions (tests pass fakes). Updates `mem`, and calls `persist` with it just before a
+/// push goes out, so other sessions see that an ask is waiting even if this one is killed.
 pub fn decide(
     ask: &Ask,
     signals: &Signals,
@@ -327,26 +499,28 @@ pub fn decide(
     channel: Option<Box<dyn Channel + Send>>,
     now: &dyn Fn() -> u64,
     sleep: &dyn Fn(u64),
+    persist: &mut dyn FnMut(&Memory),
 ) -> Decision {
     let t = now();
-    if t < mem.allowed_until_ms {
-        return Decision {
-            allowed: true,
-            why: "inside the lease from an earlier Yes".into(),
-            lease_minutes: (mem.allowed_until_ms - t).div_ceil(60_000),
-            retry_after_s: 0,
-            asked: false,
-        };
+    let key = lease_key(&ask.session, &ask.why);
+    if let Some(&until) = mem.leases.get(&key) {
+        if t < until {
+            return Decision {
+                allowed: true,
+                why: "inside the lease from an earlier Yes for this session and purpose".into(),
+                lease_minutes: (until - t).div_ceil(60_000),
+                retry_after_s: 0,
+                asked: false,
+            };
+        }
     }
     // a No (or no answer) stops everything for 5 minutes, even if the phone is put down meanwhile
     if t < mem.denied_until_ms {
-        return Decision {
-            allowed: false,
-            why: "the last ask was refused or unanswered: not asking again yet".into(),
-            lease_minutes: 0,
-            retry_after_s: (mem.denied_until_ms - t).div_ceil(1000),
-            asked: false,
-        };
+        return refused(
+            "the last ask was refused or unanswered: not asking again yet".into(),
+            (mem.denied_until_ms - t).div_ceil(1000),
+            false,
+        );
     }
     let reasons = match judge(signals, ask.idle_limit_ms, &ask.extra_apps) {
         Use::Free(why) => {
@@ -361,15 +535,22 @@ pub fn decide(
         Use::InUse(r) => r,
     };
     let in_use = reasons.join(", ");
+    if t < mem.asking_until_ms {
+        return refused(
+            format!("in use ({in_use}), and another ask is already waiting on the owner"),
+            (mem.asking_until_ms - t).div_ceil(1000),
+            false,
+        );
+    }
     let Some(channel) = channel else {
-        return Decision {
-            allowed: false,
-            why: format!("in use ({in_use}), and no push channel is configured (--route): refused"),
-            lease_minutes: 0,
-            retry_after_s: REASK_AFTER_MS / 1000,
-            asked: false,
-        };
+        return refused(
+            format!("in use ({in_use}), and no push channel is configured (--route): refused"),
+            REASK_AFTER_MS / 1000,
+            false,
+        );
     };
+    mem.asking_until_ms = t + ask.wait_ms + PENDING_SLACK_MS;
+    persist(mem);
     let mut approver = Approver::new(channel).with_expiry_ms(ask.wait_ms);
     let reason = format!(
         "wants to use your screen for about {} min: {} (in use: {in_use})",
@@ -378,11 +559,11 @@ pub fn decide(
     let req = approver.request(t, &ask.name, "ask-screen", "take-over", &reason, "");
     let outcome = approver.ask(&req, now, sleep);
     let after = now();
+    mem.asking_until_ms = 0;
     match outcome {
         Outcome::Approved { .. } => {
             let lease = (ask.minutes * 3).div_ceil(2).clamp(1, MAX_LEASE_MIN);
-            mem.allowed_until_ms = after + lease * 60_000;
-            mem.denied_until_ms = 0;
+            mem.leases.insert(key, after + lease * 60_000);
             Decision {
                 allowed: true,
                 why: "the owner said Yes (INTERIM: a plain tap, no fingerprint yet)".into(),
@@ -392,22 +573,14 @@ pub fn decide(
             }
         }
         // the push never went out: refused, but no cool-down (the owner said nothing)
-        o @ Outcome::Unavailable(_) => Decision {
-            allowed: false,
-            why: format!("in use ({in_use}): {o}"),
-            lease_minutes: 0,
-            retry_after_s: 60,
-            asked: false,
-        },
+        o @ Outcome::Unavailable(_) => refused(format!("in use ({in_use}): {o}"), 60, false),
         o => {
             mem.denied_until_ms = after + REASK_AFTER_MS;
-            Decision {
-                allowed: false,
-                why: format!("in use ({in_use}): {o}"),
-                lease_minutes: 0,
-                retry_after_s: REASK_AFTER_MS / 1000,
-                asked: true,
-            }
+            refused(
+                format!("in use ({in_use}): {o}"),
+                REASK_AFTER_MS / 1000,
+                true,
+            )
         }
     }
 }
@@ -452,6 +625,11 @@ pub fn load_route(path: &Path) -> Result<Box<dyn Channel + Send>, String> {
         cfg.inbound_topic_file = file(r, "inbound_topic_file");
         cfg.token_file = file(r, "token_file");
         cfg.tap_token_file = file(r, "tap_token_file");
+        cfg.login_topics = match r.get("login_topics") {
+            None => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) => return Err("route login_topics must be true or false".into()),
+        };
         cfg.title = TITLE.into();
         chans.push(Box::new(NtfyChannel::new(cfg, CurlHttp::default())));
     }
@@ -481,7 +659,7 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub const USAGE: &str = "usage: agentroid ask-screen --device <serial|ip:port> --minutes N --why \"TEXT\" [--route FILE] [--adb PATH] [--name LABEL] [--idle-min M] [--wait-s S] [--in-use-app PKG]... [--state-dir DIR]";
+pub const USAGE: &str = "usage: agentroid ask-screen --device <serial|ip:port> --minutes N --why \"TEXT\" [--session LABEL] [--route FILE] [--adb PATH] [--name LABEL] [--idle-min M] [--wait-s S] [--in-use-app PKG]... [--state-dir DIR]";
 
 struct Parsed {
     ask: Ask,
@@ -490,15 +668,20 @@ struct Parsed {
     state_dir: PathBuf,
 }
 
+fn one_line(s: &str, max: usize) -> bool {
+    !s.trim().is_empty() && s.chars().count() <= max && !s.chars().any(char::is_control)
+}
+
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut device = None;
     let mut minutes = None;
     let mut why = None;
+    let mut session = None;
     let mut route = None;
     let mut adb = PathBuf::from("adb");
     let mut name = "your phone".to_string();
     let mut idle_min = 5u64;
-    let mut wait_s = 120u64;
+    let mut wait_s = DEFAULT_WAIT_S;
     let mut extra = vec![];
     let mut state_dir = None;
     let mut i = 0;
@@ -520,11 +703,12 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--device" => device = Some(v.clone()),
             "--minutes" => minutes = Some(num(1, MAX_LEASE_MIN)?),
             "--why" => why = Some(v.clone()),
+            "--session" => session = Some(v.clone()),
             "--route" => route = Some(PathBuf::from(&v)),
             "--adb" => adb = PathBuf::from(&v),
             "--name" => name = v.clone(),
             "--idle-min" => idle_min = num(1, 60)?,
-            "--wait-s" => wait_s = num(30, 300)?,
+            "--wait-s" => wait_s = num(30, MAX_WAIT_S)?,
             "--in-use-app" => extra.push(v.clone()),
             "--state-dir" => state_dir = Some(PathBuf::from(&v)),
             other => return Err(format!("unknown option {other}")),
@@ -542,8 +726,12 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         return Err("--device must be a serial, ip:port or adb mDNS name".into());
     }
     let why = why.ok_or("--why is required")?;
-    if why.trim().is_empty() || why.chars().count() > 200 || why.chars().any(char::is_control) {
+    if !one_line(&why, 200) {
         return Err("--why must be 1-200 characters on one line".into());
+    }
+    let session = session.unwrap_or_else(|| why.clone());
+    if !one_line(&session, 80) && session != why {
+        return Err("--session must be 1-80 characters on one line".into());
     }
     if name.chars().count() > 40 || name.chars().any(char::is_control) {
         return Err("--name must be at most 40 characters on one line".into());
@@ -553,6 +741,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             device,
             minutes: minutes.ok_or("--minutes is required")?,
             why,
+            session,
             name,
             idle_limit_ms: idle_min * 60_000,
             wait_ms: wait_s * 1000,
@@ -570,6 +759,7 @@ fn signals_json(s: &Signals) -> serde_json::Value {
         "focus": s.focus,
         "keyboard": s.ime_shown,
         "idle_s": s.idle_ms.map(|m| m / 1000),
+        "screen_kept_on": s.screen_kept_on,
         "locked": s.keyguard,
     })
 }
@@ -580,6 +770,13 @@ pub fn command(args: &[String]) -> (String, i32) {
         Ok(p) => p,
         Err(e) => return (format!("{e}\n{USAGE}"), 2),
     };
+    let channel = match &p.route {
+        Some(r) => match load_route(r) {
+            Ok(c) => Some(c),
+            Err(e) => return (format!("{e}\n{USAGE}"), 2),
+        },
+        None => None,
+    };
     let runner = agentroid_adb_link::guard::GuardedRunner::new(AdbRunner::new(&p.adb));
     let Some(signals) = read_signals(&runner, &p.ask.device) else {
         let out = serde_json::json!({
@@ -589,18 +786,26 @@ pub fn command(args: &[String]) -> (String, i32) {
         });
         return (out.to_string(), 3);
     };
-    let mut mem = load_memory(&p.state_dir, &p.ask.device);
-    let channel = match &p.route {
-        Some(r) => match load_route(r) {
-            Ok(c) => Some(c),
-            Err(e) => return (format!("{e}\n{USAGE}"), 2),
-        },
-        None => None,
+    let (dir, device) = (&p.state_dir, &p.ask.device);
+    let loaded = load_memory(dir, device, unix_ms());
+    let mut mem = loaded.clone();
+    let written = std::cell::RefCell::new(loaded);
+    let mut persist = |m: &Memory| {
+        let mut w = written.borrow_mut();
+        if save_changes(dir, device, &w, m, unix_ms()).is_ok() {
+            *w = m.clone();
+        }
     };
-    let d = decide(&p.ask, &signals, &mut mem, channel, &unix_ms, &|ms| {
-        std::thread::sleep(std::time::Duration::from_millis(ms))
-    });
-    let saved = save_memory(&p.state_dir, &p.ask.device, mem);
+    let d = decide(
+        &p.ask,
+        &signals,
+        &mut mem,
+        channel,
+        &unix_ms,
+        &|ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+        &mut persist,
+    );
+    let saved = save_changes(dir, device, &written.borrow(), &mem, unix_ms());
     let out = serde_json::json!({
         "decision": if d.allowed { "allowed" } else { "denied" },
         "why": d.why,
@@ -609,18 +814,20 @@ pub fn command(args: &[String]) -> (String, i32) {
         "retry_after_s": d.retry_after_s,
         "asked": d.asked,
         "interim": true,
+        "session": p.ask.session,
         "signals": signals_json(&signals),
         "state_saved": saved.is_ok(),
     });
     let line = out.to_string();
+    let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(p.state_dir.join("ask-screen.log.jsonl"))
+        .open(dir.join("ask-screen.log.jsonl"))
         .and_then(|mut f| {
             use std::io::Write;
             let entry = serde_json::json!({
-                "t_ms": unix_ms(), "device": device_key(&p.ask.device), "minutes": p.ask.minutes,
+                "t_ms": unix_ms(), "device": device_key(device), "minutes": p.ask.minutes,
                 "why": p.ask.why, "result": out,
             });
             writeln!(f, "{entry}")
@@ -636,13 +843,22 @@ mod tests {
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
-    const POWER_AWAKE: &str = "POWER MANAGER (dumpsys power)\n  mWakefulness=Awake\n  mWakefulnessChanging=false\n  mLastWakeTime=170339786 (870480 ms ago)\n  mLastSleepTime=170506409 (703857 ms ago)\n mLastUserActivityTime(excludingAttention)=171200266\n";
-    const POWER_DOZING: &str = "  mWakefulness=Dozing\n  mLastWakeTime=170339786 (870480 ms ago)\n mLastUserActivityTime(excludingAttention)=170386406\n";
+    // The POCO's own layout. The realtime-clock line comes first and must never set "now".
+    const POWER_AWAKE: &str = "POWER MANAGER (dumpsys power)\n\nPower Manager State:\n  mDirty=0x0\n  mWakefulness=Awake\n  mWakefulnessChanging=false\n  mIsPowered=true\n  mWakeLockSummary=0x1\n  mLastGlobalWakeTimeRealtime=901234567 (5 ms ago)\n  mLastWakeTime=170339786 (870480 ms ago)\n  mLastSleepTime=170506409 (703857 ms ago)\n mLastUserActivityTime(excludingAttention)=171200266\n\nWake Locks: size=1\n  PARTIAL_WAKE_LOCK              'termux:service' ACQ=-1h2m (uid=10234 pid=1234)\n\nDisplay Group 0:\n  lastUserActivityTime=171200266 (10000 ms ago)\n";
+    const POWER_DOZING: &str = "  mWakefulness=Dozing\n  mWakeLockSummary=0x41\n  mLastWakeTime=170339786 (870480 ms ago)\n mLastUserActivityTime(excludingAttention)=170386406\nWake Locks: size=2\n  PARTIAL_WAKE_LOCK 'termux:service'\n  DOZE_WAKE_LOCK 'dream:doze'\n";
+
+    fn without(text: &str, prefix: &str) -> String {
+        text.lines()
+            .filter(|l| !l.trim().starts_with(prefix))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
 
     fn awake(focus: &str, ime: bool, idle_ms: u64) -> Signals {
         Signals {
             wakefulness: Some("Awake".into()),
             idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
             focus: Some(focus.into()),
             ime_shown: Some(ime),
             keyguard: Some(false),
@@ -650,24 +866,60 @@ mod tests {
     }
 
     #[test]
-    fn power_gives_the_wakefulness_and_the_idle_time_on_the_uptime_clock() {
-        // now = 170339786 + 870480 = 171210266; last touch 171200266, so 10 s idle
+    fn power_takes_the_idle_time_from_the_display_group_line() {
+        let p = parse_power(POWER_AWAKE);
+        assert_eq!(p.wakefulness.as_deref(), Some("Awake"));
+        assert_eq!(p.idle_ms, Some(10_000));
+        // the POCO's real line, read on 13 Nov
+        let real = "  mWakefulness=Awake\n  lastUserActivityTime=172182878 (563524 ms ago)\n";
+        assert_eq!(parse_power(real).idle_ms, Some(563_524));
+        // two groups: the most recent touch wins
+        let two =
+            "  lastUserActivityTime=5 (9000 ms ago)\n  lastUserActivityTime=6 (2000 ms ago)\n";
+        assert_eq!(parse_power(two).idle_ms, Some(2_000));
+    }
+
+    #[test]
+    fn without_the_group_line_now_comes_from_the_wake_time_never_the_realtime_clock() {
+        // regression: the realtime line is the first "ms ago" line; taking it read a 10 s idle
+        // phone as idle for days, so free
+        let no_group = without(POWER_AWAKE, "lastUserActivityTime=");
+        assert_eq!(parse_power(&no_group).idle_ms, Some(10_000));
+        let only_sleep = without(&no_group, "mLastWakeTime=");
+        assert_eq!(parse_power(&only_sleep).idle_ms, Some(10_000));
+        // wake and sleep disagree on "now" by 5 s: unknown, never guessed
+        let skew = no_group.replace("(703857 ms ago)", "(708857 ms ago)");
+        assert_eq!(parse_power(&skew).idle_ms, None);
+        // no "ms ago" line at all: unknown
         assert_eq!(
-            parse_power(POWER_AWAKE),
-            (Some("Awake".into()), Some(10_000))
-        );
-        assert_eq!(parse_power(POWER_DOZING).0.as_deref(), Some("Dozing"));
-        assert_eq!(parse_power(""), (None, None));
-        // no "ms ago" line: the idle time is unknown, never guessed
-        assert_eq!(
-            parse_power("mWakefulness=Awake\nmLastUserActivityTime=5\n").1,
+            parse_power("mWakefulness=Awake\nmLastUserActivityTime=5\n").idle_ms,
             None
         );
+        assert_eq!(parse_power(""), Power::default());
+    }
+
+    #[test]
+    fn power_says_whether_an_app_holds_the_screen_on() {
+        assert_eq!(parse_power(POWER_AWAKE).screen_kept_on, Some(false));
+        assert_eq!(parse_power(POWER_DOZING).screen_kept_on, Some(false));
+        let video = POWER_AWAKE.replace("mWakeLockSummary=0x1", "mWakeLockSummary=0x3");
+        assert_eq!(parse_power(&video).screen_kept_on, Some(true));
+        let dim = POWER_AWAKE.replace("mWakeLockSummary=0x1", "mWakeLockSummary=0x5");
+        assert_eq!(parse_power(&dim).screen_kept_on, Some(true));
+        // the list names a screen lock even if the summary does not
+        let listed = POWER_AWAKE.replace(
+            "  PARTIAL_WAKE_LOCK ",
+            "  SCREEN_BRIGHT_WAKE_LOCK        'WindowManager' ON_AFTER_RELEASE\n  PARTIAL_WAKE_LOCK ",
+        );
+        assert_eq!(parse_power(&listed).screen_kept_on, Some(true));
+        // no summary: unknown
+        let none = without(POWER_AWAKE, "mWakeLockSummary=");
+        assert_eq!(parse_power(&none).screen_kept_on, None);
     }
 
     #[test]
     fn window_gives_the_focused_package_and_the_lock_screen() {
-        let w = "  mCurrentFocus=Window{1a2b u0 com.anthropic.claude/com.anthropic.claude.MainActivity}\n    isKeyguardShowing=false\n";
+        let w = "  mCurrentFocus=Window{535f00b u0 com.anthropic.claude/com.anthropic.claude.mainactivity.MainActivity}\n    isKeyguardShowing=false\n";
         assert_eq!(
             parse_window(w),
             (Some("com.anthropic.claude".into()), Some(false))
@@ -680,6 +932,25 @@ mod tests {
     }
 
     #[test]
+    fn a_window_state_such_as_exiting_is_never_the_focused_app() {
+        let f = |v: &str| parse_window(&format!("  mCurrentFocus={v}\n")).0;
+        assert_eq!(
+            f("Window{abc u0 com.whatsapp/com.whatsapp.Main EXITING}").as_deref(),
+            Some("com.whatsapp")
+        );
+        assert_eq!(
+            f("Window{abc u0 Splash Screen com.whatsapp EXITING}").as_deref(),
+            Some("com.whatsapp")
+        );
+        assert_eq!(
+            f("Window{abc u0 NotificationShade}").as_deref(),
+            Some("NotificationShade")
+        );
+        // nothing but a state: unknown, so in use
+        assert_eq!(f("Window{abc u0 EXITING}"), None);
+    }
+
+    #[test]
     fn the_keyboard_is_input_shown_not_input_view_shown() {
         let poco = "  mInputShown=false\n  mIsInputViewShown=true mStatusIcon=0\n";
         assert_eq!(parse_ime(poco), Some(false));
@@ -688,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn in_use_means_a_listed_app_the_keyboard_or_a_recent_touch() {
+    fn in_use_means_a_listed_app_the_keyboard_a_recent_touch_or_a_held_screen() {
         let lim = 5 * 60_000;
         // positive controls: each signal alone makes it in use
         for app in IN_USE_APPS {
@@ -716,6 +987,10 @@ mod tests {
             ),
             Use::InUse(_)
         ));
+        // a video: untouched for an hour, but an app holds the screen on
+        let mut video = awake("com.example.player", false, 3_600_000);
+        video.screen_kept_on = Some(true);
+        assert!(matches!(judge(&video, lim, &[]), Use::InUse(_)));
         // and with none of them, an awake screen is free
         assert!(matches!(
             judge(&awake("com.example.reader", false, 3_600_000), lim, &[]),
@@ -735,6 +1010,7 @@ mod tests {
         let only_power = Signals {
             wakefulness: Some("Awake".into()),
             idle_ms: Some(3_600_000),
+            screen_kept_on: Some(false),
             ..Signals::default()
         };
         assert!(matches!(judge(&only_power, 60_000, &[]), Use::InUse(_)));
@@ -744,6 +1020,9 @@ mod tests {
         ));
         let mut s = awake("com.example.reader", false, 3_600_000);
         s.idle_ms = None;
+        assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
+        let mut s = awake("com.example.reader", false, 3_600_000);
+        s.screen_kept_on = None;
         assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
     }
 
@@ -806,7 +1085,7 @@ mod tests {
     #[test]
     fn the_guard_lets_only_dumpsys_power_reach_the_protected_phone() {
         use agentroid_adb_link::guard::{GuardedRunner, S24_SERIAL};
-        struct Hw(Mutex<Vec<String>>);
+        struct Hw(Arc<Mutex<Vec<String>>>);
         impl Runner for Hw {
             fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
                 let cmd = a.last().cloned().unwrap_or_default();
@@ -825,15 +1104,20 @@ mod tests {
                 })
             }
         }
-        let g = GuardedRunner::new(Hw(Mutex::new(vec![])));
+        let log = Arc::new(Mutex::new(vec![]));
+        let g = GuardedRunner::new(Hw(log.clone()));
         let s = read_signals(&g, "192.0.2.10:5555").unwrap();
         assert_eq!(s.wakefulness.as_deref(), Some("Awake"));
-        assert_eq!(
-            (s.focus.clone(), s.ime_shown),
-            (None, None),
-            "window and input_method never sent"
-        );
+        assert_eq!((s.focus.clone(), s.ime_shown), (None, None));
         assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
+        // what reached the phone: the guard's serial check and dumpsys power, nothing else
+        let sent = log.lock().unwrap().clone();
+        assert!(sent.iter().any(|c| c == "dumpsys power"), "{sent:?}");
+        assert!(
+            sent.iter()
+                .all(|c| c == "getprop ro.serialno" || c == "dumpsys power"),
+            "{sent:?}"
+        );
     }
 
     fn ask() -> Ask {
@@ -841,11 +1125,30 @@ mod tests {
             device: "192.0.2.10:5555".into(),
             minutes: 10,
             why: "run the settings check".into(),
+            session: "session A".into(),
             name: "your phone".into(),
             idle_limit_ms: 5 * 60_000,
-            wait_ms: 120_000,
+            wait_ms: 90_000,
             extra_apps: vec![],
         }
+    }
+
+    fn run(
+        a: &Ask,
+        s: &Signals,
+        m: &mut Memory,
+        ch: Option<Box<dyn Channel + Send>>,
+        t: &Cell<u64>,
+    ) -> Decision {
+        decide(
+            a,
+            s,
+            m,
+            ch,
+            &|| t.get(),
+            &|ms| t.set(t.get() + ms),
+            &mut |_| {},
+        )
     }
 
     fn answering(verb: &'static str) -> (Box<dyn Channel + Send>, Arc<Mutex<Vec<String>>>) {
@@ -873,13 +1176,12 @@ mod tests {
     fn free_is_allowed_without_a_push() {
         let t = Cell::new(1_000_000u64);
         let mut m = Memory::default();
-        let d = decide(
+        let d = run(
             &ask(),
             &awake("com.example.reader", false, 3_600_000),
             &mut m,
             None,
-            &|| t.get(),
-            &|ms| t.set(t.get() + ms),
+            &t,
         );
         assert!(d.allowed && !d.asked && d.lease_minutes == 0);
     }
@@ -890,23 +1192,38 @@ mod tests {
         let mut m = Memory::default();
         let (ch, seen) = answering("allow");
         let busy = awake("com.anthropic.claude", true, 1_000);
-        let d = decide(&ask(), &busy, &mut m, Some(ch), &|| t.get(), &|ms| {
-            t.set(t.get() + ms)
-        });
+        let d = run(&ask(), &busy, &mut m, Some(ch), &t);
         assert!(d.allowed && d.asked);
         assert_eq!(d.lease_minutes, 15, "1.5 x 10 min");
         assert!(seen.lock().unwrap()[0].contains("about 10 min: run the settings check"));
         // inside the lease: allowed, no channel needed
-        let d2 = decide(&ask(), &busy, &mut m, None, &|| t.get(), &|ms| {
-            t.set(t.get() + ms)
-        });
+        let d2 = run(&ask(), &busy, &mut m, None, &t);
         assert!(d2.allowed && !d2.asked);
         // after it: asked again (here: no channel, so refused)
         t.set(t.get() + 16 * 60_000);
-        let d3 = decide(&ask(), &busy, &mut m, None, &|| t.get(), &|ms| {
-            t.set(t.get() + ms)
-        });
-        assert!(!d3.allowed);
+        assert!(!run(&ask(), &busy, &mut m, None, &t).allowed);
+    }
+
+    #[test]
+    fn a_lease_covers_only_the_session_and_purpose_it_was_given_to() {
+        let t = Cell::new(1_000_000u64);
+        let mut m = Memory::default();
+        let busy = awake("com.anthropic.claude", true, 1_000);
+        let (ch, _) = answering("allow");
+        assert!(run(&ask(), &busy, &mut m, Some(ch), &t).allowed);
+        let mut other = ask();
+        other.session = "session B".into();
+        assert!(
+            !run(&other, &busy, &mut m, None, &t).allowed,
+            "another session"
+        );
+        let mut other_why = ask();
+        other_why.why = "something else".into();
+        assert!(
+            !run(&other_why, &busy, &mut m, None, &t).allowed,
+            "another purpose"
+        );
+        assert!(run(&ask(), &busy, &mut m, None, &t).allowed);
     }
 
     #[test]
@@ -915,16 +1232,14 @@ mod tests {
         let mut m = Memory::default();
         let (ch, _) = answering("deny");
         let busy = awake("com.whatsapp", false, 1_000);
-        let d = decide(&ask(), &busy, &mut m, Some(ch), &|| t.get(), &|ms| {
-            t.set(t.get() + ms)
-        });
+        let d = run(&ask(), &busy, &mut m, Some(ch), &t);
         assert!(!d.allowed && d.asked && d.retry_after_s == 300);
-        // a second call within 5 min: refused without a push
+        // a second call within 5 min, from any session: refused without a push
         let (ch2, seen2) = answering("allow");
         t.set(t.get() + 60_000);
-        let d2 = decide(&ask(), &busy, &mut m, Some(ch2), &|| t.get(), &|ms| {
-            t.set(t.get() + ms)
-        });
+        let mut other = ask();
+        other.session = "session B".into();
+        let d2 = run(&other, &busy, &mut m, Some(ch2), &t);
         assert!(!d2.allowed && !d2.asked);
         assert!(
             seen2.lock().unwrap().is_empty(),
@@ -934,11 +1249,7 @@ mod tests {
         // after it: asked again
         t.set(t.get() + 5 * 60_000);
         let (ch3, _) = answering("allow");
-        assert!(
-            decide(&ask(), &busy, &mut m, Some(ch3), &|| t.get(), &|ms| t
-                .set(t.get() + ms))
-            .allowed
-        );
+        assert!(run(&ask(), &busy, &mut m, Some(ch3), &t).allowed);
     }
 
     #[test]
@@ -946,47 +1257,93 @@ mod tests {
         let t = Cell::new(1_000_000u64);
         let mut m = Memory::default();
         let (ch, _) = answering("deny");
-        decide(
+        run(
             &ask(),
             &awake("com.whatsapp", false, 1_000),
             &mut m,
             Some(ch),
-            &|| t.get(),
-            &|ms| t.set(t.get() + ms),
+            &t,
         );
         let off = Signals {
             wakefulness: Some("Asleep".into()),
             ..Signals::default()
         };
         t.set(t.get() + 60_000);
-        assert!(
-            !decide(&ask(), &off, &mut m, None, &|| t.get(), &|ms| t
-                .set(t.get() + ms))
-            .allowed
-        );
+        assert!(!run(&ask(), &off, &mut m, None, &t).allowed);
         t.set(t.get() + 5 * 60_000);
-        assert!(
-            decide(&ask(), &off, &mut m, None, &|| t.get(), &|ms| t
-                .set(t.get() + ms))
-            .allowed
+        assert!(run(&ask(), &off, &mut m, None, &t).allowed);
+    }
+
+    #[test]
+    fn the_pending_ask_is_saved_before_the_push_and_blocks_a_second_push() {
+        let t = Cell::new(1_000_000u64);
+        let order = Arc::new(Mutex::new(vec![]));
+        let o2 = order.clone();
+        let ch = FakeChannel {
+            answer_with: Some(Box::new(move |r, n| {
+                o2.lock().unwrap().push("poll".to_string());
+                if n == 2 {
+                    vec![Inbound {
+                        event_id: "e".into(),
+                        time_ms: r.created_ms + 1000,
+                        message: format!("allow {}", r.id),
+                    }]
+                } else {
+                    vec![]
+                }
+            })),
+            ..FakeChannel::default()
+        };
+        let mut m = Memory::default();
+        let mut snaps = vec![];
+        let busy = awake("com.anthropic.claude", true, 1_000);
+        let d = decide(
+            &ask(),
+            &busy,
+            &mut m,
+            Some(Box::new(ch)),
+            &|| t.get(),
+            &|ms| t.set(t.get() + ms),
+            &mut |mm: &Memory| {
+                order.lock().unwrap().push("persist".to_string());
+                snaps.push(mm.clone());
+            },
         );
+        assert!(d.allowed);
+        assert_eq!(order.lock().unwrap()[0], "persist", "saved before any poll");
+        assert_eq!(snaps[0].asking_until_ms, 1_000_000 + 90_000 + 15_000);
+        assert_eq!(m.asking_until_ms, 0, "cleared once answered");
+        // another session while an ask is waiting: refused, no second push
+        let mut waiting = Memory {
+            asking_until_ms: t.get() + 30_000,
+            ..Memory::default()
+        };
+        let (ch2, seen2) = answering("allow");
+        let mut other = ask();
+        other.session = "session B".into();
+        let d2 = run(&other, &busy, &mut waiting, Some(ch2), &t);
+        assert!(!d2.allowed && !d2.asked && d2.retry_after_s == 30);
+        assert!(seen2.lock().unwrap().is_empty());
+        // a free phone is still allowed while someone else waits
+        let free = awake("com.example.reader", false, 3_600_000);
+        assert!(run(&other, &free, &mut waiting, None, &t).allowed);
     }
 
     #[test]
     fn no_answer_is_a_refusal() {
         let t = Cell::new(1_000_000u64);
         let mut m = Memory::default();
-        let d = decide(
+        let d = run(
             &ask(),
             &awake("com.anthropic.claude", false, 1_000),
             &mut m,
             Some(Box::new(FakeChannel::default())),
-            &|| t.get(),
-            &|ms| t.set(t.get() + ms),
+            &t,
         );
         assert!(!d.allowed && d.asked);
         assert!(d.why.contains("no human answer"), "{}", d.why);
         assert!(m.denied_until_ms > 0, "no answer starts the cool-down");
+        assert_eq!(m.asking_until_ms, 0);
     }
 
     #[test]
@@ -998,25 +1355,15 @@ mod tests {
             ..FakeChannel::default()
         };
         let busy = awake("com.anthropic.claude", false, 1_000);
-        let d = decide(
-            &ask(),
-            &busy,
-            &mut m,
-            Some(Box::new(down)),
-            &|| t.get(),
-            &|ms| t.set(t.get() + ms),
-        );
+        let d = run(&ask(), &busy, &mut m, Some(Box::new(down)), &t);
         assert!(!d.allowed && !d.asked && d.retry_after_s == 60);
         assert_eq!(
             m.denied_until_ms, 0,
             "the owner said nothing, so nothing is held against the next ask"
         );
+        assert_eq!(m.asking_until_ms, 0);
         let (ch, _) = answering("allow");
-        assert!(
-            decide(&ask(), &busy, &mut m, Some(ch), &|| t.get(), &|ms| t
-                .set(t.get() + ms))
-            .allowed
-        );
+        assert!(run(&ask(), &busy, &mut m, Some(ch), &t).allowed);
     }
 
     #[test]
@@ -1027,6 +1374,10 @@ mod tests {
     #[test]
     fn bad_arguments_are_usage_errors() {
         let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let ok = a(&["--device", "X", "--minutes", "5", "--why", "x"]);
+        let p = parse_args(&ok).unwrap();
+        assert_eq!(p.ask.wait_ms, 90_000, "the default wait ends inside 2 min");
+        assert_eq!(p.ask.session, "x", "the session defaults to the why");
         for bad in [
             a(&["--minutes", "5", "--why", "x"]),
             a(&["--device", "X", "--why", "x"]),
@@ -1034,41 +1385,99 @@ mod tests {
             a(&["--device", "X", "--minutes", "61", "--why", "x"]),
             a(&["--device", "X;reboot", "--minutes", "5", "--why", "x"]),
             a(&["--device", "X", "--minutes", "5", "--why", "line\nbreak"]),
-            a(&[
-                "--device",
-                "X",
-                "--minutes",
-                "5",
-                "--why",
-                "x",
-                "--wait-s",
-                "5",
-            ]),
-            a(&[
-                "--device",
-                "X",
-                "--minutes",
-                "5",
-                "--why",
-                "x",
-                "--bogus",
-                "1",
-            ]),
+            [ok.clone(), a(&["--wait-s", "5"])].concat(),
+            [ok.clone(), a(&["--wait-s", "301"])].concat(),
+            [ok.clone(), a(&["--session", "two\nlines"])].concat(),
+            [ok.clone(), a(&["--session", " "])].concat(),
+            [ok.clone(), a(&["--bogus", "1"])].concat(),
+            [ok.clone(), a(&["--session"])].concat(),
         ] {
-            assert_eq!(command(&bad).1, 2, "{bad:?}");
+            assert!(parse_args(&bad).is_err(), "{bad:?}");
         }
+        // and command turns them into exit code 2 before touching any phone
+        assert_eq!(command(&a(&["--device", "X;reboot"])).1, 2);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("agentroid-askscreen-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
     }
 
     #[test]
-    fn memory_round_trips_per_device() {
-        let d = std::env::temp_dir().join(format!("agentroid-askscreen-{}", std::process::id()));
-        let m = Memory {
-            allowed_until_ms: 5,
-            denied_until_ms: 7,
+    fn memory_round_trips_per_device_and_leaves_no_temporary_file() {
+        let d = temp_dir("rt");
+        let now = 1_000_000;
+        let mut m = Memory {
+            denied_until_ms: now + 60_000,
+            asking_until_ms: now + 30_000,
+            ..Memory::default()
         };
-        save_memory(&d, "A", m).unwrap();
-        assert_eq!(load_memory(&d, "a"), m, "the key ignores case");
-        assert_eq!(load_memory(&d, "B"), Memory::default());
+        m.leases.insert(lease_key("s", "w"), now + 10 * 60_000);
+        save_memory(&d, "A", &m).unwrap();
+        assert_eq!(load_memory(&d, "a", now), m, "the key ignores case");
+        assert_eq!(load_memory(&d, "B", now), Memory::default());
+        let names: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn values_further_ahead_than_ever_written_are_ignored() {
+        let d = temp_dir("far");
+        let now = 1_000_000;
+        let body = serde_json::json!({
+            "leases": {
+                lease_key("s", "w"): now + 61 * 60_000,
+                lease_key("s", "ok"): now + 60 * 60_000,
+                lease_key("s", "old"): now - 1,
+                "not-a-key": now + 60_000,
+            },
+            "denied_until_ms": now + REASK_AFTER_MS + 1,
+            "asking_until_ms": now + MAX_WAIT_S * 1000 + PENDING_SLACK_MS + 1,
+        });
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(memory_path(&d, "A"), body.to_string()).unwrap();
+        let m = load_memory(&d, "A", now);
+        assert_eq!(
+            m.leases.keys().cloned().collect::<Vec<_>>(),
+            vec![lease_key("s", "ok")]
+        );
+        assert_eq!((m.denied_until_ms, m.asking_until_ms), (0, 0));
+        // a broken file is an empty memory
+        std::fs::write(memory_path(&d, "A"), "{not json").unwrap();
+        assert_eq!(load_memory(&d, "A", now), Memory::default());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn saving_keeps_what_another_session_wrote_in_the_meantime() {
+        let d = temp_dir("merge");
+        let now = 1_000_000;
+        let before = load_memory(&d, "A", now);
+        // another session gets a Yes while this one is deciding
+        let mut theirs = Memory::default();
+        theirs.leases.insert(lease_key("B", "w"), now + 60_000);
+        save_memory(&d, "A", &theirs).unwrap();
+        // this one gets a No
+        let mut ours = before.clone();
+        ours.denied_until_ms = now + REASK_AFTER_MS;
+        save_changes(&d, "A", &before, &ours, now).unwrap();
+        let m = load_memory(&d, "A", now);
+        assert!(m.leases.contains_key(&lease_key("B", "w")), "{m:?}");
+        assert_eq!(m.denied_until_ms, now + REASK_AFTER_MS);
+        // clearing the pending marker is written even though the lease map did not change
+        let mut pending = m.clone();
+        pending.asking_until_ms = now + 10_000;
+        save_changes(&d, "A", &m, &pending, now).unwrap();
+        let mut cleared = pending.clone();
+        cleared.asking_until_ms = 0;
+        save_changes(&d, "A", &pending, &cleared, now).unwrap();
+        assert_eq!(load_memory(&d, "A", now).asking_until_ms, 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -191,7 +191,7 @@ Limits: on this phone the Wi-Fi itself sometimes took 4 to 30 minutes to rejoin 
 An agent that drives a phone someone is using takes the screen out of their hands. `agentroid ask-screen` is the one check to run first, whether the session then uses Agentroid's tools or raw adb:
 
 ```text
-agentroid ask-screen --device <serial|ip:port> --minutes N --why "what and why" --route route.json
+agentroid ask-screen --device <serial|ip:port> --minutes N --why "what and why" --session "who is asking" --route route.json
 ```
 
 It prints one line of JSON and exits **0 (allowed)** or **1 (refused)**. Exit 2 is a usage error, and 3 means the phone could not be read.
@@ -199,15 +199,17 @@ It prints one line of JSON and exits **0 (allowed)** or **1 (refused)**. Exit 2 
 - **In use** means the screen is on and any of these holds:
   - the focused app is one people type in: the Claude app (`com.anthropic.claude`), WhatsApp, Gmail, or any `--in-use-app <package>`;
   - the keyboard is open (`mInputShown` in `dumpsys input_method`);
-  - the last touch was under `--idle-min` minutes ago (default 5; read from `dumpsys power` on the phone's own uptime clock).
+  - the last touch was under `--idle-min` minutes ago (default 5; read from `dumpsys power`, which states it directly as the display group's `lastUserActivityTime ... ms ago`);
+  - an app is holding the screen on (a screen wake lock in `dumpsys power`: a video, or a reader that keeps the screen awake).
 
   Anything it cannot read counts as in use. A phone on the protected list answers only `dumpsys power`, so it counts as in use whenever its screen is on.
-- **Not in use** (the screen is off or dozing, or on but untouched with no keyboard and no listed app): allowed at once, with no push. Run the command again before each burst of actions.
-- **In use:** one push with what the session wants and for about how long, with Allow and Deny buttons. Answer within `--wait-s` seconds (default 120).
-  - **Allow** gives a lease of 1.5 × N minutes (at most 60). Calls inside the lease are allowed without another push.
-  - **Deny, or no answer,** refuses. Every call in the next 5 minutes is then refused without a push, even if the phone is put down meanwhile.
+- **Not in use** (the screen is off or dozing; or on, untouched, with nothing holding it on, no keyboard and no listed app): allowed at once, with no push. Run the command again before each burst of actions.
+- **In use:** one push with what the session wants and for about how long, with Allow and Deny buttons. Answer within `--wait-s` seconds (default 90, from 30 to 300, so with the default the command ends inside a two-minute tool timeout).
+  - **Allow** gives a lease of 1.5 × N minutes (at most 60) to that session and purpose only: the same `--session` (default: the `--why` text) and the same `--why`. Calls inside the lease are allowed without another push. Another session, or the same one asking for something else, is asked about on its own.
+  - **Deny, or no answer,** refuses. Every call for that phone in the next 5 minutes, from any session, is then refused without a push, even if the phone is put down meanwhile.
+  - **One ask at a time:** while an ask is waiting on the owner, other calls for that phone are refused without a second push.
   - If the push could not be sent, the call is refused, but nothing is held against the next ask.
-- **State** (the lease, the cool-down and a log of every decision, `ask-screen.log.jsonl`) is kept in `--state-dir`. The default is `%LOCALAPPDATA%\agentroid\ask-screen`, or `$AGENTROID_STATE_DIR/ask-screen`. Files are named by a hash of the device, not its serial.
+- **State** (the leases, the cool-down, the pending ask and a log of every decision, `ask-screen.log.jsonl`) is kept in `--state-dir`. The default is `%LOCALAPPDATA%\agentroid\ask-screen`, or `$AGENTROID_STATE_DIR/ask-screen`. Files are named by a hash of the device, not its serial. Each write goes to a temporary file and is renamed into place, and only what changed is written, so another session's lease is kept. Values further ahead than the program ever writes are ignored, so an edited or damaged file can only make it ask.
 
 The route file names one or more ntfy servers. The ask goes to every one that can carry it, and an answer from any of them counts:
 
@@ -215,20 +217,22 @@ The route file names one or more ntfy servers. The ask goes to every one that ca
 {"routes": [
   {"base": "http://127.0.0.1:2586", "tap_base": "http://<address the phone reaches>:2586",
    "topic_file": "alerts.topic", "inbound_topic_file": "taps.topic",
-   "token_file": "sender.token", "tap_token_file": "tap.token"},
+   "token_file": "sender.token", "tap_token_file": "tap.token", "login_topics": true},
   {"base": "https://ntfy.sh", "topic_file": "ntfy-topic.key", "inbound_topic_file": "ntfy-answers.key"}
 ]}
 ```
 
-- `token_file` logs in to a server that needs one. The token goes to curl on its standard input, never on its command line.
+- `token_file` logs in to a server that needs one. The token goes to curl on its standard input, never on its command line, and only to an `https` or loopback `base` (over plain http it would travel in clear).
 - `tap_token_file` is a separate token the Allow / Deny buttons carry. It sits inside the push, so give it write access to the answer topic and nothing else.
 - `tap_base` is the address the phone's buttons post to, when it differs from `base`.
-- Without a token, topics must be 24 to 64 hard-to-guess characters.
+- Topics must be 24 to 64 hard-to-guess characters, unless the route says `"login_topics": true`: the server refuses anyone without a login (for ntfy, `auth-default-access: deny-all`), so a short name such as `alerts` is safe. That needs a `token_file` and is refused for ntfy.sh, where anyone may read a topic they can guess.
+- Every call to curl, with or without a token, passes the URL (which holds the topic) and the body on standard input and fails on an HTTP error status, so a refused or rate-limited push is never counted as sent.
 - Relative paths are read from the route file's folder.
 
 **Known limits of the interim version:**
 - The push usually arrives on the very phone being asked about. A session that drives that phone (or posts `allow <id>` to the answer topic itself, with the answer token from the same machine) can say its own Yes. The check stops honest sessions from interrupting; it does not stop a hostile one. The fingerprint step is meant to close this.
 - It is a check, not a lock: nothing yet stops a session that skips it. Agentroid's daemon does not call it on its own yet.
+- There is no file lock. Two sessions that ask in the same instant can both send a push.
 
 ## Demo
 
