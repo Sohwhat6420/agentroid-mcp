@@ -49,14 +49,16 @@ const META: [char; 14] = [
 ];
 
 /// Invisible format characters (zero-width spaces and joiners, bidi controls, the byte-order mark,
-/// soft hyphen, tag characters and similar). Case-folding storage ignores Unicode's default-ignorable
-/// characters when it matches names, so `/sdcard/Andro\u{200B}id/data/<pkg>` opens another app's
-/// `Android/data` folder. One is refused where the guard decides ([`invisible_where_decided`]).
+/// soft hyphen, variation selectors, the Mongolian free variation selectors, tag characters and
+/// similar). Case-folding storage ignores Unicode's default-ignorable characters when it matches
+/// names, so `/sdcard/Andro\u{200B}id/data/<pkg>` opens another app's `Android/data` folder. One is
+/// refused where the guard decides ([`invisible_where_decided`]).
 pub fn is_invisible(c: char) -> bool {
     matches!(c as u32,
-        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180E
-        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFEFF | 0xFFA0
-        | 0xFFF0..=0xFFFB | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFFB | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
 }
 
 /// The first invisible character in the part of `p` the guard decides on: the shared-storage root
@@ -237,8 +239,16 @@ pub fn classify_file(op: FileOp, phone_path: &str) -> Decision {
         };
         return dec(Verdict::Blocked, kind, "outside_shared", why.to_string());
     }
-    // without invisible characters, which a file name may now hold: `x.ap\u{AD}k` may open as `x.apk`
-    let shown = visible(&lower);
+    // without invisible characters, which a file name may now hold: `x.ap\u{AD}k` may open as `x.apk`;
+    // and with the long s and the Kelvin sign folded, as case-folding storage folds them (`x.\u{17F}h`)
+    let shown: String = visible(&lower)
+        .chars()
+        .map(|c| match c {
+            '\u{017F}' => 's',
+            '\u{212A}' => 'k',
+            c => c,
+        })
+        .collect();
     if op == FileOp::Push && CODE_EXT.iter().any(|e| shown.ends_with(e)) {
         return dec(
             Verdict::Ask,
@@ -405,6 +415,13 @@ mod tests {
             // a dot segment spelt with an invisible character is still a dot segment
             "/sdcard/Download/.\u{AD}./.\u{AD}./x",
             "/sdcard/Download/\u{200B}./x",
+            // also with a variation selector or a Mongolian free variation selector
+            "/sdcard/Download/.\u{FE0F}./x",
+            "/sdcard/Download/.\u{180B}./x",
+            "/sdcard/Download/.\u{180F}/x",
+            // a variation selector in the Android folder or the one after it
+            "/sdcard/Andr\u{FE0F}oid/data/com.whatsapp/files/x",
+            "/sdcard/Android/d\u{FE00}ata/com.whatsapp/files/x",
         ] {
             for op in [FileOp::Pull, FileOp::Push] {
                 let d = classify_file(op, p);
@@ -450,16 +467,31 @@ mod tests {
         // a code extension with an ignored character in it is still code
         let d = classify_file(FileOp::Push, "/sdcard/Download/x.ap\u{AD}k");
         assert_eq!((d.verdict, d.kind), (Verdict::Ask, Some(Kind::Install)));
+        // as is one with a variation selector, or with a letter that folds to ASCII
+        for p in [
+            "/sdcard/Download/x.ap\u{FE0F}k",
+            "/sdcard/Download/x.ap\u{180B}k",
+            "/sdcard/Download/x.\u{17F}h",
+            "/sdcard/Download/x.ap\u{212A}",
+        ] {
+            let d = classify_file(FileOp::Push, p);
+            assert_eq!(
+                (d.verdict, d.kind),
+                (Verdict::Ask, Some(Kind::Install)),
+                "{p:?}: {d:?}"
+            );
+        }
     }
 
     #[test]
     fn letters_that_storage_folds_or_ignores_still_name_android_data() {
-        // a variation selector is ignored and the long s and Kelvin sign fold to ASCII: still asked
+        // a variation selector is now refused outright (see the invisible-character test); another
+        // non-ASCII mark the guard cannot place errs towards a match: still asked
         for p in [
-            "/sdcard/Andr\u{FE0F}oid/data/com.whatsapp/files/x",
-            "/sdcard/Android/d\u{FE00}ata/com.whatsapp/files/x",
-            "/sdcard/Android/ob\u{FE0F}b/com.game/main.obb",
-            "/storage/emulated/0/Android/media\u{FE0F}/com.whatsapp/x",
+            "/sdcard/Andro\u{301}id/data/com.whatsapp/files/x",
+            "/sdcard/Android/da\u{301}ta/com.whatsapp/files/x",
+            "/sdcard/Android/ob\u{301}b/com.game/main.obb",
+            "/storage/emulated/0/Android/media\u{301}/com.whatsapp/x",
         ] {
             let d = classify_file(FileOp::Pull, p);
             assert_eq!(d.verdict, Verdict::Ask, "{p:?}: {d:?}");
@@ -474,7 +506,7 @@ mod tests {
             assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p:?}");
         }
         // the reason still names the package as written
-        let d = classify_file(FileOp::Pull, "/sdcard/Andr\u{FE0F}oid/data/Com.X/f");
+        let d = classify_file(FileOp::Pull, "/sdcard/Andro\u{301}id/data/Com.X/f");
         assert_eq!(
             d.reason,
             "pulling from Com.X's Android/data or obb directory"

@@ -713,6 +713,60 @@ fn pull_new_passes_over_a_newest_name_the_guard_refuses() {
     });
 }
 
+/// The list of passed-over names is capped: the first ten, then a count of the rest.
+#[test]
+fn pull_new_names_at_most_ten_passed_over_files() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        h.phone.lock().unwrap().listing = (0..15).map(|i| format!("a;{i}.png")).collect();
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0 }),
+            )
+            .await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let msg = r["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("\"a;9.png\"] and 5 more"), "{msg}");
+        assert!(!msg.contains("a;10.png"), "{msg}");
+        assert!(!reached(&h).iter().any(|l| l.starts_with("pull ")));
+    });
+}
+
+/// A name with a bidi override (`invoice\u{202E}fdp.exe`, which Explorer would show as
+/// `invoiceexe.pdf`) is pulled to a laptop name with `_` in its place, and the answer's text shows
+/// the character escaped rather than raw.
+#[test]
+fn pull_new_writes_a_bidi_override_name_as_a_safe_local_name() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-bidi");
+        let h = start(DeviceMode::Full);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["invoice\u{202E}fdp.exe".into()];
+            p.files.insert(
+                "/sdcard/Download/invoice\u{202E}fdp.exe".into(),
+                b"MZ!".to_vec(),
+            );
+            p.sizes = VecDeque::from([3, 3]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() })).await;
+        let res = &r["result"];
+        assert_eq!(
+            res["phone_path"], "/sdcard/Download/invoice\u{202E}fdp.exe",
+            "{r}"
+        );
+        let path = res["path"].as_str().unwrap();
+        assert!(path.ends_with("invoice_fdp.exe"), "{path:?}");
+        assert_eq!(std::fs::read(path).unwrap(), b"MZ!");
+        let text = res["text"].as_str().unwrap();
+        assert!(!text.contains('\u{202E}'), "{text:?}");
+        assert!(text.contains("invoice\\u{202e}fdp.exe"), "{text:?}");
+    });
+}
+
 /// The laptop side is fenced: `push` reads only the outbox and `pull_new` writes only the inbox.
 /// A file elsewhere, a `..` name, or a pull into another folder is REFUSED (class `outbox` /
 /// `inbox`) and nothing reaches the phone.

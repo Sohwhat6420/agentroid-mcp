@@ -104,12 +104,17 @@ fn parse_sha(out: &str) -> Option<String> {
     (w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit())).then(|| w.to_ascii_lowercase())
 }
 
-/// A file name from the phone, made safe to use as a laptop file name.
+/// A file name from the phone, made safe to use as a laptop file name. Invisible characters (bidi
+/// controls among them) become `_` too: `invoice\u{202E}fdp.exe` would show in Explorer as
+/// `invoiceexe.pdf`.
 fn local_name(n: &str) -> String {
     let s: String = n
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if c.is_control()
+                || agentroid_core::fileguard::is_invisible(c)
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
                 '_'
             } else {
                 c
@@ -120,6 +125,30 @@ fn local_name(n: &str) -> String {
         "pulled_file".into()
     } else {
         s
+    }
+}
+
+/// A phone path for a message: invisible characters written as `\u{..}`, so a bidi override cannot
+/// reorder the text around it.
+fn shown(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for c in p.chars() {
+        if agentroid_core::fileguard::is_invisible(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The names `pull_new` passed over, for its message: the first ten, then how many more.
+fn passed_over(skipped: &[&str]) -> String {
+    const SHOWN: usize = 10;
+    if skipped.len() <= SHOWN {
+        format!("{skipped:?}")
+    } else {
+        format!("{:?} and {} more", &skipped[..SHOWN], skipped.len() - SHOWN)
     }
 }
 
@@ -467,7 +496,7 @@ impl Daemon {
                     if skipped.is_empty() {
                         format!("pull_new: no file in {dir}")
                     } else {
-                        format!("pull_new: no file in {dir} that the file guard accepts (passed over {skipped:?})")
+                        format!("pull_new: no file in {dir} that the file guard accepts (passed over {})", passed_over(&skipped))
                     },
                 )
             })?
@@ -553,11 +582,14 @@ impl Daemon {
             }
         }
         let path = local_path_string(&local);
-        let mut text =
-            format!("pulled {remote} ({size} bytes, size stable across two polls) to {path}");
+        let mut text = format!(
+            "pulled {} ({size} bytes, size stable across two polls) to {path}",
+            shown(&remote)
+        );
         if !skipped.is_empty() {
             text.push_str(&format!(
-                "; passed over newer names the file guard refuses: {skipped:?}"
+                "; passed over newer names the file guard refuses: {}",
+                passed_over(&skipped)
             ));
         }
         Ok(
