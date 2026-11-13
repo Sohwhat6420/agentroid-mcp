@@ -39,6 +39,14 @@ const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// changing (a running stopwatch, 11 Nov 2026), and the screen guard then refuses every touch. This
 /// makes the same platform calls without the idle requirement, so the XML is the platform's own.
 const IDLE_FREE_DEX: &[u8] = include_bytes!("../assets/idle-free-dump/agentroid-dump.dex");
+/// SHA-256 of that file. The dex is a committed binary that the daemon pushes to a phone and runs
+/// there as the shell user, and a diff of it shows a reviewer nothing. Pinning its hash here means a
+/// changed binary cannot arrive without a changed line of source beside it, which a reviewer does
+/// see and can check against a rebuild (`build.sh` prints the hash of what it built). Compared by
+/// the test `the_embedded_fallback_reader_is_the_pinned_binary`, which CI runs.
+#[cfg(test)]
+const IDLE_FREE_DEX_SHA256: &str =
+    "e4a552061d27fea83b402fbb0700843866b2ae963fa29ddcb0f6a4ef508501c2";
 const IDLE_FREE_REMOTE: &str = "/data/local/tmp/agentroid-dump.dex";
 const IDLE_FREE_CMD: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump /dev/tty";
 const NOT_IDLE: &str = "could not get idle state";
@@ -1074,6 +1082,17 @@ mod tests {
             &IDLE_FREE_DEX[..4],
             b"dex\n",
             "rebuild it with assets/idle-free-dump/build.sh"
+        );
+    }
+
+    #[test]
+    fn the_embedded_fallback_reader_is_the_pinned_binary() {
+        let mut h = crate::sha256::Sha256::new();
+        h.update(IDLE_FREE_DEX);
+        assert_eq!(
+            h.finish_hex(),
+            IDLE_FREE_DEX_SHA256,
+            "agentroid-dump.dex is not the binary this source pins. If you rebuilt it from Dump.java with assets/idle-free-dump/build.sh, put the hash build.sh printed into IDLE_FREE_DEX_SHA256 in the same commit; if you did not, do not ship this file"
         );
     }
 
