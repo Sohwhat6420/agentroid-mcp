@@ -46,6 +46,37 @@ const META: [char; 14] = [
     ';', '&', '|', '$', '`', '(', ')', '<', '>', '\\', '\'', '"', '*', '?',
 ];
 
+/// Invisible format characters (zero-width spaces and joiners, bidi controls, the byte-order mark,
+/// soft hyphen, tag characters and similar). Case-folding storage ignores Unicode's default-ignorable
+/// characters when it matches names, so `/sdcard/Andro\u{200B}id/data/<pkg>` opens another app's
+/// `Android/data` folder. A path that holds one is refused, as a control character is.
+pub fn is_invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFEFF | 0xFFA0
+        | 0xFFF0..=0xFFFB | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+}
+
+/// Whether case-folding storage could open path segment `seg` as the ASCII name `word`: the same
+/// letters in any case, perhaps with characters it ignores (variation selectors and the like) or
+/// letters that fold to ASCII (the Kelvin sign to `k`, the long s to `s`). Any other non-ASCII letter
+/// makes it a different name. Errs towards a match: a false match only asks a human.
+fn folds_to(seg: &str, word: &str) -> bool {
+    if seg.is_ascii() {
+        return seg.eq_ignore_ascii_case(word);
+    }
+    let skeleton: String = seg
+        .chars()
+        .filter_map(|c| match c {
+            '\u{212A}' => Some('k'),
+            '\u{017F}' => Some('s'),
+            c if c.is_ascii() => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    skeleton == word
+}
+
 fn normalise(p: &str) -> String {
     let mut out = String::with_capacity(p.len());
     let mut prev_slash = false;
@@ -73,6 +104,12 @@ fn syntax(p: &str) -> Result<String, String> {
     if p.chars().any(char::is_control) {
         return Err("phone path holds a control character".into());
     }
+    if let Some(c) = p.chars().find(|&c| is_invisible(c)) {
+        return Err(format!(
+            "phone path holds the invisible character U+{:04X}",
+            c as u32
+        ));
+    }
     if let Some(c) = p.chars().find(|c| META.contains(c)) {
         return Err(format!("phone path holds the shell metacharacter {c:?}"));
     }
@@ -97,17 +134,20 @@ fn under_shared(p: &str) -> bool {
 /// storage: another app's files. Letter case is ignored, as [`under_shared`] ignores it: Android's
 /// shared storage is case-insensitive, so `/sdcard/android/DATA/<pkg>` is the same directory, and a
 /// path the phone would open must not be judged as a different one.
+///
+/// The `Android` and `data` / `obb` / `media` segments are matched as case-folding storage would
+/// match them ([`folds_to`]), so a spelling with an ignored or folding character is still caught.
 fn app_private_external(p: &str) -> Option<String> {
     let lower = p.to_ascii_lowercase();
     for root in SHARED_ROOTS {
-        if let Some(rest) = lower.strip_prefix(root) {
-            let mut it = rest.split('/');
-            if it.next() == Some("android") {
+        if lower.starts_with(root) {
+            // ASCII lowering keeps byte lengths, so the caller's own spelling starts at the same offset
+            let mut it = p[root.len()..].split('/');
+            if it.next().is_some_and(|s| folds_to(s, "android")) {
                 if let (Some(kind), Some(pkg)) = (it.next(), it.next()) {
-                    if matches!(kind, "data" | "obb" | "media") && !pkg.is_empty() {
-                        // the package as the caller wrote it (same byte offsets: ASCII lowering keeps lengths)
-                        let at = root.len() + "android/".len() + kind.len() + 1;
-                        return Some(p[at..at + pkg.len()].to_string());
+                    let kind_ok = ["data", "obb", "media"].iter().any(|w| folds_to(kind, w));
+                    if kind_ok && !pkg.is_empty() {
+                        return Some(pkg.to_string());
                     }
                 }
             }
@@ -293,6 +333,63 @@ mod tests {
         ] {
             assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p}");
         }
+    }
+
+    #[test]
+    fn invisible_characters_are_refused_anywhere_in_a_path() {
+        // each would open com.whatsapp's files on case-folding storage, which ignores them
+        for p in [
+            "/sdcard/Andro\u{200B}id/data/com.whatsapp/files/x",
+            "/sdcard/Android/da\u{200D}ta/com.whatsapp/files/x",
+            "/sdcard/\u{FEFF}Android/data/com.whatsapp/files/x",
+            "/sdcard/Android\u{2060}/obb/com.game/main.obb",
+            "/sdcard/Android/media\u{00AD}/com.whatsapp/x",
+            "/sdcard/Android/data/com.whatsapp/files/x\u{202E}gpj.exe",
+            "/sdcard/Download/a\u{E0041}b.txt",
+        ] {
+            for op in [FileOp::Pull, FileOp::Push] {
+                let d = classify_file(op, p);
+                assert_eq!(d.verdict, Verdict::Blocked, "{p:?}: {d:?}");
+                assert_eq!(d.rule, "file:path_syntax", "{p:?}");
+            }
+        }
+        // ordinary non-ASCII names stay allowed
+        for p in [
+            "/sdcard/Download/caf\u{E9}.jpg",
+            "/sdcard/DCIM/\u{732B}.png",
+            "/sdcard/Pictures/\u{2764}\u{FE0F}.png",
+        ] {
+            assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn letters_that_storage_folds_or_ignores_still_name_android_data() {
+        // a variation selector is ignored and the long s and Kelvin sign fold to ASCII: still asked
+        for p in [
+            "/sdcard/Andr\u{FE0F}oid/data/com.whatsapp/files/x",
+            "/sdcard/Android/d\u{FE00}ata/com.whatsapp/files/x",
+            "/sdcard/Android/ob\u{FE0F}b/com.game/main.obb",
+            "/storage/emulated/0/Android/media\u{FE0F}/com.whatsapp/x",
+        ] {
+            let d = classify_file(FileOp::Pull, p);
+            assert_eq!(d.verdict, Verdict::Ask, "{p:?}: {d:?}");
+            assert_eq!(d.rule, "file:app_external_data", "{p:?}");
+        }
+        assert!(folds_to("\u{17F}dcard", "sdcard") && folds_to("\u{212A}", "k"));
+        // a different letter is a different folder: allowed, as before
+        for p in [
+            "/sdcard/Andr\u{F6}id/data/com.whatsapp/x",
+            "/sdcard/\u{410}ndroid/data/com.whatsapp/x",
+        ] {
+            assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p:?}");
+        }
+        // the reason still names the package as written
+        let d = classify_file(FileOp::Pull, "/sdcard/Andr\u{FE0F}oid/data/Com.X/f");
+        assert_eq!(
+            d.reason,
+            "pulling from Com.X's Android/data or obb directory"
+        );
     }
 
     #[test]

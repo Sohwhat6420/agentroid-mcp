@@ -81,14 +81,15 @@ fn arg<'a>(call: &'a Value, name: &str) -> Result<&'a str, RpcError> {
         })
 }
 
-/// A phone path: absolute, no control character, no `..` or `.` segment. A `.` is refused, not
+/// A phone path: absolute, no control or invisible character, no `..` or `.` segment. A `.` is refused, not
 /// dropped (`/sdcard/./Android/data/<pkg>` is another app's folder by a second spelling).
 pub fn check_phone_path(p: &str) -> Result<(), RpcError> {
     if !p.starts_with('/')
-        || p.chars().any(char::is_control)
+        || p.chars()
+            .any(|c| c.is_control() || agentroid_core::fileguard::is_invisible(c))
         || p.split('/').any(|s| s == ".." || s == ".")
     {
-        return Err(RpcError::new(INVALID_PARAMS, format!("invalid params: phone path {p:?} must be absolute, with no `..` or `.` segment and no control character")));
+        return Err(RpcError::new(INVALID_PARAMS, format!("invalid params: phone path {p:?} must be absolute, with no `..` or `.` segment and no control or invisible character")));
     }
     Ok(())
 }

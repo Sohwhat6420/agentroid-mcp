@@ -574,6 +574,44 @@ fn pull_new_and_push_reject_single_dot_segments_before_touching_the_phone() {
     });
 }
 
+/// An invisible character (a zero-width space, a joiner, a byte-order mark) is refused in `pull_new`'s
+/// folder and `push`'s phone path: case-folding storage ignores it, so `/sdcard/Andro\u{200B}id/data/
+/// <pkg>` opens another app's private folder.
+#[test]
+fn pull_new_and_push_reject_invisible_characters_before_touching_the_phone() {
+    run(async {
+        let dir = tmp_dir("devtools-invisible-paths");
+        let local = local_file(&dir, "f.bin", b"abc");
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        for d in [
+            "/sdcard/Andro\u{200B}id/data/com.whatsapp/files",
+            "/sdcard/Android/da\u{200D}ta/com.whatsapp/files",
+            "/sdcard/\u{FEFF}Android/data/com.whatsapp/files",
+        ] {
+            let r = c
+                .tool(POCO, json!({ "tool": "pull_new", "dir": d, "poll_ms": 0 }))
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "{d:?}: {r}");
+            assert!(
+                r["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invisible"),
+                "{d:?}: {r}"
+            );
+            let r = c
+                .tool(
+                    POCO,
+                    json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": format!("{d}/f.bin") }),
+                )
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "push {d:?}: {r}");
+        }
+        no_command_reached(&h);
+    });
+}
+
 /// The laptop side is fenced: `push` reads only the outbox and `pull_new` writes only the inbox.
 /// A file elsewhere, a `..` name, or a pull into another folder is REFUSED (class `outbox` /
 /// `inbox`) and nothing reaches the phone.
