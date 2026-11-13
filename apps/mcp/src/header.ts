@@ -4,6 +4,7 @@
 // older reading as if it were current.
 
 import type { Schema } from "./schema.ts";
+import { cleanField } from "./untrusted.ts";
 
 export type Unknown = "unknown";
 export interface Field<T> {
@@ -48,6 +49,8 @@ const KEYS = ["alias", "model", "mode", ...HEALTH_KEYS] as const;
 type Key = (typeof KEYS)[number];
 
 const isStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+/** Longest value kept for each header string, in characters. */
+export const FIELD_MAX = { alias: 40, model: 40, mode: 16, package: 120, title: 80 } as const;
 const isNum = (v: unknown, lo: number, hi: number): v is number => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
 
 /** Keep only the parts of a raw reading that are well-formed; anything else is dropped, so it shows as unknown. */
@@ -55,9 +58,20 @@ export function parseObservation(raw: unknown): Observation {
   const o: Observation = {};
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return o;
   const r = raw as Record<string, unknown>;
-  if (isStr(r.alias)) o.alias = r.alias;
-  if (isStr(r.model)) o.model = r.model;
-  if (isStr(r.mode)) o.mode = r.mode;
+  // The strings below end up on the one-line header. A model name and a window title are whatever the
+  // phone says they are, so each is cleaned first (no line breaks or control characters, bounded
+  // length): a title cannot start a line of its own or pass as a server notice.
+  const str = (v: unknown, max: number): string | undefined => {
+    if (!isStr(v)) return undefined;
+    const c = cleanField(v, max);
+    return c.length > 0 ? c : undefined;
+  };
+  const alias = str(r.alias, FIELD_MAX.alias);
+  if (alias !== undefined) o.alias = alias;
+  const model = str(r.model, FIELD_MAX.model);
+  if (model !== undefined) o.model = model;
+  const mode = str(r.mode, FIELD_MAX.mode);
+  if (mode !== undefined) o.mode = mode;
   if (isNum(r.battery, 0, 100)) o.battery = r.battery;
   if (typeof r.powered === "boolean") o.powered = r.powered;
   if (isNum(r.temp_c, -50, 150)) o.temp_c = r.temp_c;
@@ -66,8 +80,10 @@ export function parseObservation(raw: unknown): Observation {
   if (typeof r.foreground === "object" && r.foreground !== null && !Array.isArray(r.foreground)) {
     const f = r.foreground as Record<string, unknown>;
     const fg: Foreground = {};
-    if (isStr(f.package)) fg.package = f.package;
-    if (isStr(f.title)) fg.title = f.title;
+    const pkg = str(f.package, FIELD_MAX.package);
+    if (pkg !== undefined) fg.package = pkg;
+    const title = str(f.title, FIELD_MAX.title);
+    if (title !== undefined) fg.title = title;
     if (fg.package !== undefined || fg.title !== undefined) o.foreground = fg;
   }
   if (isNum(r.age_s, 0, 1e9)) o.age_s = r.age_s;
