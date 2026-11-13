@@ -209,7 +209,7 @@ Agentroid is a preview, released for trial and demo. The Cargo workspace and the
 
 - Windows only: the daemon listens on a named pipe. A Unix-socket listener for Linux, needed for the CI benchmark runs, is written but not yet built or tested.
 - On a screen that never goes still (a running stopwatch), the stock screen read fails. bridged now falls back to a read-only reader for that case; see [Benchmark in progress](#benchmark-in-progress).
-- Per-device modes cannot be set from configuration yet: every allowed device runs as `full` (`agentroid-setup` writes a `devices.toml` that the daemon does not read). Emulators and allowed physical phones both work.
+- Per-device modes are set on the command line only: an allowed device runs as `full` unless `bridged` is started with `--read-only-serial <hardware serial>` for it, which makes it answer reads only. `helper` cannot be set for a device yet, and `agentroid-setup` writes a `devices.toml` that the daemon does not read. Emulators and allowed physical phones both work.
 - The helper app is not connected to the live transport, so non-ASCII typing is unavailable.
 - Screenshots are not returned to the agent as images.
 - The phone link over a tailnet has been tested against fakes, not end to end on a real phone.
