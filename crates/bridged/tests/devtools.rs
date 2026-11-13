@@ -754,6 +754,119 @@ fn pull_new_is_stable_on_two_equal_polls_and_fails_when_the_size_keeps_changing(
     });
 }
 
+/// The phone chooses the size and the name of its newest file. Neither may hurt the laptop: a file
+/// over the limit is refused before the pull, and a pull never replaces a file already in the inbox.
+#[test]
+fn pull_new_refuses_a_file_over_the_limit_and_never_overwrites_an_inbox_file() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-limits");
+        let h = start(DeviceMode::Full);
+        h.daemon.set_max_pull_bytes(16);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["big.bin".into()];
+            p.files.insert("/sdcard/d/big.bin".into(), vec![1; 17]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let pull = json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0 });
+        // one byte over: refused, and adb pull never ran
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(code(&r), REFUSED, "{r}");
+        assert_eq!(r["error"]["data"]["class"], "inbox_size", "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("at most 16 bytes"),
+            "{r}"
+        );
+        assert!(
+            !reached(&h).iter().any(|l| l.starts_with("pull ")),
+            "{:?}",
+            reached(&h)
+        );
+        assert_eq!(std::fs::read_dir(dir.join("inbox")).unwrap().count(), 0);
+        // exactly the limit is taken
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["report.txt".into()];
+            p.files
+                .insert("/sdcard/d/report.txt".into(), b"0123456789abcdef".to_vec());
+        }
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(r["result"]["size"], 16, "{r}");
+        let first = PathBuf::from(r["result"]["path"].as_str().unwrap());
+        assert_eq!(first, dir.join("inbox").join("report.txt"));
+        // the phone now holds another file with the same name: the first pull is kept as it was
+        h.phone.lock().unwrap().files.insert(
+            "/sdcard/d/report.txt".into(),
+            b"replaced by phone".to_vec()[..16].to_vec(),
+        );
+        let r = c.tool(POCO, pull.clone()).await;
+        let second = PathBuf::from(r["result"]["path"].as_str().unwrap());
+        assert_eq!(second, dir.join("inbox").join("report (1).txt"), "{r}");
+        assert_eq!(std::fs::read(&first).unwrap(), b"0123456789abcdef");
+        assert_eq!(std::fs::read(&second).unwrap(), b"replaced by phon");
+        let r = c.tool(POCO, pull).await;
+        assert!(
+            r["result"]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("report (2).txt"),
+            "{r}"
+        );
+    });
+}
+
+#[test]
+fn a_phone_file_name_becomes_a_plain_laptop_file_name() {
+    use bridged::devtools::local_name;
+    // ordinary names are kept
+    for n in [
+        "IMG_0001.jpg",
+        "new shot.png",
+        "notes.tar.gz",
+        "Makefile",
+        "résumé.pdf",
+    ] {
+        assert_eq!(local_name(n), n);
+    }
+    // separators, drive and stream characters, control characters
+    assert_eq!(
+        local_name("..\\..\\Startup\\run.bat"),
+        ".._.._Startup_run.bat"
+    );
+    assert_eq!(local_name("a/b:c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
+    assert_eq!(local_name("a\nb\tc"), "a_b_c");
+    // Windows drops trailing dots and spaces, so they are dropped here first
+    assert_eq!(local_name("report.txt. . "), "report.txt");
+    assert_eq!(local_name(" . "), "pulled_file");
+    for n in ["", ".", "..", "...", "   "] {
+        assert_eq!(local_name(n), "pulled_file", "{n:?}");
+    }
+    // Windows device names never reach a device
+    for (n, want) in [
+        ("NUL", "_NUL"),
+        ("nul.txt", "_nul.txt"),
+        ("CON", "_CON"),
+        ("Aux.log", "_Aux.log"),
+        ("PRN.tar.gz", "_PRN.tar.gz"),
+        ("COM1", "_COM1"),
+        ("lpt9.txt", "_lpt9.txt"),
+        ("NUL .txt", "_NUL .txt"),
+    ] {
+        assert_eq!(local_name(n), want);
+    }
+    for n in ["NULL", "CONSOLE.txt", "COM0", "COM10", "LPT", "command.com"] {
+        assert_eq!(local_name(n), n, "{n} is not a device name");
+    }
+    // a very long name is cut and keeps its extension
+    let long = format!("{}.jpeg", "x".repeat(400));
+    let cut = local_name(&long);
+    assert_eq!(cut.chars().count(), 120);
+    assert!(cut.ends_with(".jpeg"));
+}
+
 #[test]
 fn doctor_without_a_command_asks_the_phone_nothing_and_every_call_is_journalled() {
     run(async {

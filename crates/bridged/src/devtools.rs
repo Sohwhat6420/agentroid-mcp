@@ -36,6 +36,13 @@ pub const TOOLS: [&str; 3] = ["doctor", "push", "pull_new"];
 pub const MAX_POLLS: u32 = 20;
 /// Longest `doctor` answer kept, in bytes.
 const MAX_TEXT: usize = 256 * 1024;
+/// The largest file `pull_new` fetches unless the daemon was told otherwise: 512 MiB. The phone
+/// decides how big its newest file is, so without a limit one call could fill the laptop's disk.
+pub const DEFAULT_MAX_PULL_BYTES: u64 = 512 * 1024 * 1024;
+/// Longest laptop file name kept from a phone file name, in characters.
+const MAX_LOCAL_NAME: usize = 120;
+/// How many numbered names `pull_new` tries before it gives up on a name that is taken.
+const MAX_NAME_TRIES: u32 = 999;
 
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -95,8 +102,12 @@ fn parse_sha(out: &str) -> Option<String> {
     (w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit())).then(|| w.to_ascii_lowercase())
 }
 
-/// A file name from the phone, made safe to use as a laptop file name.
-fn local_name(n: &str) -> String {
+/// A file name from the phone, made safe to use as a laptop file name. The phone chooses the name,
+/// so it is treated as hostile: no separator, drive or stream character, no control character, no
+/// trailing dot or space (Windows drops them, so two names would be one file), not a Windows device
+/// name (`NUL`, `CON`, `COM1`...: opening one never reaches a file), and at most
+/// [`MAX_LOCAL_NAME`] characters.
+pub fn local_name(n: &str) -> String {
     let s: String = n
         .chars()
         .map(|c| {
@@ -107,11 +118,54 @@ fn local_name(n: &str) -> String {
             }
         })
         .collect();
+    let s = s.trim_end_matches(['.', ' ']).trim_start_matches(' ');
     if s.is_empty() || s == "." || s == ".." {
-        "pulled_file".into()
-    } else {
-        s
+        return "pulled_file".into();
     }
+    // keep the extension when the name is cut
+    let mut s: String = if s.chars().count() > MAX_LOCAL_NAME {
+        let (stem, ext) = split_ext(s);
+        let ext: String = ext.chars().take(16).collect();
+        let keep = MAX_LOCAL_NAME - ext.chars().count();
+        format!("{}{ext}", stem.chars().take(keep).collect::<String>())
+    } else {
+        s.to_string()
+    };
+    let stem = s
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.ends_with(|c: char| c.is_ascii_digit() && c != '0'));
+    if device {
+        s.insert(0, '_');
+    }
+    s
+}
+
+/// `("name", ".ext")`; the extension is empty when there is none (or the name starts with its only dot).
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    }
+}
+
+/// A path in `dir` for `name` that is not taken: `name` itself, else `stem (1).ext`, `stem (2).ext`...
+/// A pulled file never replaces one that is already in the inbox.
+fn free_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    let first = dir.join(name);
+    if std::fs::symlink_metadata(&first).is_err() {
+        return Some(first);
+    }
+    let (stem, ext) = split_ext(name);
+    (1..=MAX_NAME_TRIES)
+        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
 }
 
 /// The laptop folder for `push` and `pull_new` when the daemon was given none:
@@ -478,6 +532,15 @@ impl Daemon {
                 format!("pull_new: {remote} was still changing after {MAX_POLLS} polls"),
             )
         })?;
+        // the phone says how big its file is; the laptop decides how much it takes
+        let max = *self.max_pull_bytes.get_or_init(|| DEFAULT_MAX_PULL_BYTES);
+        if size > max {
+            return Err(fenced(
+                "pull_new",
+                "inbox_size",
+                format!("pull_new fetches at most {max} bytes and {remote} is {size} bytes; nothing was pulled"),
+            ));
+        }
         std::fs::create_dir_all(&local_dir).map_err(|e| {
             RpcError::new(
                 STATE_ERROR,
@@ -496,7 +559,16 @@ impl Daemon {
                 ),
             ));
         }
-        let local: PathBuf = local_dir.join(local_name(&newest));
+        // never over a file that is already there: a phone file named like an earlier pull gets a number
+        let local: PathBuf = free_path(&local_dir, &local_name(&newest)).ok_or_else(|| {
+            RpcError::new(
+                STATE_ERROR,
+                format!(
+                    "pull_new: {} already holds {MAX_NAME_TRIES} files named like {newest:?}; clear the inbox",
+                    local_dir.display()
+                ),
+            )
+        })?;
         self.backend()
             .raw_pull(&t.serial, &remote, &local)
             .map_err(|e| RpcError::new(DEVICE_ERROR, format!("pull failed: {e}")))?;
