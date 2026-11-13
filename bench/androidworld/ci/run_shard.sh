@@ -14,6 +14,9 @@ esac
 # The sign-in token arrives as a 0600 file (CLAUDE_TOKEN_FILE), never in this step's environment. Drop any copy of
 # it from the environment anyway, so nothing started here can inherit one.
 unset CLAUDE_CODE_OAUTH_TOKEN
+# Every exit deletes the file, early ones too (BENCH_STOP, an adb or installer failure), not only the normal path.
+drop_token_file() { rm -f "${CLAUDE_TOKEN_FILE:-}" 2>/dev/null || true; }
+trap drop_token_file EXIT
 test -s "${CLAUDE_TOKEN_FILE:-}" || { echo "CLAUDE_TOKEN_FILE is not set or empty" >&2; exit 3; }
 mkdir -p out
 
@@ -31,7 +34,7 @@ if [ "$(read_stop)" = "1" ]; then echo "BENCH_STOP=1: running nothing"; record_s
     if [ "$(read_stop)" = "1" ]; then echo "BENCH_STOP=1 seen at $(date -u +%H:%MZ): ending after the current task"; : > STOP; exit 0; fi
   done ) &
 poller=$!
-trap 'kill "$poller" 2>/dev/null || true' EXIT
+trap 'kill "$poller" 2>/dev/null || true; drop_token_file' EXIT
 
 adb wait-for-device
 # AndroidWorld's apps (the laptop installed these once with install_apps.py; a CI AVD starts empty).

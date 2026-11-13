@@ -141,9 +141,12 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-      # The sign-in token goes into a file only this user can read, so it is never in the emulator step's
-      # environment: the action, the emulator, adb and gh never see it. run_shard.sh reads and deletes the file
-      # and hands the token to run_pilot alone, which passes it to each `claude` child only.
+      # The sign-in token goes into a 0600 file in RUNNER_TEMP, so it is never in the emulator step's
+      # environment: the action, the emulator, adb and gh do not inherit it. The file is not a wall between
+      # processes, though: every process running as the runner's user can read it until run_shard.sh deletes
+      # it (at once before run_pilot starts, or on any exit, early ones included; if the emulator never comes up
+      # and run_shard.sh never starts, it stays until the job ends). run_shard.sh hands the token to run_pilot
+      # alone, which passes it to each `claude` child only.
       - name: Hold the sign-in token in a private file
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
