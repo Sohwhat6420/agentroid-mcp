@@ -521,7 +521,7 @@ impl Daemon {
                 .map_err(|_| {
                     RpcError::new(
                         DEVICE_ERROR,
-                        format!("pull_new: cannot read the size of {remote}"),
+                        format!("pull_new: cannot read the size of {}", shown(&remote)),
                     )
                 })?;
             if prev == Some(n) {
@@ -536,7 +536,10 @@ impl Daemon {
         let size = stable.ok_or_else(|| {
             RpcError::new(
                 DEVICE_ERROR,
-                format!("pull_new: {remote} was still changing after {MAX_POLLS} polls"),
+                format!(
+                    "pull_new: {} was still changing after {MAX_POLLS} polls",
+                    shown(&remote)
+                ),
             )
         })?;
         std::fs::create_dir_all(&local_dir).map_err(|e| {
@@ -570,14 +573,20 @@ impl Daemon {
         if got != size {
             return Err(RpcError::new(
                 DEVICE_ERROR,
-                format!("pull_new: {remote} is {size} bytes on the phone but {got} on the laptop"),
+                format!(
+                    "pull_new: {} is {size} bytes on the phone but {got} on the laptop",
+                    shown(&remote)
+                ),
             ));
         }
         if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
             if theirs != sha {
                 return Err(RpcError::new(
                     DEVICE_ERROR,
-                    format!("pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}"),
+                    format!(
+                        "pull_new: sha256 mismatch for {}: phone {theirs}, laptop {sha}",
+                        shown(&remote)
+                    ),
                 ));
             }
         }
