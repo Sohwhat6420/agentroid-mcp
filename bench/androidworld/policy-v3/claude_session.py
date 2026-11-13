@@ -27,6 +27,31 @@ import time
 from typing import Any, Callable, Sequence
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
+
+# The CI sign-in token. It is for `claude` children only: hold_token() takes it out of os.environ, so the processes
+# started from here (bridged, the MCP server, adb) do not inherit it, and child_env() hands it back to each `claude`
+# child alone. What this does NOT do: code running inside this process (android_world and its dependencies) can still
+# read the held token, and the process's initial environment (/proc/<pid>/environ) still shows it to other processes
+# of the same user. The defence against android_world's dependencies is the hash lock on them
+# (ci/aw-requirements.lock); full isolation would need a separate process or user.
+TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+_held_token: str | None = None
+
+
+def hold_token() -> bool:
+    """Move the sign-in token from os.environ into this module. Idempotent; True when a token is held."""
+    global _held_token
+    t = os.environ.pop(TOKEN_VAR, None)
+    if t:
+        _held_token = t
+    return _held_token is not None
+
+
+def child_env() -> dict[str, str] | None:
+    """The environment for a `claude` child: this process's, plus the held token. None (inherit) when none is held."""
+    if _held_token is None:
+        return None
+    return {**os.environ, TOKEN_VAR: _held_token}
 CLAUDE = os.environ.get("AGENTROID_CLAUDE", "claude")
 
 
@@ -60,7 +85,7 @@ class ClaudeSession:
         self.log: list[dict[str, Any]] = []
         self.last_model = model
         self._proc = popen(session_argv(model, system, effort), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+                           stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=child_env(),
                            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
         self._lines: "queue.Queue[str | None]" = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
