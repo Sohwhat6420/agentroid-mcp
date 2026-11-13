@@ -85,15 +85,21 @@ fn under_shared(p: &str) -> bool {
     SHARED_ROOTS.iter().any(|r| p.starts_with(r))
 }
 
-/// `Android/data/<pkg>/...` or `Android/obb/<pkg>/...` under shared storage: another app's files.
+/// `Android/data/<pkg>/...`, `Android/obb/<pkg>/...` or `Android/media/<pkg>/...` under shared
+/// storage: another app's files. Letter case is ignored, as [`under_shared`] ignores it: Android's
+/// shared storage is case-insensitive, so `/sdcard/android/DATA/<pkg>` is the same directory, and a
+/// path the phone would open must not be judged as a different one.
 fn app_private_external(p: &str) -> Option<String> {
+    let lower = p.to_ascii_lowercase();
     for root in SHARED_ROOTS {
-        if let Some(rest) = p.strip_prefix(root) {
+        if let Some(rest) = lower.strip_prefix(root) {
             let mut it = rest.split('/');
-            if it.next() == Some("Android") {
+            if it.next() == Some("android") {
                 if let (Some(kind), Some(pkg)) = (it.next(), it.next()) {
                     if matches!(kind, "data" | "obb" | "media") && !pkg.is_empty() {
-                        return Some(pkg.to_string());
+                        // the package as the caller wrote it (same byte offsets: ASCII lowering keeps lengths)
+                        let at = root.len() + "android/".len() + kind.len() + 1;
+                        return Some(p[at..at + pkg.len()].to_string());
                     }
                 }
             }
@@ -245,6 +251,40 @@ mod tests {
         );
         // the top-level Android folder itself is not an app's data
         assert_eq!(v(FileOp::Pull, "/sdcard/Android/x.txt"), Verdict::Allowed);
+    }
+
+    #[test]
+    fn another_apps_external_data_is_asked_in_any_letter_case() {
+        // shared storage is case-insensitive on the phone: each of these opens com.whatsapp's files
+        for p in [
+            "/sdcard/android/data/com.whatsapp/files/x",
+            "/sdcard/ANDROID/DATA/com.whatsapp/files/x",
+            "/sdcard/Android/Data/com.whatsapp/files/x",
+            "/SDCARD/aNdRoId/data/com.whatsapp/files/x",
+            "/storage/emulated/0/android/media/com.whatsapp/WhatsApp/Databases/msgstore.db",
+            "/storage/self/primary/Android/OBB/com.game/main.obb",
+            "/sdcard//android///data/com.whatsapp/files/x",
+        ] {
+            let d = classify_file(FileOp::Pull, p);
+            assert_eq!(d.verdict, Verdict::Ask, "{p}: {d:?}");
+            assert_eq!(d.kind, Some(Kind::Credential), "{p}");
+            assert_eq!(d.rule, "file:app_external_data", "{p}");
+        }
+        // the reason names the package as the caller wrote it
+        let d = classify_file(FileOp::Pull, "/sdcard/android/data/Com.Example.App/files/x");
+        assert_eq!(
+            d.reason,
+            "pulling from Com.Example.App's Android/data or obb directory"
+        );
+        // the nearest allowed neighbours stay allowed: not the Android folder, or no package under it
+        for p in [
+            "/sdcard/Download/android/data/com.whatsapp/x",
+            "/sdcard/android/x.txt",
+            "/sdcard/androidx/data/com.whatsapp/x",
+            "/sdcard/android/datax/com.whatsapp/x",
+        ] {
+            assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p}");
+        }
     }
 
     #[test]
