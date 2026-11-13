@@ -146,19 +146,14 @@ pub struct CropOut {
 
 pub struct CoreBackend<T: Transport, C: Clock> {
     pub core: Core<T, C>,
-    modes: HashMap<String, DeviceMode>,
 }
 
 impl<T: Transport, C: Clock> CoreBackend<T, C> {
     pub fn new(core: Core<T, C>) -> Self {
-        CoreBackend {
-            core,
-            modes: HashMap::new(),
-        }
+        CoreBackend { core }
     }
     /// Configure a device's mode (hardware or adb serial). The protected phone stays `read_only` regardless.
     pub fn set_mode(&mut self, serial: &str, mode: DeviceMode) {
-        self.modes.insert(serial.to_string(), mode);
         self.core.set_mode(serial, mode);
     }
 }
@@ -168,13 +163,8 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
         self.core.transport.devices()
     }
     fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
-        let configured = self
-            .modes
-            .get(&d.hw_serial)
-            .or_else(|| self.modes.get(&d.serial))
-            .copied()
-            .unwrap_or_default();
-        gate::effective_mode(&[&d.serial, &d.hw_serial], configured)
+        // one rule, core's: what the daemon reports is what the gate applies
+        self.core.mode_of(d)
     }
     fn call(&mut self, serial: &str, call: &Call) -> Result<Outcome, CoreError> {
         self.core.call(Some(serial), call)

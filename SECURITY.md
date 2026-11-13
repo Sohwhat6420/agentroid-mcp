@@ -54,7 +54,7 @@ These are documented design limits of the current build. A report that only rest
 - **A prompt-injected agent can still use the access it has.** Screen content is untrusted input to the model. The safety checks limit what a misled agent can do; they cannot stop it from doing the permitted things badly.
 - **Two optional outbound paths, both to ntfy.** Agentroid sends no telemetry. (a) If you create `%USERPROFILE%\.agentroid
 tfy-topic.txt`, the MCP server posts a short message (run id, flow name, step counts, no screen content) when a job finishes or needs you. (b) If you start the daemon with `--approval-topic-file <file>`, each `asked` action posts an approval request to that topic (default server `https://ntfy.sh`, or `--ntfy-base <url>`): it carries the tool, the phone's hardware serial, the guard's reason, which quotes the matched on-screen label, and the target label. Treat both topic names as secrets, prefer a self-hosted ntfy server, and do not install the ntfy app on the phone being driven: its Allow button would be on the agent's own screen.
-- **Windows only, pre-release.** Device modes cannot yet be set from configuration: every allowed device runs as `full` over the local pipe (the HTTP listener does enforce a mode per access token).
+- **Windows only, pre-release.** An allowed device runs as `full` over the local pipe unless the daemon is started with `--read-only-serial <hardware serial>` for it; `helper` cannot be set for a device yet (the HTTP listener does enforce a mode per access token).
 
 ## Testing responsibly
 
