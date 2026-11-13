@@ -34,6 +34,7 @@ pub mod gate;
 pub mod refs;
 pub mod require;
 pub mod screenguard;
+pub mod screenlock;
 pub mod selector;
 pub mod selftest;
 pub mod settle;

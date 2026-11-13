@@ -50,6 +50,7 @@ The checks live in the daemon (`bridged`), not in a prompt. They run on every ca
 - **Tamper-evident audit log.** Each decision, allowed or refused, is a JSON line chained to the one before it by SHA-256. It is written before the action is sent, and an action is refused if the log cannot be written. `agentroid audit verify <log>` reports an edited line, a re-hashed edit or lines cut off the end. It rotates every 10,000 records or 7 days, and `--audit-anchor <path>` writes the chain head to a second place (ideally off the machine), which catches a log rewritten from scratch (best effort by default; `--audit-anchor-required` refuses the action if the anchor cannot be written).
 - **Shell and files.** Raw shell lines from `run_script` and `push`/`pull_new` go through the same gate and log: wiping, security-setting, credential-store and input-injection commands are refused outright, and in this build every other line that is not on the read-only list is refused too. Pushes and pulls are limited to shared storage on the phone.
 - **Flow risk labels.** Flow steps still carry a risk label (R0 to R5), and a flow with any step rated R2 or higher is refused before its first step. The label is written by the flow's author, which may be the agent, so the screen guard on every step is the real control. A permission pop-up, an unknown overlay or a `checkpoint` step pauses the job for a person.
+- **Screen lock.** On a real phone, every call that changes the screen (tap, long-press, swipe, scroll, type, key, unlock, open an app, a URL or an activity, the acting steps of flows and jobs, and every `run_script` shell line that is not on the read-only list) is refused unless `agentroid ask-screen` gave a lease that is still live, or the phone is not in use at the moment of the call. See [The screen lock](#the-screen-lock). Emulators are not locked.
 - **Lock screen.** `unlock` wakes the screen and swipes away a swipe-only lock screen. If a PIN, pattern or password is set, it reports that the phone is still locked and stops.
 - **Journal and receipts.** The intent of every acting step is written to the run journal and flushed to disk before the step is sent, and every tool result carries a receipt (calls, wall time, retries, errors). A refusal returns its reason to the caller. The run journal itself is an ordinary append-only file; the tamper-evident record of every guard decision is the audit log above.
 - **Local access.** The daemon listens on a Windows named pipe that admits only the current user, rejects remote clients, and will not start if another process already owns the name. Any process running as your Windows user can still talk to it.
@@ -209,7 +210,33 @@ It prints one line of JSON and exits **0 (allowed)** or **1 (refused)**. Exit 2 
   - **Deny, or no answer,** refuses. Every call for that phone in the next 5 minutes, from any session, is then refused without a push, even if the phone is put down meanwhile.
   - **One ask at a time:** while an ask is waiting on the owner, other calls for that phone are refused without a second push. If that marker cannot be saved, the call is refused and nothing is sent.
   - If the push could not be sent, the call is refused, but nothing is held against the next ask.
-- **State** (the leases, the cool-down, the pending ask and a log of every decision, `ask-screen.log.jsonl`) is kept in `--state-dir`. The default is `%LOCALAPPDATA%\agentroid\ask-screen`, or `$AGENTROID_STATE_DIR/ask-screen`. Files are named by a hash of the device, not its serial. Each write goes to a temporary file and is renamed into place, and only what changed is written, so another session's lease is kept. Values further ahead than the program ever writes are ignored, so a damaged or left-over file can only make it ask. The file is not signed: anyone who can write the state folder can forge a lease of up to 60 minutes, so keep it in your own profile.
+- **State** (the leases, the cool-down, the pending ask and a log of every decision, `ask-screen.log.jsonl`) is kept in `--state-dir`. The default is `%LOCALAPPDATA%\agentroid\ask-screen`, or `$AGENTROID_STATE_DIR/ask-screen`. Files are named by a hash of the phone's hardware serial (`getprop ro.serialno`), or of the `--device` text when the serial cannot be read, never by the serial itself. The JSON's `state_key` says which. Each write goes to a temporary file and is renamed into place, and only what changed is written, so another session's lease is kept. Values further ahead than the program ever writes are ignored, so a damaged or left-over file can only make it ask. The file is not signed: anyone who can write the state folder can forge a lease of up to 60 minutes, so keep it in your own profile.
+
+### The screen lock
+
+`ask-screen` only asks. The daemon makes it binding: with `--adb`, `bridged` refuses every screen-changing call to a real phone (the list is under [Safety model](#safety-model)) unless one of these holds at the moment of the call:
+
+1. **A live lease.** An Allow to `ask-screen` for this phone whose lease has not run out. Any session's lease counts, because the daemon lets only one session hold a phone at a time. The daemon reads the leases from `ask-screen`'s state folder (its default, or `--ask-screen-state-dir`), under the phone's hardware serial or its adb serial.
+2. **Not in use now.** The daemon reads the phone itself, with the same rules as `ask-screen`. A phone that is not in use is allowed with no push, and a **burst** starts.
+
+A burst lets the agent carry on. Its own taps count as touches, and the app or keyboard it opens shows as in use, so without this the phone would read as in use straight after the first call. The burst goes on while:
+
+- the phone's last touch is no later than the end of the agent's own last action. The phone gives its last touch as "so many ms ago" while it is being read, so the lock allows for the length of its own read plus 0.3 s;
+- that action was less than 5 minutes ago;
+- no call screen has come up.
+
+A touch by anyone else ends the burst at once. So does a call screen, or 5 idle minutes. After that, only a lease or a phone left alone for 5 minutes lets calls through. A `run_script` shell line is admitted before it runs, so the 10 s after it count as the agent's own.
+
+- **A Deny stands.** Inside the 5-minute cool-down after a Deny, or after no answer, every screen-changing call is refused, even if the phone has been put down.
+- **Refusals** are errors: `<tool> refused by the screen lock, nothing was sent: the phone is in use (...); run agentroid ask-screen ... first`. They go to the audit log under the rule `screen_lock`.
+- **No guessing.** A phone that cannot be read is refused.
+- **Reads are never locked:** `look`, `ui_tree`, `screenshot`, `getprop`, `doctor`, `list_apps` and `wait`.
+- **No off switch.** Emulators (`emulator-<port>`) are not locked, so benchmark runs are unchanged.
+- **Cost:** each locked call outside a lease reads the phone first (`dumpsys power`, and when the screen is on `dumpsys window` and `dumpsys input_method`), about three adb round trips.
+- **Known gaps:**
+  - The lock tells touches apart by time only. A touch made while the agent's own action is running, or within about half a second after it ends, counts as the agent's.
+  - The lease file is not signed (see State above).
+  - The session stay-awake setting is still written when a call is refused, because it is queued before the lock runs.
 
 The route file names one or more ntfy servers. The ask goes to every one that can carry it, and an answer from any of them counts:
 

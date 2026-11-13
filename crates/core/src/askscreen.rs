@@ -662,7 +662,9 @@ pub fn load_route(path: &Path) -> Result<Box<dyn Channel + Send>, String> {
     Ok(Box::new(AnyChannel::new(chans)))
 }
 
-fn default_state_dir() -> PathBuf {
+/// Where the leases and the log are kept unless `--state-dir` says otherwise. The daemon's screen
+/// lock reads the leases from here too.
+pub fn default_state_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("AGENTROID_STATE_DIR") {
         return PathBuf::from(d).join("ask-screen");
     }
@@ -809,7 +811,13 @@ pub fn command(args: &[String]) -> (String, i32) {
         });
         return (out.to_string(), 3);
     };
-    let (dir, device) = (&p.state_dir, &p.ask.device);
+    // keep the state under the phone's hardware serial when it can be read, so the daemon's screen
+    // lock finds the lease whatever name adb gives the phone (serial, ip:port, mDNS name)
+    let hw = shell(&runner, &p.ask.device, "getprop ro.serialno")
+        .map(|s| s.trim().to_string())
+        .filter(|s| (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()));
+    let dir = &p.state_dir;
+    let device: &str = hw.as_deref().unwrap_or(&p.ask.device);
     let loaded = load_memory(dir, device, unix_ms());
     let mut mem = loaded.clone();
     let written = std::cell::RefCell::new(loaded);
@@ -846,6 +854,7 @@ pub fn command(args: &[String]) -> (String, i32) {
         "asked": d.asked,
         "interim": true,
         "session": p.ask.session,
+        "state_key": if hw.is_some() { "hardware serial" } else { "--device" },
         "signals": signals_json(&signals),
         "state_saved": saved.is_ok(),
     });
