@@ -278,7 +278,8 @@ impl Approver {
             return None;
         }
         // a replay from before the ask, or an event dated after the window: not an answer
-        if ev.time_ms + MAX_EARLY_MS < req.created_ms || ev.time_ms > req.expires_ms + MAX_EARLY_MS
+        if ev.time_ms.saturating_add(MAX_EARLY_MS) < req.created_ms
+            || ev.time_ms > req.expires_ms.saturating_add(MAX_EARLY_MS)
         {
             return None;
         }
@@ -437,9 +438,19 @@ fn system_wall_ms() -> u64 {
 /// with Unix time. `sent_unix_ms` is the Unix time at which the request was sent, so an event's
 /// distance from that moment is the same on both clocks. Compared raw, every live answer looked
 /// about 56 years late and was thrown away.
-pub fn on_request_clock(event_unix_ms: u64, sent_unix_ms: u64, created_ms: u64) -> u64 {
+///
+/// `None` when the event is dated before the request clock's zero (before the daemon started):
+/// it can only be a replay, and clamping it to 0 would let it pass the "from before the ask"
+/// bound while the daemon is less than [`MAX_EARLY_MS`] old. The caller drops it.
+///
+/// The laptop's clock must be within about [`MAX_EARLY_MS`] of the ntfy server's (NTP): beyond
+/// that, an Allow is filtered out or falls outside the window, so it times out (fails closed).
+pub fn on_request_clock(event_unix_ms: u64, sent_unix_ms: u64, created_ms: u64) -> Option<u64> {
     let t = i128::from(created_ms) + i128::from(event_unix_ms) - i128::from(sent_unix_ms);
-    u64::try_from(t.max(0)).unwrap_or(u64::MAX)
+    if t < 0 {
+        return None;
+    }
+    Some(u64::try_from(t).unwrap_or(u64::MAX))
 }
 
 pub struct NtfyChannel<H: Http> {
@@ -563,9 +574,9 @@ impl<H: Http> Channel for NtfyChannel<H> {
         // ntfy's Unix times, moved onto the request's clock before the approver judges the window
         Ok(parse_ntfy_lines(&text)
             .into_iter()
-            .map(|mut ev| {
-                ev.time_ms = on_request_clock(ev.time_ms, sent, req.created_ms);
-                ev
+            .filter_map(|mut ev| {
+                ev.time_ms = on_request_clock(ev.time_ms, sent, req.created_ms)?;
+                Some(ev)
             })
             .collect())
     }
@@ -1093,10 +1104,111 @@ mod tests {
         );
         assert_eq!(
             on_request_clock(UNIX_MS + 7_000, UNIX_MS, 1_000_000),
-            1_007_000
+            Some(1_007_000)
         );
-        assert_eq!(on_request_clock(UNIX_MS - 5_000_000, UNIX_MS, 1_000_000), 0);
+        assert_eq!(
+            on_request_clock(UNIX_MS - 5_000_000, UNIX_MS, 1_000_000),
+            None
+        );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_replay_from_before_the_daemon_started_is_dropped_even_in_its_first_minute() {
+        // The daemon is 30 s old, so an event 5 minutes before the send is before its clock's zero.
+        // Clamped to 0 it would pass the 60 s "from before the ask" bound; it must be dropped.
+        const UNIX_MS: u64 = 1_790_000_000_000;
+        let d = tmp("ntfy-young");
+        let tf = d.join("topic.key");
+        std::fs::write(&tf, "agentroid-approvals-0123456789abcdef\n").unwrap();
+        for (what, offset_s, kept) in [
+            ("an Allow 7 s after the ask (positive control)", 7i64, true),
+            (
+                "a replayed Allow from 5 minutes before the ask",
+                -300,
+                false,
+            ),
+        ] {
+            let mut minted = Approver::new(Box::new(FakeChannel::default()));
+            let r = req(&mut minted, 30_000);
+            let event_s = (UNIX_MS as i64 / 1000 + offset_s) as u64;
+            let http = RecHttp {
+                posts: vec![],
+                gets: vec![],
+                reply: format!(
+                    "{{\"id\":\"m1\",\"time\":{event_s},\"event\":\"message\",\"topic\":\"t\",\"message\":\"allow {}\"}}\n",
+                    r.id
+                ),
+            };
+            let mut ch =
+                NtfyChannel::new(NtfyConfig::new(&tf), http).with_wall_clock(Box::new(|| UNIX_MS));
+            ch.send(&r).unwrap();
+            let got = ch.poll(&r).unwrap();
+            assert_eq!(!got.is_empty(), kept, "{what}: {got:?}");
+            if kept {
+                let mut a = Approver::new(Box::new(FakeChannel::default()));
+                assert_eq!(a.judge(&r, &got[0]), Some(Answer::Allow), "{what}");
+            }
+        }
+        assert_eq!(on_request_clock(UNIX_MS - 300_000, UNIX_MS, 30_000), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_answer_with_an_absurd_time_is_refused_without_overflow() {
+        let mut minted = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut minted, 1_000_000);
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        for time_ms in [u64::MAX, u64::MAX - MAX_EARLY_MS + 1] {
+            let ev = Inbound {
+                event_id: format!("e{time_ms}"),
+                time_ms,
+                message: format!("allow {}", r.id),
+            };
+            assert_eq!(a.judge(&r, &ev), None, "{time_ms}");
+        }
+    }
+
+    #[test]
+    fn the_window_edges_and_a_wrong_id_on_the_live_clock() {
+        let mut minted = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut minted, 1_000_000);
+        let mut other = Approver::new(Box::new(FakeChannel::default()));
+        let wrong = req(&mut other, 1_000_000);
+        let edge = r.expires_ms + MAX_EARLY_MS;
+        let early = r.created_ms - MAX_EARLY_MS;
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let ev = |id: &str, n: u32, time_ms: u64| Inbound {
+            event_id: format!("e{n}"),
+            time_ms,
+            message: format!("allow {id}"),
+        };
+        assert_eq!(
+            a.judge(&r, &ev(&wrong.id, 1, r.created_ms + 7_000)),
+            None,
+            "a wrong id"
+        );
+        assert_eq!(
+            a.judge(&r, &ev(&r.id, 2, edge + 1)),
+            None,
+            "one ms past the upper bound"
+        );
+        assert_eq!(
+            a.judge(&r, &ev(&r.id, 3, early - 1)),
+            None,
+            "one ms before the lower bound"
+        );
+        assert_eq!(
+            a.judge(&r, &ev(&r.id, 4, edge)),
+            Some(Answer::Allow),
+            "the upper bound itself"
+        );
+        let mut b = Approver::new(Box::new(FakeChannel::default()));
+        assert_eq!(
+            b.judge(&r, &ev(&r.id, 5, early)),
+            Some(Answer::Allow),
+            "the lower bound itself"
+        );
     }
 
     #[test]
