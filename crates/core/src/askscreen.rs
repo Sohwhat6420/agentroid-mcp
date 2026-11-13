@@ -565,9 +565,12 @@ pub fn decide(
             false,
         );
     };
+    let prev = mem.asking_until_ms;
     mem.asking_until_ms = t + ask.wait_ms + PENDING_SLACK_MS;
     if !persist(mem) {
-        mem.asking_until_ms = 0;
+        // back to what was loaded, not 0: a stale value would otherwise count as a change, and the
+        // final save would write 0 over another session's live pending marker
+        mem.asking_until_ms = prev;
         return refused(
             format!("in use ({in_use}), and the pending ask could not be saved (--state-dir), or another ask started meanwhile: refused without a push"),
             60,
@@ -1001,6 +1004,32 @@ mod tests {
         assert!(!d.allowed && !d.asked && d.retry_after_s == 60, "{d:?}");
         assert!(seen.lock().unwrap().is_empty(), "no push went out");
         assert_eq!(m, Memory::default(), "nothing held against the next ask");
+    }
+
+    #[test]
+    fn a_refused_save_leaves_a_stale_pending_marker_as_it_was_loaded() {
+        // a crashed earlier ask left a deadline that has passed; another session's live ask made
+        // this save fail. The memory must come back unchanged, so the final save writes nothing
+        // (writing 0 would wipe the other session's live marker)
+        let t = Cell::new(1_000_000u64);
+        let stale = Memory {
+            asking_until_ms: 400_000,
+            ..Memory::default()
+        };
+        let mut m = stale.clone();
+        let (ch, seen) = answering("allow");
+        let d = decide(
+            &ask(),
+            &awake("com.anthropic.claude", true, 1_000),
+            &mut m,
+            Some(ch),
+            &|| t.get(),
+            &|ms| t.set(t.get() + ms),
+            &mut |_| false,
+        );
+        assert!(!d.allowed && !d.asked, "{d:?}");
+        assert!(seen.lock().unwrap().is_empty(), "no push went out");
+        assert_eq!(m, stale, "the loaded marker is left as it was");
     }
 
     #[test]

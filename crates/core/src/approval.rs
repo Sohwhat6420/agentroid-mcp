@@ -653,7 +653,8 @@ impl<H: Http> Channel for NtfyChannel<H> {
     }
 }
 
-/// The host of an `http(s)://host[:port]/...` URL, lower-cased and without a trailing dot. `None`
+/// The host of an `http(s)://host[:port]/...` URL, lower-cased and without a trailing dot (an IP
+/// literal with one is refused). `None`
 /// for anything else, including a user part (`http://127.0.0.1@far.example/` goes to far.example),
 /// so a check on the host can never be fooled by one.
 fn host_of(url: &str) -> Option<String> {
@@ -697,7 +698,13 @@ fn host_of(url: &str) -> Option<String> {
         Some(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {}
         _ => return None,
     }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let trimmed = host.trim_end_matches('.');
+    // curl takes `127.0.0.1.` for a name to look up in DNS, not an IP literal, so it is no proof of
+    // loopback: an IP literal with a trailing dot is refused (a name such as `localhost.` is kept)
+    if trimmed.len() != host.len() && trimmed.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let host = trimmed.to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
 
@@ -1515,6 +1522,15 @@ mod tests {
         assert_eq!(host_of("http://[::1%25eth0]/"), None);
         assert_eq!(host_of("http://localhost:/"), None);
         assert_eq!(host_of("http://localhost").as_deref(), Some("localhost"));
+        // an IP literal with a trailing dot is a DNS name to curl, so it is refused; a name keeps
+        // its trailing-dot spelling
+        assert_eq!(host_of("http://127.0.0.1.:2586/"), None);
+        assert_eq!(host_of("http://127.0.0.1../"), None);
+        assert_eq!(host_of("http://[::1.]:2586/"), None);
+        assert_eq!(
+            host_of("http://localhost.:2586").as_deref(),
+            Some("localhost")
+        );
         assert!(is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
         assert!(is_loopback_host("::1") && is_loopback_host("localhost"));
         assert!(!is_loopback_host("127.evil.example") && !is_loopback_host("192.0.2.7"));
@@ -1538,6 +1554,9 @@ mod tests {
             ("https://push.ntfy.sh", false),
             ("http://localhost:2586", true),
             ("https://ntfy.example.org", true),
+            // a token over plain http never goes to `127.0.0.1.` (a DNS lookup to curl)
+            ("http://127.0.0.1.:2586", false),
+            ("http://127.0.0.1:2586", true),
         ] {
             let mut c = cfg_with_token(&d);
             c.base = base.into();
