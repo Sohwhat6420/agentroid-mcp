@@ -67,5 +67,21 @@ class Merge(unittest.TestCase):
         self.assertIn("0 of 2", md)
 
 
+class Workflow(unittest.TestCase):
+    WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "androidworld.yml"
+
+    def test_an_always_step_after_the_emulator_deletes_the_token_file(self):
+        # if the emulator never boots, run_shard.sh never runs its own clean-up: this step must
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        written = text.index('> "${RUNNER_TEMP}/claude-sign-in"')
+        emulator = text.index("bash bench/androidworld/ci/run_shard.sh")
+        step = text.index("- name: Delete the sign-in token file")
+        self.assertLess(written, emulator)
+        self.assertLess(emulator, step)
+        body = text[step:].split("\n      - ", 1)[0]
+        self.assertIn("if: always()", body)
+        self.assertIn('rm -f "${RUNNER_TEMP}/claude-sign-in"', body)
+
+
 if __name__ == "__main__":
     unittest.main()
