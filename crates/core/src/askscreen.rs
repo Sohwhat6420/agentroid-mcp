@@ -294,13 +294,13 @@ pub fn parse_ime(text: &str) -> Option<bool> {
 /// 1. any `mCallState=` line (one per SIM) ringing (1), off the hook (2) or not a number:
 ///    `Some(true)`, whatever else the dump says;
 /// 2. a dump that did not finish or was not given (`DUMP TIMEOUT`, `Error dumping`,
-///    `Permission Denial`), or an empty one: `None` (unknown), even with idle lines in it;
+///    `Permission Denial`): `None` (unknown), even with idle lines in it;
 /// 3. every `mCallState=` line idle (0): `Some(false)`;
 /// 4. no such line, and the service does not exist (`Can't find service: telephony.registry`):
 ///    no telephony, so no carrier call, `Some(false)`;
 /// 5. no such line in a real registry dump (its `last known state:` header) with no phone slots:
 ///    `Some(false)`;
-/// 6. anything else: `None`.
+/// 6. anything else, an empty dump included: `None`.
 ///
 /// A read that failed or was refused never gets here: the caller keeps it unknown.
 pub fn parse_call_state(text: &str) -> Option<bool> {
@@ -314,10 +314,10 @@ pub fn parse_call_state(text: &str) -> Option<bool> {
     if seen == Some(true) {
         return Some(true);
     }
-    let unfinished = text.trim().is_empty()
-        || ["DUMP TIMEOUT", "Error dumping", "Permission Denial"]
-            .iter()
-            .any(|m| text.contains(m));
+    // an empty dump has no line and no header, so it falls through to `None` below
+    let unfinished = ["DUMP TIMEOUT", "Error dumping", "Permission Denial"]
+        .iter()
+        .any(|m| text.contains(m));
     if unfinished {
         return None;
     }
@@ -1332,7 +1332,15 @@ mod tests {
             None
         );
         assert_eq!(
+            parse_call_state("last known state:\n  mCallState=0\nError dumping service info\n"),
+            None
+        );
+        assert_eq!(
             parse_call_state("Permission Denial: can't dump telephony.registry from pid=1\n"),
+            None
+        );
+        assert_eq!(
+            parse_call_state("last known state:\n  mCallState=0\nPermission Denial: can't dump\n"),
             None
         );
         // ... but a call in it is still a call
