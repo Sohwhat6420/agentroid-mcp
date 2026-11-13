@@ -115,7 +115,12 @@ async fn the_interval_throttles_the_write_time_prune_but_not_an_explicit_one() {
         None,
     )
     .await;
-    ask(&r.hub, "a").await; // first write: a prune runs (nothing to drop) and starts the interval
+    // first write: a prune runs (nothing to drop) and starts the interval
+    ask(&r.hub, "a").await;
+    // The hub answers the waiter before it stamps and writes the answer and starts the interval. If the
+    // clock moved first, `a` would be stamped two days on: fresh, with the interval starting there, so
+    // the write of `b` below would find nothing to prune and nothing due. Wait for the write.
+    settles(&r.dir, &["a"]).await;
     r.clock.advance(2 * DAY); // `a` is now too old, but...
     r.clock.advance(0);
     // ...a prune ran at t=1_000 and the next is due an hour later: this write is 2 days later, so it is due
