@@ -36,6 +36,16 @@ pub const TOOLS: [&str; 3] = ["doctor", "push", "pull_new"];
 pub const MAX_POLLS: u32 = 20;
 /// Longest `doctor` answer kept, in bytes.
 const MAX_TEXT: usize = 256 * 1024;
+/// The largest file `pull_new` fetches unless the daemon was told otherwise: 512 MiB. The phone
+/// decides how big its newest file is, so without a limit one call could fill the laptop's disk.
+/// The limit is checked against the phone's answer before the pull, and the copy's size only after
+/// adb pull has finished: a phone that lies about the size can still write up to what it sends
+/// within adb's timeout before the copy is deleted.
+pub const DEFAULT_MAX_PULL_BYTES: u64 = 512 * 1024 * 1024;
+/// Longest laptop file name kept from a phone file name, in characters.
+const MAX_LOCAL_NAME: usize = 120;
+/// How many numbered names `pull_new` tries before it gives up on a name that is taken.
+const MAX_NAME_TRIES: u32 = 999;
 
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -95,23 +105,127 @@ fn parse_sha(out: &str) -> Option<String> {
     (w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit())).then(|| w.to_ascii_lowercase())
 }
 
-/// A file name from the phone, made safe to use as a laptop file name.
-fn local_name(n: &str) -> String {
+/// A file name from the phone, made safe to use as a laptop file name. The phone chooses the name,
+/// so it is treated as hostile: no separator, drive or stream character, no control character, no
+/// trailing dot or space (Windows drops them, so two names would be one file), not a Windows device
+/// name (`NUL`, `CON`, `COM1`...: opening one never reaches a file), and at most
+/// [`MAX_LOCAL_NAME`] characters.
+pub fn local_name(n: &str) -> String {
     let s: String = n
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            // invisible characters too, bidi controls among them: `invoice\u{202E}fdp.exe` would
+            // show in Explorer as `invoiceexe.pdf`
+            if c.is_control()
+                || is_invisible(c)
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
                 '_'
             } else {
                 c
             }
         })
         .collect();
+    let s = s.trim_end_matches(['.', ' ']).trim_start_matches(' ');
     if s.is_empty() || s == "." || s == ".." {
-        "pulled_file".into()
-    } else {
-        s
+        return "pulled_file".into();
     }
+    // keep the extension when the name is cut
+    let mut s: String = if s.chars().count() > MAX_LOCAL_NAME {
+        let (stem, ext) = split_ext(s);
+        let ext: String = ext.chars().take(16).collect();
+        let keep = MAX_LOCAL_NAME - ext.chars().count();
+        format!("{}{ext}", stem.chars().take(keep).collect::<String>())
+    } else {
+        s.to_string()
+    };
+    let stem = s
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.ends_with(|c: char| c.is_ascii_digit() && c != '0'));
+    if device {
+        s.insert(0, '_');
+    }
+    s
+}
+
+/// Invisible format characters: zero-width spaces and joiners, bidi controls, the byte-order mark,
+/// soft hyphen, variation selectors, tag characters and similar. The same set as the file guard's
+/// `fileguard::is_invisible` in the file-guard change; when both are in, this one can go.
+fn is_invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFFB | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
+}
+
+/// `("name", ".ext")`; the extension is empty when there is none (or the name starts with its only dot).
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    }
+}
+
+/// Reserves a path in `dir` for `name` that is not taken: `name` itself, else `stem (1).ext`,
+/// `stem (2).ext`... The name is taken by creating an empty file with `create_new`, which fails if
+/// anything (a file, a folder, a link) is already there, so two pulls at once never pick the same
+/// name and a pulled file never replaces one that is already in the inbox. `Ok(None)` when every
+/// name is taken.
+fn reserve_path(dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
+    let (stem, ext) = split_ext(name);
+    let candidates = std::iter::once(dir.join(name))
+        .chain((1..=MAX_NAME_TRIES).map(|i| dir.join(format!("{stem} ({i}){ext}"))));
+    for p in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(Some(p)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Windows answers "access denied" for a folder by that name: it is taken all the same
+            Err(_) if std::fs::symlink_metadata(&p).is_ok() => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// How every temporary pull name starts. `pull_new` never reserves a name that starts this way: it
+/// passes over phone names that start with a dot, and (in case that ever changes) puts a `_` in
+/// front of one that does. So a temporary name and a reserved one are never the same.
+const PULL_TEMP_PREFIX: &str = ".agentroid-pull-";
+
+/// A new, unique, empty file in `dir` for adb to pull into, made with `create_new` (so it is no file
+/// that was already there). The copy is renamed over the call's reserved name once it is checked.
+fn temp_path(dir: &Path) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1000 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let p = dir.join(format!("{PULL_TEMP_PREFIX}{}-{n}.part", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary name",
+    ))
 }
 
 /// The laptop folder for `push` and `pull_new` when the daemon was given none:
@@ -478,6 +592,15 @@ impl Daemon {
                 format!("pull_new: {remote} was still changing after {MAX_POLLS} polls"),
             )
         })?;
+        // the phone says how big its file is; the laptop decides how much it takes
+        let max = *self.max_pull_bytes.get_or_init(|| DEFAULT_MAX_PULL_BYTES);
+        if size > max {
+            return Err(fenced(
+                "pull_new",
+                "inbox_size",
+                format!("pull_new fetches at most {max} bytes and {remote} is {size} bytes; nothing was pulled"),
+            ));
+        }
         std::fs::create_dir_all(&local_dir).map_err(|e| {
             RpcError::new(
                 STATE_ERROR,
@@ -496,30 +619,121 @@ impl Daemon {
                 ),
             ));
         }
-        let local: PathBuf = local_dir.join(local_name(&newest));
-        self.backend()
-            .raw_pull(&t.serial, &remote, &local)
-            .map_err(|e| RpcError::new(DEVICE_ERROR, format!("pull failed: {e}")))?;
-        let (sha, got) = file_sha256(&local).map_err(|e| {
-            RpcError::new(
-                DEVICE_ERROR,
-                format!("pull_new: cannot read {}: {e}", local.display()),
-            )
-        })?;
-        if got != size {
-            return Err(RpcError::new(
-                DEVICE_ERROR,
-                format!("pull_new: {remote} is {size} bytes on the phone but {got} on the laptop"),
-            ));
+        // never over a file that is already there: a phone file named like an earlier pull gets a
+        // number, and the name is reserved (an empty file) so a second pull at once cannot take it
+        let mut name = local_name(&newest);
+        if name.starts_with(PULL_TEMP_PREFIX) {
+            name.insert(0, '_');
         }
-        if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
-            if theirs != sha {
-                return Err(RpcError::new(
-                    DEVICE_ERROR,
-                    format!("pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}"),
+        let local: PathBuf = reserve_path(&local_dir, &name)
+            .map_err(|e| {
+                RpcError::new(
+                    STATE_ERROR,
+                    format!(
+                        "pull_new: cannot reserve a name in {}: {e}",
+                        local_dir.display()
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                RpcError::new(
+                    STATE_ERROR,
+                    format!(
+                        "pull_new: {} already holds {MAX_NAME_TRIES} files named like {newest:?}; clear the inbox",
+                        local_dir.display()
+                    ),
+                )
+            })?;
+        // adb pulls into a temporary name of this call's own, never into the reserved name: adb
+        // deletes and re-creates its destination, and in that gap another pull could reserve the
+        // same name. The reservation stays in place until the checked copy is renamed over it.
+        let temp = temp_path(&local_dir).map_err(|e| {
+            let mut err = RpcError::new(
+                STATE_ERROR,
+                format!(
+                    "pull_new: cannot make a temporary file in {}: {e}",
+                    local_dir.display()
+                ),
+            );
+            if let Err(r) = std::fs::remove_file(&local) {
+                err.message.push_str(&format!(
+                    "; the reserved name {} could not be deleted: {r}",
+                    local.display()
                 ));
             }
-        }
+            err
+        })?;
+        // the size limit was checked against the phone's own answer, so whatever arrived is checked again
+        // here, and a pull that fails or does not match leaves nothing in the inbox (a file that grew after
+        // the size check, or a phone that reported a false size, must not stay on the laptop). The check
+        // runs after adb pull has finished, so a phone that lies about the size can still write as much
+        // as it can send before adb's timeout, until the copy is deleted here.
+        let verified = (|| -> Result<String, RpcError> {
+            self.backend()
+                .raw_pull(&t.serial, &remote, &temp)
+                .map_err(|e| RpcError::new(DEVICE_ERROR, format!("pull failed: {e}")))?;
+            let (sha, got) = file_sha256(&temp).map_err(|e| {
+                RpcError::new(
+                    DEVICE_ERROR,
+                    format!("pull_new: cannot read {}: {e}", temp.display()),
+                )
+            })?;
+            // `size` is at most `max` (checked above), so a matching copy is within the limit too
+            if got != size {
+                return Err(RpcError::new(
+                    DEVICE_ERROR,
+                    format!(
+                        "pull_new: {remote} is {size} bytes on the phone but {got} on the laptop"
+                    ),
+                ));
+            }
+            if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
+                if theirs != sha {
+                    return Err(RpcError::new(
+                        DEVICE_ERROR,
+                        format!(
+                            "pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}"
+                        ),
+                    ));
+                }
+            }
+            std::fs::rename(&temp, &local).map_err(|e| {
+                RpcError::new(
+                    STATE_ERROR,
+                    format!("pull_new: cannot move the copy to {}: {e}", local.display()),
+                )
+            })?;
+            Ok(sha)
+        })();
+        let sha = match verified {
+            Ok(sha) => sha,
+            Err(mut e) => {
+                // only the two names this call created: its temporary file and its reserved (empty)
+                // name. No other pull is handed either name while they exist; a process outside the
+                // daemon that writes into the inbox is not guarded against. A copy with bytes in it
+                // is "the laptop copy"; an empty or missing one means adb wrote nothing.
+                let wrote = std::fs::metadata(&temp).is_ok_and(|m| m.len() > 0);
+                match std::fs::remove_file(&temp) {
+                    Err(r) if r.kind() != std::io::ErrorKind::NotFound => {
+                        e.message.push_str(&format!(
+                            "; the laptop copy at {} could not be deleted: {r}",
+                            temp.display()
+                        ))
+                    }
+                    _ if wrote => e.message.push_str("; the laptop copy was deleted"),
+                    _ => e.message.push_str("; nothing was left on the laptop"),
+                }
+                if let Err(r) = std::fs::remove_file(&local) {
+                    if r.kind() != std::io::ErrorKind::NotFound {
+                        e.message.push_str(&format!(
+                            "; the reserved name {} could not be deleted: {r}",
+                            local.display()
+                        ));
+                    }
+                }
+                return Err(e);
+            }
+        };
         let path = local_path_string(&local);
         Ok(
             json!({ "tool": "pull_new", "text": format!("pulled {remote} ({size} bytes, size stable across two polls) to {path}"), "image_bytes": null, "path": path, "size": size, "sha256": sha, "phone_path": remote }),
@@ -529,4 +743,27 @@ impl Daemon {
 
 fn local_path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two pulls that want the same name at once get two names: the first reservation exists on
+    /// disk before the second looks, so the second cannot pick it.
+    #[test]
+    fn a_reserved_name_is_never_handed_out_twice() {
+        let dir = std::env::temp_dir().join(format!("agentroid-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = reserve_path(&dir, "shot.png").unwrap().unwrap();
+        let b = reserve_path(&dir, "shot.png").unwrap().unwrap();
+        assert_eq!(a, dir.join("shot.png"));
+        assert_eq!(b, dir.join("shot (1).png"));
+        assert!(a.is_file() && b.is_file());
+        // a folder by that name is taken too
+        std::fs::create_dir(dir.join("x")).unwrap();
+        assert_eq!(reserve_path(&dir, "x").unwrap().unwrap(), dir.join("x (1)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

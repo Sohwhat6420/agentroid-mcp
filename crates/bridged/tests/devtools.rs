@@ -45,6 +45,12 @@ struct Phone {
     sizes: VecDeque<u64>,
     stats: usize,
     corrupt_push: bool,
+    /// the pull flips the first byte (same size, another sha256)
+    corrupt_pull: bool,
+    /// the pull writes half the file, then fails (as an adb pull cut off mid-way)
+    break_pull: bool,
+    /// for every pull: the laptop path adb was given, and the names in its folder at that moment
+    pulled_into: Vec<(PathBuf, Vec<String>)>,
 }
 
 #[derive(Clone)]
@@ -126,11 +132,28 @@ impl Transport for Shared {
     fn pull(&mut self, _s: &str, remote: &str, local: &Path) -> Result<(), TransportError> {
         let mut p = self.0.lock().unwrap();
         p.reached.push(format!("pull {remote}"));
+        let names = local
+            .parent()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| {
+                rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        p.pulled_into.push((local.to_path_buf(), names));
         let b = p
             .files
             .get(remote)
             .cloned()
             .ok_or_else(|| TransportError(format!("{remote}: no such file")))?;
+        if p.break_pull {
+            std::fs::write(local, &b[..b.len() / 2]).map_err(|e| TransportError(e.to_string()))?;
+            return Err(TransportError("connection reset mid-pull".into()));
+        }
+        let mut b = b;
+        if p.corrupt_pull && !b.is_empty() {
+            b[0] ^= 0xff;
+        }
         std::fs::write(local, b).map_err(|e| TransportError(e.to_string()))
     }
 }
@@ -752,6 +775,301 @@ fn pull_new_is_stable_on_two_equal_polls_and_fails_when_the_size_keeps_changing(
             .await;
         assert_eq!(code(&r), DEVICE_ERROR);
     });
+}
+
+/// The phone chooses the size and the name of its newest file. Neither may hurt the laptop: a file
+/// over the limit is refused before the pull, and a pull never replaces a file already in the inbox.
+#[test]
+fn pull_new_refuses_a_file_over_the_limit_and_never_overwrites_an_inbox_file() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-limits");
+        let h = start(DeviceMode::Full);
+        h.daemon.set_max_pull_bytes(16);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["big.bin".into()];
+            p.files.insert("/sdcard/d/big.bin".into(), vec![1; 17]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let pull = json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0 });
+        // one byte over: refused, and adb pull never ran
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(code(&r), REFUSED, "{r}");
+        assert_eq!(r["error"]["data"]["class"], "inbox_size", "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("at most 16 bytes"),
+            "{r}"
+        );
+        assert!(
+            !reached(&h).iter().any(|l| l.starts_with("pull ")),
+            "{:?}",
+            reached(&h)
+        );
+        assert_eq!(std::fs::read_dir(dir.join("inbox")).unwrap().count(), 0);
+        // exactly the limit is taken
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["report.txt".into()];
+            p.files
+                .insert("/sdcard/d/report.txt".into(), b"0123456789abcdef".to_vec());
+        }
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(r["result"]["size"], 16, "{r}");
+        let first = PathBuf::from(r["result"]["path"].as_str().unwrap());
+        assert_eq!(first, dir.join("inbox").join("report.txt"));
+        // the phone now holds another file with the same name: the first pull is kept as it was
+        h.phone.lock().unwrap().files.insert(
+            "/sdcard/d/report.txt".into(),
+            b"replaced by phone".to_vec()[..16].to_vec(),
+        );
+        let r = c.tool(POCO, pull.clone()).await;
+        let second = PathBuf::from(r["result"]["path"].as_str().unwrap());
+        assert_eq!(second, dir.join("inbox").join("report (1).txt"), "{r}");
+        assert_eq!(std::fs::read(&first).unwrap(), b"0123456789abcdef");
+        assert_eq!(std::fs::read(&second).unwrap(), b"replaced by phon");
+        let r = c.tool(POCO, pull).await;
+        assert!(
+            r["result"]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("report (2).txt"),
+            "{r}"
+        );
+    });
+}
+
+/// The size limit is checked against what the phone says. A phone that says 4 bytes and then sends
+/// 5000 (the file grew after the check, or the phone lies) gets an error, and nothing stays in the inbox.
+#[test]
+fn a_pull_bigger_than_the_phone_said_is_refused_and_deleted() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-grew");
+        let h = start(DeviceMode::Full);
+        h.daemon.set_max_pull_bytes(16);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["big.bin".into()];
+            p.files.insert("/sdcard/d/big.bin".into(), vec![1; 5000]);
+            p.sizes = VecDeque::from([4, 4]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() })).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("the laptop copy was deleted"),
+            "{r}"
+        );
+        assert!(
+            reached(&h).iter().any(|l| l.starts_with("pull ")),
+            "the pull ran: {:?}",
+            reached(&h)
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join("inbox")).unwrap().count(),
+            0,
+            "nothing is left in the inbox"
+        );
+    });
+}
+
+/// A copy whose sha256 does not match the phone's, a pull cut off half-way, and a pull that fails
+/// before writing anything each end in an error and leave nothing in the inbox (not the partial
+/// copy, not the reserved empty name). A file already in the inbox is left alone.
+#[test]
+fn a_sha256_mismatch_or_a_failed_pull_leaves_nothing_in_the_inbox() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-fails");
+        let inbox = dir.join("inbox");
+        std::fs::write(inbox.join("keep.txt"), b"mine").unwrap();
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        let pull = json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0 });
+        let only_keep = || {
+            let names: Vec<_> = std::fs::read_dir(&inbox)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["keep.txt"], "only the earlier file is left");
+            assert_eq!(std::fs::read(inbox.join("keep.txt")).unwrap(), b"mine");
+        };
+        // the same size, another sha256
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["shot.png".into()];
+            p.files
+                .insert("/sdcard/d/shot.png".into(), b"0123456789".to_vec());
+            p.corrupt_pull = true;
+        }
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let m = r["error"]["message"].as_str().unwrap();
+        assert!(
+            m.contains("sha256 mismatch") && m.contains("the laptop copy was deleted"),
+            "{r}"
+        );
+        only_keep();
+        // cut off half-way: the partial copy goes too
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.corrupt_pull = false;
+            p.break_pull = true;
+        }
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let m = r["error"]["message"].as_str().unwrap();
+        assert!(
+            m.contains("pull failed") && m.contains("the laptop copy was deleted"),
+            "{r}"
+        );
+        only_keep();
+        // the phone file is gone by the time adb pulls it: nothing was written, and the reserved
+        // name is not left behind either
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.break_pull = false;
+            p.files.clear();
+            p.listing = vec!["gone.bin".into()];
+            p.sizes = VecDeque::from([3, 3]);
+        }
+        let r = c.tool(POCO, pull).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let m = r["error"]["message"].as_str().unwrap();
+        assert!(
+            m.contains("pull failed") && m.contains("nothing was left on the laptop"),
+            "{r}"
+        );
+        assert!(!m.contains("was deleted"), "{r}");
+        only_keep();
+    });
+}
+
+/// adb pulls into a temporary name of the call's own, never into the reserved name: adb deletes
+/// and re-creates its destination, and in that gap another pull could reserve the same name. The
+/// reservation stays in place while adb writes; the checked copy is then renamed over it, and the
+/// temporary file is gone.
+#[test]
+fn pull_new_pulls_into_a_temporary_name_and_renames_it_over_the_reservation() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-temp");
+        let inbox = dir.join("inbox");
+        let h = start(DeviceMode::Full);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["shot.png".into()];
+            p.files
+                .insert("/sdcard/d/shot.png".into(), b"pixels".to_vec());
+            p.sizes = VecDeque::from([6, 6]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0, "local_dir": inbox.to_string_lossy() })).await;
+        let path = PathBuf::from(
+            r["result"]["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{r}")),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"pixels");
+        let (into, names_then) = h.phone.lock().unwrap().pulled_into[0].clone();
+        assert_ne!(into, path, "adb was given the reserved name itself");
+        assert_eq!(
+            into.parent(),
+            path.parent(),
+            "the temporary file is in the inbox"
+        );
+        assert!(
+            into.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".agentroid-pull-"),
+            "{into:?}"
+        );
+        assert!(
+            names_then.iter().any(|n| n == "shot.png"),
+            "the reservation was in place while adb wrote: {names_then:?}"
+        );
+        assert!(!into.exists(), "the temporary file is gone");
+        let names: Vec<_> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["shot.png"]);
+    });
+}
+
+#[test]
+fn a_phone_file_name_becomes_a_plain_laptop_file_name() {
+    use bridged::devtools::local_name;
+    // ordinary names are kept
+    for n in [
+        "IMG_0001.jpg",
+        "new shot.png",
+        "notes.tar.gz",
+        "Makefile",
+        "résumé.pdf",
+    ] {
+        assert_eq!(local_name(n), n);
+    }
+    // separators, drive and stream characters, control characters
+    assert_eq!(
+        local_name("..\\..\\Startup\\run.bat"),
+        ".._.._Startup_run.bat"
+    );
+    assert_eq!(local_name("a/b:c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
+    assert_eq!(local_name("a\nb\tc"), "a_b_c");
+    // invisible characters, bidi controls among them: this one would show as `invoiceexe.pdf`
+    assert_eq!(local_name("invoice\u{202E}fdp.exe"), "invoice_fdp.exe");
+    for c in [
+        '\u{061C}',
+        '\u{200B}',
+        '\u{200E}',
+        '\u{200F}',
+        '\u{202A}',
+        '\u{2066}',
+        '\u{2069}',
+        '\u{FEFF}',
+        '\u{FE0F}',
+        '\u{180B}',
+        '\u{E0041}',
+    ] {
+        assert_eq!(
+            local_name(&format!("a{c}b.txt")),
+            "a_b.txt",
+            "U+{:04X}",
+            c as u32
+        );
+    }
+    // Windows drops trailing dots and spaces, so they are dropped here first
+    assert_eq!(local_name("report.txt. . "), "report.txt");
+    assert_eq!(local_name(" . "), "pulled_file");
+    for n in ["", ".", "..", "...", "   "] {
+        assert_eq!(local_name(n), "pulled_file", "{n:?}");
+    }
+    // Windows device names never reach a device
+    for (n, want) in [
+        ("NUL", "_NUL"),
+        ("nul.txt", "_nul.txt"),
+        ("CON", "_CON"),
+        ("Aux.log", "_Aux.log"),
+        ("PRN.tar.gz", "_PRN.tar.gz"),
+        ("COM1", "_COM1"),
+        ("lpt9.txt", "_lpt9.txt"),
+        ("NUL .txt", "_NUL .txt"),
+    ] {
+        assert_eq!(local_name(n), want);
+    }
+    for n in ["NULL", "CONSOLE.txt", "COM0", "COM10", "LPT", "command.com"] {
+        assert_eq!(local_name(n), n, "{n} is not a device name");
+    }
+    // a very long name is cut and keeps its extension
+    let long = format!("{}.jpeg", "x".repeat(400));
+    let cut = local_name(&long);
+    assert_eq!(cut.chars().count(), 120);
+    assert!(cut.ends_with(".jpeg"));
 }
 
 #[test]
