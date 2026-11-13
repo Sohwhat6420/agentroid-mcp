@@ -24,7 +24,7 @@ BRIDGED = SCAFFOLD / "target" / "debug" / "bridged.exe"
 SERVER = SCAFFOLD / "apps" / "mcp" / "src" / "sdk-wiring.ts"
 # The model dispatcher script (node), named by the AGENTROID_DISPATCH environment variable.
 DISPATCH = Path(os.environ["AGENTROID_DISPATCH"]) if os.environ.get("AGENTROID_DISPATCH") else None
-NO_WINDOW = 0x08000000
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 
 PROMPT = (
     "You have the Agentroid tools (mcp__agentroid__*). Using only those tools: "

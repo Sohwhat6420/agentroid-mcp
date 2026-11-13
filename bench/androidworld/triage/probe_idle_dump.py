@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import emulator_ctl  # noqa: E402
 
-NO_WINDOW = 0x08000000
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 SERIAL = emulator_ctl.SERIAL
 
 

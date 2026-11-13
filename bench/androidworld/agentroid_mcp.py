@@ -7,6 +7,7 @@ so nothing can appear on the user's screen.
 
 from __future__ import annotations
 
+import sys
 import json
 import os
 import queue
@@ -19,7 +20,7 @@ from typing import Any, Callable, Sequence
 
 import action_map
 
-CREATE_NO_WINDOW = 0x08000000
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 PROTOCOL_VERSION = "2025-06-18"
 HERE = Path(__file__).resolve().parent
 MCP_DIR = HERE.parent.parent / "apps" / "mcp"

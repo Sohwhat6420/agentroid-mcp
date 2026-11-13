@@ -16,6 +16,7 @@ One long-lived process per task keeps the conversation and the prompt cache warm
 
 from __future__ import annotations
 
+import sys
 import base64
 import json
 import os
@@ -25,7 +26,7 @@ import threading
 import time
 from typing import Any, Callable, Sequence
 
-CREATE_NO_WINDOW = 0x08000000
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 CLAUDE = os.environ.get("AGENTROID_CLAUDE", "claude")
 
 
