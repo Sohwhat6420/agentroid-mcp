@@ -569,7 +569,7 @@ pub fn decide(
     if !persist(mem) {
         mem.asking_until_ms = 0;
         return refused(
-            format!("in use ({in_use}), and the pending ask could not be saved (--state-dir): refused without a push"),
+            format!("in use ({in_use}), and the pending ask could not be saved (--state-dir), or another ask started meanwhile: refused without a push"),
             60,
             false,
         );
@@ -815,7 +815,13 @@ pub fn command(args: &[String]) -> (String, i32) {
     let written = std::cell::RefCell::new(loaded);
     let mut persist = |m: &Memory| {
         let mut w = written.borrow_mut();
-        let ok = save_changes(dir, device, &w, m, unix_ms()).is_ok();
+        // another session may have started its ask after this one loaded the file: look again
+        // just before writing, so two asks do not both go out (narrows the race; not a file lock)
+        let t = unix_ms();
+        if load_memory(dir, device, t).asking_until_ms > t.max(w.asking_until_ms) {
+            return false;
+        }
+        let ok = save_changes(dir, device, &w, m, t).is_ok();
         if ok {
             *w = m.clone();
         }

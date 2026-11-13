@@ -664,10 +664,39 @@ fn host_of(url: &str) -> Option<String> {
     if authority.contains('@') || authority.contains('\\') {
         return None;
     }
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => authority.split(':').next()?,
+    // only the characters a plain host name or IP literal is made of, so a percent-encoded name
+    // (`ntfy%2esh`, which curl decodes to ntfy.sh) never parses as some other host
+    let (host, after) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let (h, after) = v6.split_once(']')?;
+            if !h
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+            {
+                return None;
+            }
+            (h, after)
+        }
+        None => {
+            let (h, after) = match authority.find(':') {
+                Some(i) => (&authority[..i], &authority[i..]),
+                None => (authority, ""),
+            };
+            if !h
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return None;
+            }
+            (h, after)
+        }
     };
+    // nothing after the host but an optional `:port` of digits
+    match after.strip_prefix(':') {
+        None if after.is_empty() => {}
+        Some(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {}
+        _ => return None,
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
@@ -1478,6 +1507,14 @@ mod tests {
         assert_eq!(host_of("http://[::1]:2586").as_deref(), Some("::1"));
         assert_eq!(host_of("http://127.0.0.1@192.0.2.7:2586"), None);
         assert_eq!(host_of("ftp://127.0.0.1"), None);
+        // percent-encoding (curl decodes it), a junk port, junk after a bracketed address
+        assert_eq!(host_of("https://ntfy%2esh/x"), None);
+        assert_eq!(host_of("https://ntf%79.sh"), None);
+        assert_eq!(host_of("http://127.0.0.1:1:99/"), None);
+        assert_eq!(host_of("http://[::1]evil/"), None);
+        assert_eq!(host_of("http://[::1%25eth0]/"), None);
+        assert_eq!(host_of("http://localhost:/"), None);
+        assert_eq!(host_of("http://localhost").as_deref(), Some("localhost"));
         assert!(is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
         assert!(is_loopback_host("::1") && is_loopback_host("localhost"));
         assert!(!is_loopback_host("127.evil.example") && !is_loopback_host("192.0.2.7"));
