@@ -997,16 +997,34 @@ async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_i
         "no segment frame went out"
     );
     assert_eq!(reads.load(Ordering::SeqCst), 1, "the lock read the phone");
-    // put down: the segment goes
+    // put down: a segment let through because the phone is free must be short; one asking to
+    // live a minute is refused, nothing sent
     *phone_state.lock().unwrap() = Signals {
         wakefulness: Some("Asleep".into()),
         in_call: Some(false),
         ..Signals::default()
     };
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-long", "run_id": "run-a", "steps": r1_steps(), "expires_in_s": 60 })).await;
+    assert_eq!(code(&r), REFUSED, "{r}");
+    assert_eq!(r["error"]["data"]["rule"], "screen_lock", "{r}");
+    assert!(p.st().segments_seen.is_empty(), "nothing reached the phone");
+    // the segment goes, with its life cut to the free limit
     let before = mono();
     let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-free", "run_id": "run-a", "steps": r1_steps() })).await;
     assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
     assert_eq!(p.st().segments_seen.len(), 1);
+    {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expires = p.st().segments_seen[0]["segment"]["expires"]
+            .as_str()
+            .and_then(agentroid_segments::time::parse_utc)
+            .unwrap();
+        let max = agentroid_core::screenlock::FREE_SEGMENT_MAX_S as i64;
+        assert!(expires <= now_s + max + 1, "expires {expires}, now {now_s}");
+    }
     // its own steps woke the phone and opened an app: the segment's answer continues the burst
     // (past the 1 s the lock keeps a verdict, so only the recorded answer can let it through)
     tokio::time::sleep(Duration::from_millis(1_100)).await;

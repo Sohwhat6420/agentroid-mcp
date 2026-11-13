@@ -576,10 +576,19 @@ impl<R: Runner> GuardedRunner<R> {
     }
 
     fn hardware_serial(&self, selector: &[String]) -> Result<String, RunError> {
+        self.hardware_serial_within(selector, 15_000)
+    }
+
+    /// [`Self::hardware_serial`], giving the read at most `timeout_ms`.
+    fn hardware_serial_within(
+        &self,
+        selector: &[String],
+        timeout_ms: u64,
+    ) -> Result<String, RunError> {
         let mut a: Vec<String> = selector.to_vec();
         a.push("shell".into());
         a.push("getprop ro.serialno".into());
-        let out = self.inner.run(&a, 15_000)?;
+        let out = self.inner.run(&a, timeout_ms)?;
         let val = out.stdout.trim().to_string();
         let plain = !val.is_empty()
             && val.len() <= 64
@@ -625,13 +634,18 @@ impl<R: Runner> GuardedRunner<R> {
     /// The checks every command passes before it is sent: the argv guard, then the target's real
     /// hardware serial (fails closed).
     fn admit(&self, args: &[String]) -> Result<(), RunError> {
+        self.admit_within(args, 15_000)
+    }
+
+    /// [`Self::admit`], giving its serial read at most `probe_ms`.
+    fn admit_within(&self, args: &[String], probe_ms: u64) -> Result<(), RunError> {
         let c = self.guard.check(args).map_err(|e| RunError::Refused(e.0))?;
         if let Some(sel) = &c.selector {
             if !c.is_identity_probe()
                 && !HOST_CMDS.contains(&c.sub.as_str())
                 && !GLOBAL_SAFE.contains(&c.sub.as_str())
             {
-                let hw = self.hardware_serial(sel)?;
+                let hw = self.hardware_serial_within(sel, probe_ms)?;
                 if hw.eq_ignore_ascii_case(S24_SERIAL) {
                     if let Some(v) = sel.get(1) {
                         self.guard.deny(v);
@@ -674,9 +688,18 @@ impl<R: Runner> Runner for GuardedRunner<R> {
         timeout_ms: u64,
         mark: &mut dyn FnMut(),
     ) -> Result<RunOutput, RunError> {
-        // the checks (and their serial read) first, outside the marked window
-        self.admit(args)?;
-        self.inner.run_marked(args, timeout_ms, mark)
+        // the checks (and their serial read) first, outside the marked window; the serial read and
+        // the command share `timeout_ms`, so a caller with a deadline keeps it
+        let t0 = std::time::Instant::now();
+        self.admit_within(args, timeout_ms.min(15_000))?;
+        let spent = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let left = timeout_ms.saturating_sub(spent);
+        if left == 0 {
+            return Err(RunError::Io(format!(
+                "no time left after the target check ({timeout_ms} ms); nothing was sent"
+            )));
+        }
+        self.inner.run_marked(args, left, mark)
     }
 }
 
@@ -954,6 +977,46 @@ mod tests {
         let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys window"]);
         assert!(s24.run_marked(&argv, 1000, &mut || marked = true).is_err());
         assert!(!marked);
+    }
+
+    #[test]
+    fn a_marked_runs_serial_read_and_command_share_its_timeout() {
+        /// Records each timeout; the serial read takes 30 ms.
+        struct Timed(RefCell<Vec<(String, u64)>>);
+        impl Runner for Timed {
+            fn run(&self, a: &[String], t: u64) -> Result<RunOutput, RunError> {
+                let cmd = a.last().cloned().unwrap_or_default();
+                self.0.borrow_mut().push((cmd.clone(), t));
+                let out = if cmd == "getprop ro.serialno" {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    "R5CX12345AB\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(RunOutput {
+                    code: Some(0),
+                    stdout: out,
+                    stderr: String::new(),
+                })
+            }
+        }
+        let r = GuardedRunner::new(Timed(RefCell::new(vec![])));
+        let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys power"]);
+        r.run_marked(&argv, 700, &mut || {}).unwrap();
+        let calls = r.inner.0.borrow().clone();
+        assert_eq!(calls[0], ("getprop ro.serialno".to_string(), 700));
+        assert_eq!(calls[1].0, "dumpsys power");
+        assert!(calls[1].1 <= 670, "{calls:?}");
+        // no time left after the serial read: nothing is sent
+        let r = GuardedRunner::new(Timed(RefCell::new(vec![])));
+        let mut marked = false;
+        assert!(r.run_marked(&argv, 20, &mut || marked = true).is_err());
+        assert!(!marked);
+        assert_eq!(r.inner.0.borrow().len(), 1);
+        // a plain run keeps the serial read's own 15 s
+        let r = GuardedRunner::new(Timed(RefCell::new(vec![])));
+        r.run(&argv, 700).unwrap();
+        assert_eq!(r.inner.0.borrow()[0].1, 15_000);
     }
 
     #[test]

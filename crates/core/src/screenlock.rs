@@ -44,6 +44,7 @@ use crate::askscreen::{is_generic_serial, judge, load_memory, Signals, Use, REAS
 use agentroid_adb_link::runner::Runner;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// A burst ends when the agent has done nothing on the phone for this long.
 pub const BURST_GAP_MS: u64 = 5 * 60_000;
@@ -58,6 +59,12 @@ pub const MAX_POWER_READ_MS: u64 = 1_000;
 pub const LOCK_READ_BUDGET_MS: u64 = 5_000;
 /// How long an allowed verdict is kept for the same phone (cleared when the agent acts).
 pub const VERDICT_TTL_MS: u64 = 1_000;
+/// A link segment the lock let through because the phone is not in use now (not a lease) is
+/// checked once, before it is sent, so it must be short: at most this many steps ...
+pub const FREE_SEGMENT_MAX_STEPS: usize = 10;
+/// ... and at most this many seconds to live (a segment that asks for longer is refused; one that
+/// does not say is given this).
+pub const FREE_SEGMENT_MAX_S: u64 = 10;
 /// The idle time below which a screen-on phone counts as in use (the `ask-screen` default).
 pub const DEFAULT_IDLE_MS: u64 = 5 * 60_000;
 /// Apps that mean a ringing or live call: in use when the phone is read free, and the end of a
@@ -89,6 +96,29 @@ pub type Now = Box<dyn Fn() -> u64 + Send>;
 /// not be read (then it is locked).
 pub type EmulatorProbe = Box<dyn FnMut(&str) -> Option<bool> + Send>;
 
+/// The lock's monotonic clock, shared with the tickets that stamp when their work ended (outside
+/// the daemon's lock, so a ticket handed back late is still dated by its own end).
+#[derive(Clone)]
+pub struct MonoClock(Arc<Mutex<Now>>);
+
+impl MonoClock {
+    pub fn new(now: Now) -> Self {
+        MonoClock(Arc::new(Mutex::new(now)))
+    }
+
+    /// Milliseconds on the lock's monotonic clock.
+    pub fn now(&self) -> u64 {
+        let f = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (*f)()
+    }
+}
+
+impl std::fmt::Debug for MonoClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MonoClock")
+    }
+}
+
 /// Why a call was let through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admitted {
@@ -109,7 +139,7 @@ pub struct ScreenLock {
     /// Unix ms: leases and the No cool-down.
     wall: Now,
     /// Monotonic ms: the burst, the read timings and the verdict cache.
-    mono: Now,
+    mono: MonoClock,
     probe: EmulatorProbe,
     /// (adb serial, hardware serial) -> what the device said about being an emulator.
     emulators: HashMap<(String, String), bool>,
@@ -172,7 +202,7 @@ impl ScreenLock {
             idle_limit_ms: DEFAULT_IDLE_MS,
             read,
             wall,
-            mono,
+            mono: MonoClock::new(mono),
             probe: Box::new(|_| None),
             emulators: HashMap::new(),
             ours: HashMap::new(),
@@ -194,6 +224,11 @@ impl ScreenLock {
 
     pub fn state_dir(&self) -> &std::path::Path {
         &self.state_dir
+    }
+
+    /// The lock's monotonic clock, for stamping when admitted work ended.
+    pub fn clock(&self) -> MonoClock {
+        self.mono.clone()
     }
 
     /// A real emulator: an `emulator-<port>` adb name, and the device says so. Asked once per
@@ -234,13 +269,20 @@ impl ScreenLock {
         }
         let t = (self.wall)();
         // ask-screen keys its file by the hardware serial when it can read it (and it is not a
-        // junk serial), else by the `--device` text; look under both
+        // junk serial), else by the `--device` text; look under both. A junk hardware serial is
+        // never a key, but the adb serial always is, even a junk one: a USB phone whose adb serial
+        // is the junk one is asked about (and said No to) under that name, and adb cannot reach two
+        // connected devices under one serial
         let mut lease_until = 0;
         let mut denied_until = 0;
-        for k in [hw_serial, adb_serial] {
-            if k.is_empty() || (k == hw_serial && is_generic_serial(k)) {
-                continue;
-            }
+        let mut keys: Vec<&str> = vec![];
+        if !hw_serial.is_empty() && !is_generic_serial(hw_serial) {
+            keys.push(hw_serial);
+        }
+        if !adb_serial.is_empty() && !keys.iter().any(|k| k.eq_ignore_ascii_case(adb_serial)) {
+            keys.push(adb_serial);
+        }
+        for k in keys {
             let m = load_memory(&self.state_dir, k, t);
             lease_until = m.leases.values().copied().fold(lease_until, u64::max);
             denied_until = denied_until.max(m.denied_until_ms);
@@ -262,14 +304,15 @@ impl ScreenLock {
                 (denied_until - t).div_ceil(1000).min(REASK_AFTER_MS / 1000)
             ));
         }
-        let start = (self.mono)();
+        let start = self.mono.now();
         if let Some((at, v)) = self.verdicts.get(&key) {
             if start.saturating_sub(*at) <= VERDICT_TTL_MS {
                 return Ok(v.clone());
             }
         }
-        let reading = (self.read)(adb_serial, &*self.mono);
-        let end = (self.mono)().max(start);
+        let clock = self.mono.clone();
+        let reading = (self.read)(adb_serial, &move || clock.now());
+        let end = self.mono.now().max(start);
         let Some(Reading {
             signals: s,
             power_from,
@@ -339,12 +382,24 @@ impl ScreenLock {
 
     /// The agent's own action on this phone has just ended (it was admitted and it ran).
     pub fn acted(&mut self, adb_serial: &str, hw_serial: &str) {
-        let at = (self.mono)();
+        self.acted_at(adb_serial, hw_serial, u64::MAX);
+    }
+
+    /// The agent's own action on this phone ended at `at` on the lock's monotonic clock (never
+    /// later than now): work reported after it ended is dated by its end, not by the report.
+    pub fn acted_at(&mut self, adb_serial: &str, hw_serial: &str, at: u64) {
+        let at = at.min(self.mono.now());
         let key = phone_key(hw_serial, adb_serial);
         // what it did may have changed the phone: the next call reads it again
         self.verdicts.remove(&key);
         let e = self.ours.entry(key).or_insert(0);
         *e = (*e).max(at);
+    }
+
+    /// Work was let through for this phone (it may change it): drop the kept verdict, so the next
+    /// call reads the phone again whether the work runs or not.
+    pub fn forget(&mut self, adb_serial: &str, hw_serial: &str) {
+        self.verdicts.remove(&phone_key(hw_serial, adb_serial));
     }
 }
 
@@ -939,6 +994,64 @@ mod tests {
         clock.store(T0 + BURST_GAP_MS + 60_000, Ordering::SeqCst);
         let e = lock.admit("s1", "HW1").unwrap_err();
         assert!(e.contains("in use"), "{e}");
+    }
+
+    #[test]
+    fn a_no_under_a_junk_adb_serial_stands_for_the_usb_phone_with_that_serial() {
+        // the review's probe: a USB phone whose adb serial and hardware serial are both the junk
+        // one; ask-screen kept its state under --device, the adb serial
+        let mut r = rig("junkno");
+        let no = Memory {
+            denied_until_ms: T0 + 200_000,
+            ..Memory::default()
+        };
+        save_memory(&r.dir, "0123456789ABCDEF", &no).unwrap();
+        r.set(Some(asleep()));
+        let e = r
+            .lock
+            .admit("0123456789ABCDEF", "0123456789ABCDEF")
+            .unwrap_err();
+        assert!(e.contains("said No"), "{e}");
+        // the positive control: a phone reached under another name that shares only the junk
+        // hardware serial is not held to it
+        assert!(matches!(
+            r.lock.admit("192.0.2.9:5555", "0123456789ABCDEF"),
+            Ok(Admitted::Free(_))
+        ));
+        // and a lease kept under the junk adb serial lets that phone through
+        let mut m = Memory::default();
+        m.leases.insert("0123456789abcdef".into(), T0 + 90_000);
+        save_memory(&r.dir, "0123456789ABCDEF", &m).unwrap();
+        r.set(Some(awake("com.anthropic.claude", true, 1_000)));
+        assert_eq!(
+            r.lock.admit("0123456789ABCDEF", "0123456789ABCDEF"),
+            Ok(Admitted::Lease(2))
+        );
+    }
+
+    #[test]
+    fn a_late_report_is_dated_by_the_end_of_the_work_and_never_ahead_of_now() {
+        let mut r = rig("actedat");
+        // the work ended at T0 + 2 s and was reported at T0 + 20 s; a touch at T0 + 10 s is not
+        // the agent's
+        r.at(T0 + 20_000);
+        r.lock.acted_at("s1", "HW1", T0 + 2_000);
+        r.at(T0 + 21_000);
+        r.set(Some(awake("com.whatsapp", true, 11_000)));
+        assert!(r.lock.admit("s1", "HW1").is_err());
+        // a stamp ahead of the clock counts as now: a touch 1 s from now is not covered
+        let mut r = rig("actedat2");
+        r.lock.acted_at("s1", "HW1", T0 + 60_000);
+        r.at(T0 + 2_000);
+        r.set(Some(awake("com.whatsapp", true, 1_000)));
+        assert!(r.lock.admit("s1", "HW1").is_err());
+        // the positive control: the agent's own touch at the end of the work goes on as a burst
+        let mut r = rig("actedat3");
+        r.at(T0 + 20_000);
+        r.lock.acted_at("s1", "HW1", T0 + 2_000);
+        r.at(T0 + 21_000);
+        r.set(Some(awake("com.whatsapp", true, 19_000)));
+        assert_eq!(r.lock.admit("s1", "HW1"), Ok(Admitted::Burst));
     }
 
     #[test]

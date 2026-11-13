@@ -613,13 +613,17 @@ pub fn screen_lock_for_adb(lease_dir: std::path::PathBuf, adb: &Path) -> ScreenL
     ScreenLock::new(
         lease_dir,
         Box::new(move |serial, mono| {
-            agentroid_core::askscreen::read_signals_timed(&read_runner, serial, mono).map(
-                |(signals, power_from, power_to)| Reading {
-                    signals,
-                    power_from,
-                    power_to,
-                },
+            agentroid_core::askscreen::read_signals_timed(
+                &read_runner,
+                serial,
+                mono,
+                agentroid_core::screenlock::LOCK_READ_BUDGET_MS,
             )
+            .map(|(signals, power_from, power_to)| Reading {
+                signals,
+                power_from,
+                power_to,
+            })
         }),
         Box::new(|| {
             std::time::SystemTime::now()

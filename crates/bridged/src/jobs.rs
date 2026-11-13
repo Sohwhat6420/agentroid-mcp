@@ -2051,8 +2051,10 @@ impl sandbox::Bridge for DaemonBridge {
             Err(e) => Err(e.to_string()),
         });
         // a line the lock admitted has run (or timed out running): only now is its end the
-        // agent's own activity for the screen lock's burst. A read-only line has no ticket.
-        if let Some(t) = ticket {
+        // agent's own activity for the screen lock's burst, dated now, before the daemon's lock is
+        // taken (it may be busy for a while). A read-only line has no ticket.
+        if let Some(mut t) = ticket {
+            t.finished();
             self.daemon.backend().lock_done(t);
         }
         out

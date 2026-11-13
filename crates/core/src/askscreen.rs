@@ -16,10 +16,12 @@
 //!   use, so a phone that answers only `dumpsys power` (a protected phone) is in use whenever its
 //!   screen is on.
 //! * **A call** that is ringing or live (`mCallState` from `dumpsys telephony.registry`, read
-//!   whatever the screen shows) is in use, screen on or off. A dump that ran and has no
-//!   `mCallState` line at all (a device with no telephony) means no carrier call. A call state
-//!   that cannot be read (the read failed or was refused) counts as in use, so a protected phone
-//!   (which answers only `dumpsys power`) is always asked.
+//!   whatever the screen shows) is in use, screen on or off. No carrier call only when every
+//!   `mCallState` line is idle, the service does not exist (`Can't find service`), or a finished
+//!   registry dump has no phone slots (a device with no telephony). A call state that cannot be
+//!   read (the read failed or was refused, the dump timed out or errored, or came back empty or
+//!   unrecognised) counts as in use, so a protected phone (which answers only `dumpsys power`)
+//!   is always asked. See [`parse_call_state`].
 //! * **Not in use** (screen off or dozing; or on, untouched, nothing holding it on, no keyboard,
 //!   no listed app): allowed at once, with no push. Run the command again before each burst.
 //! * **In use:** one push with what the session wants and for how long. Yes gives a lease of
@@ -288,11 +290,19 @@ pub fn parse_ime(text: &str) -> Option<bool> {
     None
 }
 
-/// Parse the output of a `dumpsys telephony.registry` that ran (exit 0): `Some(true)` when any
-/// `mCallState=` line (one per SIM) is ringing (1) or off the hook (2), or not a number;
-/// `Some(false)` when every such line is idle (0), or when there is no such line at all (no
-/// telephony, so no carrier call); `None` when the dump is a refusal (`Permission Denial`). A
-/// read that failed or was refused never gets here: the caller keeps it unknown.
+/// Parse the output of a `dumpsys telephony.registry` that ran (exit 0), in this order:
+/// 1. any `mCallState=` line (one per SIM) ringing (1), off the hook (2) or not a number:
+///    `Some(true)`, whatever else the dump says;
+/// 2. a dump that did not finish or was not given (`DUMP TIMEOUT`, `Error dumping`,
+///    `Permission Denial`), or an empty one: `None` (unknown), even with idle lines in it;
+/// 3. every `mCallState=` line idle (0): `Some(false)`;
+/// 4. no such line, and the service does not exist (`Can't find service: telephony.registry`):
+///    no telephony, so no carrier call, `Some(false)`;
+/// 5. no such line in a real registry dump (its `last known state:` header) with no phone slots:
+///    `Some(false)`;
+/// 6. anything else: `None`.
+///
+/// A read that failed or was refused never gets here: the caller keeps it unknown.
 pub fn parse_call_state(text: &str) -> Option<bool> {
     let mut seen = None;
     for word in text.split_whitespace() {
@@ -301,11 +311,23 @@ pub fn parse_call_state(text: &str) -> Option<bool> {
             seen = Some(seen.unwrap_or(false) || busy);
         }
     }
-    match seen {
-        Some(v) => Some(v),
-        None if text.contains("Permission Denial") => None,
-        None => Some(false),
+    if seen == Some(true) {
+        return Some(true);
     }
+    let unfinished = text.trim().is_empty()
+        || ["DUMP TIMEOUT", "Error dumping", "Permission Denial"]
+            .iter()
+            .any(|m| text.contains(m));
+    if unfinished {
+        return None;
+    }
+    if seen.is_some()
+        || text.contains("Can't find service: telephony.registry")
+        || text.contains("last known state:")
+    {
+        return Some(false);
+    }
+    None
 }
 
 /// The hardware serial `ask-screen` keeps its state under, from what `getprop ro.serialno` gave
@@ -375,29 +397,39 @@ pub fn judge(s: &Signals, idle_limit_ms: u64, extra_apps: &[String]) -> Use {
     }
 }
 
+/// The longest any one read command may take.
+const COMMAND_MS: u64 = 15_000;
+/// The whole read for the `ask-screen` command: up to four commands at their own limit (the
+/// daemon's lock reads with its own, much smaller budget).
+pub const ASK_READ_BUDGET_MS: u64 = 4 * COMMAND_MS;
+
 pub(crate) fn shell(r: &dyn Runner, device: &str, cmd: &str) -> Option<String> {
-    let a = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "shell".to_string(),
-        cmd.to_string(),
-    ];
-    match r.run(&a, 15_000) {
-        Ok(o) if o.ok() => Some(o.stdout),
-        _ => None,
-    }
+    shell_within(r, device, cmd, COMMAND_MS)
+}
+
+/// [`shell`], giving the command at most `timeout_ms`, the guarded runner's own serial read
+/// included: it goes as a marked run (nothing to mark), which shares its timeout with that read,
+/// where a plain run gives the read its own 15 s.
+fn shell_within(r: &dyn Runner, device: &str, cmd: &str, timeout_ms: u64) -> Option<String> {
+    shell_marked(r, device, cmd, timeout_ms, &mut || {})
 }
 
 /// [`shell`], with `mark` called just before the command itself is sent (after the guard's own
 /// checks): see [`Runner::run_marked`].
-fn shell_marked(r: &dyn Runner, device: &str, cmd: &str, mark: &mut dyn FnMut()) -> Option<String> {
+fn shell_marked(
+    r: &dyn Runner,
+    device: &str,
+    cmd: &str,
+    timeout_ms: u64,
+    mark: &mut dyn FnMut(),
+) -> Option<String> {
     let a = vec![
         "-s".to_string(),
         device.to_string(),
         "shell".to_string(),
         cmd.to_string(),
     ];
-    match r.run_marked(&a, 15_000, mark) {
+    match r.run_marked(&a, timeout_ms, mark) {
         Ok(o) if o.ok() => Some(o.stdout),
         _ => None,
     }
@@ -406,19 +438,34 @@ fn shell_marked(r: &dyn Runner, device: &str, cmd: &str, mark: &mut dyn FnMut())
 /// Read the signals through `r` (production: the guarded adb runner, so a protected phone answers
 /// `dumpsys power` and nothing else). `None` when not even `dumpsys power` could be read.
 pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
-    read_signals_timed(r, device, &|| 0).map(|(s, _, _)| s)
+    let origin = std::time::Instant::now();
+    let clock = move || u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+    read_signals_timed(r, device, &clock, ASK_READ_BUDGET_MS).map(|(s, _, _)| s)
 }
 
 /// [`read_signals`], with the times on `clock` just before and just after the `dumpsys power`
 /// read (the read that states the last touch as "so many ms ago"). The screen lock uses them.
 /// "Just before" is after the guarded runner's own serial read, so only the power read is timed.
+///
+/// The whole read gets `budget_ms` on `clock`: each command is given what is left (at most
+/// 15 s), and once the budget is spent the read stops and the phone counts as unreadable
+/// (`None`), so a slow phone cannot hold the caller for long.
 pub fn read_signals_timed(
     r: &dyn Runner,
     device: &str,
     clock: &dyn Fn() -> u64,
+    budget_ms: u64,
 ) -> Option<(Signals, u64, u64)> {
+    let deadline = clock().saturating_add(budget_ms);
+    // what the next command may take: the rest of the budget, at most a command's own limit
+    let left = || {
+        let now = clock();
+        (now < deadline).then(|| (deadline - now).min(COMMAND_MS))
+    };
     let mut sent = None;
-    let power = shell_marked(r, device, "dumpsys power", &mut || sent = Some(clock()));
+    let power = shell_marked(r, device, "dumpsys power", left()?, &mut || {
+        sent = Some(clock())
+    });
     let to = clock();
     let from = sent.unwrap_or(to);
     let power = parse_power(&power?);
@@ -432,19 +479,24 @@ pub fn read_signals_timed(
     // a call is in use whatever the screen shows (held at an ear, the screen may be off)
     // the whole dump, not a grep: a grep that finds nothing exits 1, which would make a device
     // with no telephony read as unknown; a dump that failed or was refused stays unknown
-    s.in_call = shell(r, device, "dumpsys telephony.registry").and_then(|t| parse_call_state(&t));
+    s.in_call = shell_within(r, device, "dumpsys telephony.registry", left()?)
+        .and_then(|t| parse_call_state(&t));
     if s.screen_on() == Some(true) {
-        if let Some(w) = shell(
+        if let Some(w) = shell_within(
             r,
             device,
             "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='",
+            left()?,
         ) {
             (s.focus, s.keyguard) = parse_window(&w);
         }
-        if let Some(i) = shell(r, device, "dumpsys input_method | grep -E 'mInputShown='") {
+        let cmd = "dumpsys input_method | grep -E 'mInputShown='";
+        if let Some(i) = shell_within(r, device, cmd, left()?) {
             s.ime_shown = parse_ime(&i);
         }
     }
+    // the budget spent by the last command: what was read may be out of date
+    left()?;
     Some((s, from, to))
 }
 
@@ -1255,18 +1307,43 @@ mod tests {
         );
         assert_eq!(parse_call_state("  mCallState=1\n"), Some(true));
         assert_eq!(parse_call_state("  mCallState=x\n"), Some(true));
-        // a dump that ran with no such line: no telephony, so no carrier call
-        assert_eq!(parse_call_state("nothing here"), Some(false));
+        // dual SIM: either slot ringing or off the hook is a call
+        let dual =
+            "last known state:\n  Phone Id=0\n    mCallState=0\n  Phone Id=1\n    mCallState=1\n";
+        assert_eq!(parse_call_state(dual), Some(true));
+        let dual =
+            "last known state:\n  Phone Id=0\n    mCallState=2\n  Phone Id=1\n    mCallState=0\n";
+        assert_eq!(parse_call_state(dual), Some(true));
+        // no telephony: the service does not exist, or a real registry dump with no phone slots
         assert_eq!(
             parse_call_state("Can't find service: telephony.registry\n"),
             Some(false)
         );
-        assert_eq!(parse_call_state(""), Some(false));
-        // a refusal printed by dumpsys itself stays unknown
+        assert_eq!(parse_call_state("last known state:\n"), Some(false));
+        // a dump that did not finish or was not given stays unknown, even with idle lines in it
+        let timeout = "\n*** SERVICE 'telephony.registry' DUMP TIMEOUT (10000ms) EXPIRED ***\n\n";
+        assert_eq!(parse_call_state(timeout), None);
+        assert_eq!(
+            parse_call_state(&format!("last known state:\n  mCallState=0\n{timeout}")),
+            None
+        );
+        assert_eq!(
+            parse_call_state("Error dumping service info: (Broken pipe) telephony.registry\n"),
+            None
+        );
         assert_eq!(
             parse_call_state("Permission Denial: can't dump telephony.registry from pid=1\n"),
             None
         );
+        // ... but a call in it is still a call
+        assert_eq!(
+            parse_call_state(&format!("  mCallState=1\n{timeout}")),
+            Some(true)
+        );
+        // an empty dump, or anything else with no such line: unknown
+        assert_eq!(parse_call_state(""), None);
+        assert_eq!(parse_call_state("  \n"), None);
+        assert_eq!(parse_call_state("nothing here"), None);
     }
 
     #[test]
@@ -1321,7 +1398,7 @@ mod tests {
         // the dump ran and has no mCallState line (a tablet, an emulator without a radio)
         for out in [
             "Can't find service: telephony.registry\n",
-            "  mServiceState=...\n",
+            "last known state:\n  mServiceState=...\n",
         ] {
             let s = read_signals(
                 &CallPhone {
@@ -1387,8 +1464,79 @@ mod tests {
             }
         }
         let clock = Cell::new(1_000);
-        let (_, from, to) = read_signals_timed(&Checked(&clock), "X", &|| clock.get()).unwrap();
+        let (_, from, to) =
+            read_signals_timed(&Checked(&clock), "X", &|| clock.get(), 5_000).unwrap();
         assert_eq!((from, to), (1_900, 1_940));
+    }
+
+    #[test]
+    fn the_read_stops_once_its_budget_is_spent_and_each_command_gets_what_is_left() {
+        use std::cell::{Cell, RefCell};
+        // a screen-on phone (four commands) whose every command takes `per` ms
+        struct Slow<'a> {
+            clock: &'a Cell<u64>,
+            per: u64,
+            timeouts: RefCell<Vec<u64>>,
+        }
+        impl Runner for Slow<'_> {
+            fn run(&self, a: &[String], t: u64) -> Result<RunOutput, RunError> {
+                self.timeouts.borrow_mut().push(t);
+                self.clock.set(self.clock.get() + self.per);
+                let cmd = a.last().map(String::as_str).unwrap_or_default();
+                let out = if cmd == "dumpsys power" {
+                    POWER_AWAKE
+                } else if cmd.starts_with("dumpsys telephony.registry") {
+                    NO_CALL
+                } else {
+                    "  mCurrentFocus=null\n  mInputShown=false\n"
+                };
+                Ok(RunOutput {
+                    code: Some(0),
+                    stdout: out.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let clock = Cell::new(0);
+        let quick = Slow {
+            clock: &clock,
+            per: 1_000,
+            timeouts: RefCell::new(vec![]),
+        };
+        assert!(read_signals_timed(&quick, "X", &|| clock.get(), 5_000).is_some());
+        assert_eq!(*quick.timeouts.borrow(), vec![5_000, 4_000, 3_000, 2_000]);
+        // 2 s a command: the third runs out the budget, and the read stops there, unreadable
+        clock.set(0);
+        let slow = Slow {
+            clock: &clock,
+            per: 2_000,
+            timeouts: RefCell::new(vec![]),
+        };
+        assert!(read_signals_timed(&slow, "X", &|| clock.get(), 5_000).is_none());
+        assert_eq!(*slow.timeouts.borrow(), vec![5_000, 3_000, 1_000]);
+        // 1.25 s a command: all four run, but the last ends on the deadline, so what was read
+        // may be out of date: unreadable too
+        clock.set(0);
+        let edge = Slow {
+            clock: &clock,
+            per: 1_250,
+            timeouts: RefCell::new(vec![]),
+        };
+        assert!(read_signals_timed(&edge, "X", &|| clock.get(), 5_000).is_none());
+        assert_eq!(*edge.timeouts.borrow(), vec![5_000, 3_750, 2_500, 1_250]);
+        // a large budget still gives no command more than 15 s
+        clock.set(0);
+        let ask = Slow {
+            clock: &clock,
+            per: 10,
+            timeouts: RefCell::new(vec![]),
+        };
+        assert!(read_signals_timed(&ask, "X", &|| clock.get(), ASK_READ_BUDGET_MS).is_some());
+        assert!(
+            ask.timeouts.borrow().iter().all(|t| *t == 15_000),
+            "{:?}",
+            ask.timeouts
+        );
     }
 
     #[test]

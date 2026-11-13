@@ -28,6 +28,7 @@
 
 use crate::proto::*;
 use crate::registry::Registry;
+use agentroid_core::screenlock::FREE_SEGMENT_MAX_S;
 use agentroid_segments::{
     build, sign_with, Phase, SafeClasses, Segment, SegmentRequest, Step, Supervisor,
 };
@@ -633,23 +634,33 @@ impl crate::server::Daemon {
                     .map(|l| l.epoch)
                     .ok_or_else(|| RpcError::new(NOT_HOLDER, format!("no lease on {key}")))?;
                 if method == "link.segment" {
-                    let p: LinkSegmentParams = parse_params(params)?;
+                    let mut p: LinkSegmentParams = parse_params(params)?;
                     let id = p.segment_id.clone();
                     // the screen lock, before anything is built, signed or sent: a segment
-                    // changes the screen like any tap
+                    // changes the screen like any tap, and it is checked only this once
                     let ticket = self
                         .backend()
-                        .lock_admit(&d.serial, "link.segment")
+                        .lock_admit_segment(&d.serial, p.steps.len(), p.expires_in_s)
                         .map_err(|e| {
                             RpcError::new(REFUSED, e.to_string())
                                 .with_data(json!({"rule": "screen_lock"}))
                         })?;
+                    if ticket.is_some() {
+                        // let through because the phone is not in use now: a short life only
+                        p.expires_in_s = Some(
+                            p.expires_in_s
+                                .unwrap_or(FREE_SEGMENT_MAX_S)
+                                .min(FREE_SEGMENT_MAX_S),
+                        );
+                    }
                     let r = link.segment(&key, epoch, p);
                     // the phone's answer is in (or the segment may be running): the end of the
-                    // agent's own action. A segment that failed before it ran cancels its ticket
-                    // (dropped: nothing it did is the agent's)
+                    // agent's own action, stamped now, before the daemon's lock is taken again.
+                    // A segment that failed before it ran cancels its ticket (dropped: nothing it
+                    // did is the agent's)
                     match ticket {
-                        Some(t) if r.is_ok() || link.segment_is_running(&key, &id) => {
+                        Some(mut t) if r.is_ok() || link.segment_is_running(&key, &id) => {
+                            t.finished();
                             self.backend().lock_done(t)
                         }
                         cancelled => drop(cancelled),

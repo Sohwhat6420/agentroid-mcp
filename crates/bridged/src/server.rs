@@ -132,17 +132,21 @@ pub trait DeviceBackend: Send {
     /// Record a shell line the `run_script` sandbox refused before it reached the bridge (D3b), so
     /// the audit log holds every refused command. Default: not recorded.
     fn shell_refused(&mut self, _serial: &str, _line: &str, _reason: &str) {}
-    /// Core's screen lock alone, for screen-changing work core does not send itself (a link
-    /// segment). `Ok(Some(ticket))`: give the ticket to [`DeviceBackend::lock_done`] once the work
-    /// has run, or drop it if it never ran. Default: no lock, so nothing is refused.
-    fn lock_admit(
+    /// Core's screen lock alone, for a link segment of `steps` steps asking to live `expires_s`
+    /// seconds (core does not send segments itself). `Ok(Some(ticket))`: the phone was let through
+    /// because it is not in use now, so the segment is held to the short limits
+    /// ([`agentroid_core::screenlock::FREE_SEGMENT_MAX_S`]); stamp the ticket finished and give it
+    /// to [`DeviceBackend::lock_done`] once the work has run, or drop it if it never ran.
+    /// Default: no lock, so nothing is refused.
+    fn lock_admit_segment(
         &mut self,
         _serial: &str,
-        _tool: &'static str,
+        _steps: usize,
+        _expires_s: Option<u64>,
     ) -> Result<Option<LockTicket>, CoreError> {
         Ok(None)
     }
-    /// The work `ticket` names ([`DeviceBackend::lock_admit`], or a shell line through
+    /// The work `ticket` names ([`DeviceBackend::lock_admit_segment`], or a shell line through
     /// [`DeviceBackend::shell_gate`]) has run: its end is the agent's own activity. Default: none.
     fn lock_done(&mut self, _ticket: LockTicket) {}
 }
@@ -243,12 +247,13 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
     fn shell_refused(&mut self, serial: &str, line: &str, reason: &str) {
         self.core.record_shell_refusal(Some(serial), line, reason);
     }
-    fn lock_admit(
+    fn lock_admit_segment(
         &mut self,
         serial: &str,
-        tool: &'static str,
+        steps: usize,
+        expires_s: Option<u64>,
     ) -> Result<Option<LockTicket>, CoreError> {
-        self.core.lock_admit(Some(serial), tool)
+        self.core.lock_admit_segment(Some(serial), steps, expires_s)
     }
     fn lock_done(&mut self, ticket: LockTicket) {
         self.core.lock_done(ticket);
