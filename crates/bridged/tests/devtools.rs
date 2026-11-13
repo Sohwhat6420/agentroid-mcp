@@ -536,6 +536,44 @@ fn push_rejects_bad_paths_before_touching_the_phone() {
     });
 }
 
+/// `pull_new`'s folder (and `push`'s phone path) may not hold a `.` segment: `/sdcard/./Android/data/
+/// <pkg>` is another app's private folder by a second spelling, so it is refused before the file
+/// guard is asked and before anything is listed on the phone.
+#[test]
+fn pull_new_and_push_reject_single_dot_segments_before_touching_the_phone() {
+    run(async {
+        let dir = tmp_dir("devtools-dot-paths");
+        let local = local_file(&dir, "f.bin", b"abc");
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        for d in [
+            "/sdcard/./Android/data/com.whatsapp/files",
+            "/sdcard/Android/./data/com.whatsapp/files",
+            "/storage/emulated/0/./android/media/com.whatsapp",
+            "/sdcard/Android/data/com.whatsapp/files/.",
+            "/sdcard/Download/./",
+            "/./sdcard/Download",
+        ] {
+            let r = c
+                .tool(POCO, json!({ "tool": "pull_new", "dir": d, "poll_ms": 0 }))
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "{d:?}: {r}");
+            assert!(
+                r["error"]["message"].as_str().unwrap().contains("`.`"),
+                "{d:?}: {r}"
+            );
+            let r = c
+                .tool(
+                    POCO,
+                    json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": format!("{d}/f.bin") }),
+                )
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "push {d:?}: {r}");
+        }
+        no_command_reached(&h);
+    });
+}
+
 /// The laptop side is fenced: `push` reads only the outbox and `pull_new` writes only the inbox.
 /// A file elsewhere, a `..` name, or a pull into another folder is REFUSED (class `outbox` /
 /// `inbox`) and nothing reaches the phone.

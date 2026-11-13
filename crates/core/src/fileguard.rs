@@ -1,7 +1,8 @@
 //! The file guard (D3b, 10 Nov 2026): `push` and `pull` through the same deny-by-default rules and
 //! audit log as every tap.
 //!
-//! * A phone path must be absolute, with no `..`, no control character and no shell metacharacter.
+//! * A phone path must be absolute, with no `..` or `.` segment, no control character and no shell
+//!   metacharacter. A `.` is refused rather than dropped: the guard judges the path as written.
 //! * **Push** is allowed only into shared storage (`/sdcard`, `/storage/emulated/0`,
 //!   `/storage/self/primary`) and `/data/local/tmp`. Anything else (`/system`, `/data/data`,
 //!   `/data/system`, `/vendor`, `/dev`, `/proc`...) is blocked: writing there is a wipe or a
@@ -78,6 +79,13 @@ fn syntax(p: &str) -> Result<String, String> {
     if p.split('/').any(|s| s == "..") {
         return Err("phone path holds a `..` segment".into());
     }
+    // `/sdcard/./Android/data/<pkg>` is another app's folder by a second spelling. Refused, not
+    // rewritten: the guard judges the path the phone will open, so it never repairs one.
+    if p.split('/').any(|s| s == ".") {
+        return Err("phone path holds a `.` segment".into());
+    }
+    // with `.` and `..` gone, collapsing repeated slashes leaves only real names (and perhaps a
+    // trailing slash); a bare `/` or `//` collapses to `/`, which is outside shared storage
     Ok(normalise(p))
 }
 
@@ -282,6 +290,38 @@ mod tests {
             "/sdcard/android/x.txt",
             "/sdcard/androidx/data/com.whatsapp/x",
             "/sdcard/android/datax/com.whatsapp/x",
+        ] {
+            assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p}");
+        }
+    }
+
+    #[test]
+    fn single_dot_segments_are_refused_not_rewritten() {
+        // a `.` segment names the same directory on the phone, so each of these would open another
+        // app's files (or a shared folder by a second spelling); the guard refuses rather than guess
+        for p in [
+            "/sdcard/./Android/data/com.whatsapp/files/x",
+            "/sdcard/Android/./data/com.whatsapp/files/x",
+            "/storage/emulated/0/./android/media/com.whatsapp/x",
+            "/sdcard/Android/data/./com.whatsapp/files/x",
+            "/sdcard//.//Android/data/com.whatsapp/files/x",
+            "/sdcard/Download/.",
+            "/sdcard/Android/data/com.whatsapp/files/.",
+            "/./sdcard/Android/data/com.whatsapp/files/x",
+            "./sdcard/Download/x",
+        ] {
+            for op in [FileOp::Push, FileOp::Pull] {
+                let d = classify_file(op, p);
+                assert_eq!(d.verdict, Verdict::Blocked, "{op:?} {p:?}: {d:?}");
+                assert_eq!(d.rule, "file:path_syntax", "{op:?} {p:?}");
+            }
+        }
+        // names that only start or end with a dot are ordinary names
+        for p in [
+            "/sdcard/.nomedia",
+            "/sdcard/Download/x.",
+            "/sdcard/Download/..x",
+            "/sdcard/.thumbnails/a.jpg",
         ] {
             assert_eq!(v(FileOp::Pull, p), Verdict::Allowed, "{p}");
         }
