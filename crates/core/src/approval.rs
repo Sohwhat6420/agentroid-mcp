@@ -505,8 +505,14 @@ impl<H: Http> NtfyChannel<H> {
 
     fn topics(&self) -> Result<(String, String), String> {
         let login = self.cfg.token_file.is_some() && self.cfg.login_topics;
-        if login && host_of(&self.cfg.base).is_some_and(|h| h.eq_ignore_ascii_case("ntfy.sh")) {
-            return Err("short topics are never safe on ntfy.sh: drop login_topics".into());
+        if login {
+            match host_of(&self.cfg.base) {
+                None => return Err("login_topics needs a plain http(s)://host[:port] base".into()),
+                Some(h) if h == "ntfy.sh" || h.ends_with(".ntfy.sh") => {
+                    return Err("short topics are never safe on ntfy.sh: drop login_topics".into())
+                }
+                Some(_) => {}
+            }
         }
         let out = read_topic_for(&self.cfg.topic_file, login)?;
         let inb = match &self.cfg.inbound_topic_file {
@@ -522,9 +528,9 @@ impl<H: Http> NtfyChannel<H> {
         let t = match &self.cfg.token_file {
             Some(p) => {
                 // a token travels in clear over plain http, so only to this machine
-                if !self.cfg.base.starts_with("https://")
-                    && !host_of(&self.cfg.base).is_some_and(is_loopback_host)
-                {
+                let host = host_of(&self.cfg.base)
+                    .ok_or("a token needs a plain http(s)://host[:port] base")?;
+                if !self.cfg.base.starts_with("https://") && !is_loopback_host(&host) {
                     return Err("a token is sent only to an https or loopback base".into());
                 }
                 Some(read_token(p)?)
@@ -647,20 +653,30 @@ impl<H: Http> Channel for NtfyChannel<H> {
     }
 }
 
-/// The host of an `http(s)://host[:port]/...` URL.
-fn host_of(url: &str) -> Option<&str> {
+/// The host of an `http(s)://host[:port]/...` URL, lower-cased and without a trailing dot. `None`
+/// for anything else, including a user part (`http://127.0.0.1@far.example/` goes to far.example),
+/// so a check on the host can never be fooled by one.
+fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let hostport = rest.split('/').next()?;
-    if let Some(v6) = hostport.strip_prefix('[') {
-        return v6.split(']').next();
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('@') || authority.contains('\\') {
+        return None;
     }
-    hostport.split(':').next()
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => authority.split(':').next()?,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
 }
 
+/// `localhost`, or a loopback IP literal (`127.x.x.x`, `::1`). A name such as `127.example` is not.
 fn is_loopback_host(h: &str) -> bool {
-    h == "localhost" || h == "::1" || h.starts_with("127.")
+    h == "localhost"
+        || h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Several channels as one: the ask goes out on every channel that can carry it (it is refused
@@ -1450,6 +1466,48 @@ mod tests {
         c.token_file = Some(d.join("laptop.token"));
         c.login_topics = true;
         c
+    }
+
+    #[test]
+    fn host_checks_cannot_be_fooled_by_a_user_part_a_trailing_dot_or_a_fake_name() {
+        assert_eq!(
+            host_of("http://127.0.0.1:2586/x").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(host_of("https://NTFY.SH./x").as_deref(), Some("ntfy.sh"));
+        assert_eq!(host_of("http://[::1]:2586").as_deref(), Some("::1"));
+        assert_eq!(host_of("http://127.0.0.1@192.0.2.7:2586"), None);
+        assert_eq!(host_of("ftp://127.0.0.1"), None);
+        assert!(is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("::1") && is_loopback_host("localhost"));
+        assert!(!is_loopback_host("127.evil.example") && !is_loopback_host("192.0.2.7"));
+        let d = std::env::temp_dir().join(format!("agentroid-hosts-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("alerts.topic"), "alerts\n").unwrap();
+        std::fs::write(d.join("taps.topic"), "taps\n").unwrap();
+        std::fs::write(
+            d.join("laptop.token"),
+            "tk_LAPTOP000000000000000000000000\n",
+        )
+        .unwrap();
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = a.request(1, "X", "tap", "destructive", "delete", "");
+        let log: AuthLog = Default::default();
+        for (base, ok) in [
+            ("http://127.0.0.1@192.0.2.7:2586", false),
+            ("http://127.evil.example:2586", false),
+            ("https://x@ntfy.sh", false),
+            ("https://ntfy.sh.", false),
+            ("https://push.ntfy.sh", false),
+            ("http://localhost:2586", true),
+            ("https://ntfy.example.org", true),
+        ] {
+            let mut c = cfg_with_token(&d);
+            c.base = base.into();
+            let sent = NtfyChannel::new(c, AuthHttp(log.clone())).send(&r);
+            assert_eq!(sent.is_ok(), ok, "{base}: {sent:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

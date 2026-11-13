@@ -76,7 +76,8 @@ pub struct Signals {
     pub wakefulness: Option<String>,
     /// Milliseconds since the last user activity (touch, key).
     pub idle_ms: Option<u64>,
-    /// Whether an app holds a screen wake lock (a video, keep-screen-on): someone is watching.
+    /// Whether an app holds a screen wake lock (a video, keep-screen-on) or a call holds the
+    /// proximity sensor (the phone is at someone's ear): someone is using it.
     pub screen_kept_on: Option<bool>,
     /// The package of the focused window (`mCurrentFocus`), or `""` when nothing has focus.
     pub focus: Option<String>,
@@ -87,8 +88,13 @@ pub struct Signals {
 }
 
 impl Signals {
+    /// Awake is on; Asleep, Dozing and Dreaming are off; any other value is unknown.
     pub fn screen_on(&self) -> Option<bool> {
-        self.wakefulness.as_deref().map(|w| w == "Awake")
+        match self.wakefulness.as_deref()? {
+            "Awake" => Some(true),
+            "Asleep" | "Dozing" | "Dreaming" => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -114,12 +120,15 @@ fn ms_ago(line: &str, key: &str) -> Option<(u64, u64)> {
     Some((val.parse().ok()?, ago.parse().ok()?))
 }
 
-/// The screen wake-lock bits of `mWakeLockSummary`: SCREEN_BRIGHT (0x2) and SCREEN_DIM (0x4).
-const SCREEN_LOCK_BITS: u64 = 0x2 | 0x4;
-const SCREEN_LOCK_TYPES: [&str; 3] = [
+/// The `mWakeLockSummary` bits that mean someone is using the screen: SCREEN_BRIGHT (0x2),
+/// SCREEN_DIM (0x4) and PROXIMITY_SCREEN_OFF (0x10, held through a call while the phone is at an
+/// ear; the screen stays Awake with no touches).
+const SCREEN_LOCK_BITS: u64 = 0x2 | 0x4 | 0x10;
+const SCREEN_LOCK_TYPES: [&str; 4] = [
     "SCREEN_BRIGHT_WAKE_LOCK",
     "SCREEN_DIM_WAKE_LOCK",
     "FULL_WAKE_LOCK",
+    "PROXIMITY_SCREEN_OFF_WAKE_LOCK",
 ];
 
 /// Parse `dumpsys power`.
@@ -176,7 +185,9 @@ pub fn parse_power(text: &str) -> Power {
                 summary = u64::from_str_radix(v.trim(), 16).ok();
             }
         }
-        if SCREEN_LOCK_TYPES.contains(&l.split_whitespace().next().unwrap_or("")) {
+        if SCREEN_LOCK_TYPES.contains(&l.split_whitespace().next().unwrap_or(""))
+            || l == "mProximityPositive=true"
+        {
             screen_lock_line = true;
         }
     }
@@ -301,7 +312,9 @@ pub fn judge(s: &Signals, idle_limit_ms: u64, extra_apps: &[String]) -> Use {
     }
     match s.screen_kept_on {
         None => why.push("whether an app holds the screen on is unknown".into()),
-        Some(true) => why.push("an app is holding the screen on (a video or a reader)".into()),
+        Some(true) => {
+            why.push("the screen is held on (a video, a reader, or a call at an ear)".into())
+        }
         Some(false) => {}
     }
     if why.is_empty() {
@@ -381,7 +394,9 @@ fn memory_path(dir: &Path, device: &str) -> PathBuf {
 
 /// Load the memory for a phone. Values further ahead than this program ever writes (a lease past
 /// 60 minutes, a cool-down past 5, a pending ask past the longest wait) are ignored, as are
-/// leases that have run out: a damaged or edited file can only make it ask, never allow.
+/// leases that have run out. So a damaged file, or one left by an older run, can only make it ask.
+/// The file is not signed: anyone who can write the state folder can forge a lease of up to 60
+/// minutes, so it belongs in the user's own profile.
 pub fn load_memory(dir: &Path, device: &str, now: u64) -> Memory {
     let Ok(t) = std::fs::read_to_string(memory_path(dir, device)) else {
         return Memory::default();
@@ -491,7 +506,8 @@ fn refused(why: String, retry_after_s: u64, asked: bool) -> Decision {
 
 /// The decision, given the signals, the memory and a channel. `now` and `sleep` are Unix-ms
 /// clock functions (tests pass fakes). Updates `mem`, and calls `persist` with it just before a
-/// push goes out, so other sessions see that an ask is waiting even if this one is killed.
+/// push goes out, so other sessions see that an ask is waiting even if this one is killed. If
+/// `persist` returns false (the marker could not be saved), nothing is sent and the call is refused.
 pub fn decide(
     ask: &Ask,
     signals: &Signals,
@@ -499,7 +515,7 @@ pub fn decide(
     channel: Option<Box<dyn Channel + Send>>,
     now: &dyn Fn() -> u64,
     sleep: &dyn Fn(u64),
-    persist: &mut dyn FnMut(&Memory),
+    persist: &mut dyn FnMut(&Memory) -> bool,
 ) -> Decision {
     let t = now();
     let key = lease_key(&ask.session, &ask.why);
@@ -550,7 +566,14 @@ pub fn decide(
         );
     };
     mem.asking_until_ms = t + ask.wait_ms + PENDING_SLACK_MS;
-    persist(mem);
+    if !persist(mem) {
+        mem.asking_until_ms = 0;
+        return refused(
+            format!("in use ({in_use}), and the pending ask could not be saved (--state-dir): refused without a push"),
+            60,
+            false,
+        );
+    }
     let mut approver = Approver::new(channel).with_expiry_ms(ask.wait_ms);
     let reason = format!(
         "wants to use your screen for about {} min: {} (in use: {in_use})",
@@ -792,9 +815,11 @@ pub fn command(args: &[String]) -> (String, i32) {
     let written = std::cell::RefCell::new(loaded);
     let mut persist = |m: &Memory| {
         let mut w = written.borrow_mut();
-        if save_changes(dir, device, &w, m, unix_ms()).is_ok() {
+        let ok = save_changes(dir, device, &w, m, unix_ms()).is_ok();
+        if ok {
             *w = m.clone();
         }
+        ok
     };
     let d = decide(
         &p.ask,
@@ -915,6 +940,61 @@ mod tests {
         // no summary: unknown
         let none = without(POWER_AWAKE, "mWakeLockSummary=");
         assert_eq!(parse_power(&none).screen_kept_on, None);
+    }
+
+    #[test]
+    fn a_call_at_an_ear_counts_as_a_held_screen() {
+        // the proximity lock: Awake, untouched for minutes, no keyboard, the dialer focused
+        let call = POWER_AWAKE.replace("mWakeLockSummary=0x1", "mWakeLockSummary=0x11");
+        assert_eq!(parse_power(&call).screen_kept_on, Some(true));
+        let listed = POWER_AWAKE.replace(
+            "  PARTIAL_WAKE_LOCK ",
+            "  PROXIMITY_SCREEN_OFF_WAKE_LOCK 'incall' ACQ=-6m\n  PARTIAL_WAKE_LOCK ",
+        );
+        assert_eq!(parse_power(&listed).screen_kept_on, Some(true));
+        let near = format!("{POWER_AWAKE}  mProximityPositive=true\n");
+        assert_eq!(parse_power(&near).screen_kept_on, Some(true));
+        let far = format!("{POWER_AWAKE}  mProximityPositive=false\n");
+        assert_eq!(parse_power(&far).screen_kept_on, Some(false));
+        let mut s = awake("com.google.android.dialer", false, 600_000);
+        s.screen_kept_on = parse_power(&call).screen_kept_on;
+        assert!(matches!(judge(&s, 5 * 60_000, &[]), Use::InUse(_)));
+    }
+
+    #[test]
+    fn an_unknown_wakefulness_is_never_screen_off() {
+        for w in ["awake", "On", "Unknown", ""] {
+            let mut s = awake("com.example.reader", false, 3_600_000);
+            s.wakefulness = Some(w.into());
+            assert_eq!(s.screen_on(), None, "{w:?}");
+            assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)), "{w:?}");
+        }
+        for w in ["Asleep", "Dozing", "Dreaming"] {
+            let s = Signals {
+                wakefulness: Some(w.into()),
+                ..Signals::default()
+            };
+            assert!(matches!(judge(&s, 60_000, &[]), Use::Free(_)), "{w}");
+        }
+    }
+
+    #[test]
+    fn a_pending_marker_that_cannot_be_saved_sends_nothing() {
+        let t = Cell::new(1_000_000u64);
+        let mut m = Memory::default();
+        let (ch, seen) = answering("allow");
+        let d = decide(
+            &ask(),
+            &awake("com.anthropic.claude", true, 1_000),
+            &mut m,
+            Some(ch),
+            &|| t.get(),
+            &|ms| t.set(t.get() + ms),
+            &mut |_| false,
+        );
+        assert!(!d.allowed && !d.asked && d.retry_after_s == 60, "{d:?}");
+        assert!(seen.lock().unwrap().is_empty(), "no push went out");
+        assert_eq!(m, Memory::default(), "nothing held against the next ask");
     }
 
     #[test]
@@ -1147,7 +1227,7 @@ mod tests {
             ch,
             &|| t.get(),
             &|ms| t.set(t.get() + ms),
-            &mut |_| {},
+            &mut |_| true,
         )
     }
 
@@ -1307,6 +1387,7 @@ mod tests {
             &mut |mm: &Memory| {
                 order.lock().unwrap().push("persist".to_string());
                 snaps.push(mm.clone());
+                true
             },
         );
         assert!(d.allowed);
