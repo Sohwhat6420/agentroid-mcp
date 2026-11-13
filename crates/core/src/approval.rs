@@ -421,14 +421,63 @@ impl NtfyConfig {
     }
 }
 
+/// Unix time in milliseconds.
+pub type WallClock = Box<dyn Fn() -> u64 + Send>;
+
+fn system_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// An ntfy event's Unix time, moved onto the clock a request was made on.
+///
+/// The two clocks are different things. A request's `created_ms` and `expires_ms` come from the
+/// caller's clock, and the daemon's counts milliseconds from its own start. ntfy stamps every event
+/// with Unix time. `sent_unix_ms` is the Unix time at which the request was sent, so an event's
+/// distance from that moment is the same on both clocks. Compared raw, every live answer looked
+/// about 56 years late and was thrown away.
+pub fn on_request_clock(event_unix_ms: u64, sent_unix_ms: u64, created_ms: u64) -> u64 {
+    let t = i128::from(created_ms) + i128::from(event_unix_ms) - i128::from(sent_unix_ms);
+    u64::try_from(t.max(0)).unwrap_or(u64::MAX)
+}
+
 pub struct NtfyChannel<H: Http> {
     cfg: NtfyConfig,
     http: H,
+    /// Unix time, for tying ntfy's event times to the request's clock.
+    wall_ms: WallClock,
+    /// The request last sent (its id) and the Unix time it was sent at.
+    sent: Option<(String, u64)>,
 }
 
 impl<H: Http> NtfyChannel<H> {
     pub fn new(cfg: NtfyConfig, http: H) -> NtfyChannel<H> {
-        NtfyChannel { cfg, http }
+        NtfyChannel {
+            cfg,
+            http,
+            wall_ms: Box::new(system_wall_ms),
+            sent: None,
+        }
+    }
+
+    /// Replace the Unix-time source (tests).
+    pub fn with_wall_clock(mut self, wall_ms: WallClock) -> NtfyChannel<H> {
+        self.wall_ms = wall_ms;
+        self
+    }
+
+    /// The Unix time `req` was sent at. A request polled without having been sent through this
+    /// channel is anchored at its first poll.
+    fn sent_unix_ms(&mut self, req: &Request) -> u64 {
+        match &self.sent {
+            Some((id, at)) if *id == req.id => *at,
+            _ => {
+                let at = (self.wall_ms)();
+                self.sent = Some((req.id.clone(), at));
+                at
+            }
+        }
     }
 
     fn topics(&self) -> Result<(String, String), String> {
@@ -458,10 +507,10 @@ impl<H: Http> NtfyChannel<H> {
         .to_string()
     }
 
-    /// The poll URL: every message on the inbound topic since just before the ask was created,
-    /// returned at once (`poll=1`).
-    pub fn poll_url(&self, req: &Request, inbound: &str) -> String {
-        let since_s = req.created_ms.saturating_sub(MAX_EARLY_MS) / 1000;
+    /// The poll URL: every message on the inbound topic since just before the ask was sent
+    /// (`sent_unix_ms`, Unix time, which is what ntfy's `since` takes), returned at once (`poll=1`).
+    pub fn poll_url(&self, sent_unix_ms: u64, inbound: &str) -> String {
+        let since_s = sent_unix_ms.saturating_sub(MAX_EARLY_MS) / 1000;
         format!(
             "{}/{inbound}/json?poll=1&since={since_s}",
             self.cfg.base.trim_end_matches('/')
@@ -496,6 +545,7 @@ impl<H: Http> Channel for NtfyChannel<H> {
         let (topic, inbound) = self.topics()?;
         let body = self.publish_body(req, &topic, &inbound);
         let url = format!("{}/", self.cfg.base.trim_end_matches('/'));
+        self.sent = Some((req.id.clone(), (self.wall_ms)()));
         // the topic is in the body, never in a log line
         self.http
             .post_json(&url, &body)
@@ -504,12 +554,20 @@ impl<H: Http> Channel for NtfyChannel<H> {
     }
     fn poll(&mut self, req: &Request) -> Result<Vec<Inbound>, String> {
         let (topic, inbound) = self.topics()?;
-        let url = self.poll_url(req, &inbound);
+        let sent = self.sent_unix_ms(req);
+        let url = self.poll_url(sent, &inbound);
         let text = self
             .http
             .get(&url)
             .map_err(|e| format!("poll failed: {}", scrub(&e, &[&topic, &inbound])))?;
-        Ok(parse_ntfy_lines(&text))
+        // ntfy's Unix times, moved onto the request's clock before the approver judges the window
+        Ok(parse_ntfy_lines(&text)
+            .into_iter()
+            .map(|mut ev| {
+                ev.time_ms = on_request_clock(ev.time_ms, sent, req.created_ms);
+                ev
+            })
+            .collect())
     }
 }
 
@@ -942,7 +1000,8 @@ mod tests {
                 r.id
             ),
         };
-        let mut ch = NtfyChannel::new(NtfyConfig::new(&tf), http);
+        let mut ch = NtfyChannel::new(NtfyConfig::new(&tf), http)
+            .with_wall_clock(Box::new(|| 1_700_000_000_000));
         ch.send(&r).unwrap();
         let (url, body) = ch.http.posts[0].clone();
         assert_eq!(url, "https://ntfy.sh/");
@@ -959,7 +1018,84 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_id, "m1");
         assert_eq!(events[0].time_ms, 1_700_000_007_000);
-        assert!(ch.http.gets[0].starts_with(&format!("https://ntfy.sh/{topic}/json?poll=1&since=")));
+        assert_eq!(
+            ch.http.gets[0],
+            format!("https://ntfy.sh/{topic}/json?poll=1&since=1699999940")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_live_answer_is_judged_on_the_requests_clock_not_as_unix_time() {
+        // The daemon's clock counts from its start (adb-link's SystemClock): an ask is created at
+        // "about 17 minutes of uptime", while ntfy stamps its events with Unix time.
+        const UNIX_MS: u64 = 1_790_000_000_000;
+        let d = tmp("ntfy-live");
+        let tf = d.join("topic.key");
+        let topic = "agentroid-approvals-0123456789abcdef";
+        std::fs::write(&tf, format!("{topic}\n")).unwrap();
+        for (what, offset_s, approved) in [
+            ("an Allow 7 s after the ask", 7i64, true),
+            ("an Allow 80 s after the ask", 80, true),
+            (
+                "a replayed Allow from 5 minutes before the ask",
+                -300,
+                false,
+            ),
+            ("an Allow dated 10 minutes after the ask", 600, false),
+        ] {
+            let (_t, now, sleep) = clock();
+            assert_eq!(
+                now(),
+                1_000_000,
+                "the request's clock is uptime, not Unix time"
+            );
+            let mut minted = Approver::new(Box::new(FakeChannel::default()));
+            let r = req(&mut minted, now());
+            let event_s = (UNIX_MS as i64 / 1000 + offset_s) as u64;
+            let http = RecHttp {
+                posts: vec![],
+                gets: vec![],
+                reply: format!(
+                    "{{\"id\":\"m1\",\"time\":{event_s},\"event\":\"message\",\"topic\":\"t\",\"message\":\"allow {}\"}}\n",
+                    r.id
+                ),
+            };
+            let ch =
+                NtfyChannel::new(NtfyConfig::new(&tf), http).with_wall_clock(Box::new(|| UNIX_MS));
+            let mut a = Approver::new(Box::new(ch));
+            let out = a.ask(&r, &now, &sleep);
+            assert_eq!(
+                matches!(out, Outcome::Approved { .. }),
+                approved,
+                "{what}: {out:?}"
+            );
+        }
+        // the poll asks ntfy for messages since Unix time, not since the daemon's uptime
+        let (_t, now, _sleep) = clock();
+        let mut minted = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut minted, now());
+        let http = RecHttp {
+            posts: vec![],
+            gets: vec![],
+            reply: String::new(),
+        };
+        let mut ch =
+            NtfyChannel::new(NtfyConfig::new(&tf), http).with_wall_clock(Box::new(|| UNIX_MS));
+        ch.send(&r).unwrap();
+        assert!(ch.poll(&r).unwrap().is_empty());
+        assert_eq!(
+            ch.http.gets[0],
+            format!(
+                "https://ntfy.sh/{topic}/json?poll=1&since={}",
+                UNIX_MS / 1000 - 60
+            )
+        );
+        assert_eq!(
+            on_request_clock(UNIX_MS + 7_000, UNIX_MS, 1_000_000),
+            1_007_000
+        );
+        assert_eq!(on_request_clock(UNIX_MS - 5_000_000, UNIX_MS, 1_000_000), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 
