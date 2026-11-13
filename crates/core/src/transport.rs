@@ -418,8 +418,12 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// `adb-<serial>-...`. A serial typed in another letter case, or a phone that connected over
     /// Wi-Fi, must not fall back to `full`. When several entries match, the narrowest mode wins.
     pub fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
-        // how little a mode allows: `helper` keeps gestures, keys and typing, which `read_only` also
-        // refuses, so it sits between the two
+        // the ranking counts only what can change the phone: `helper` keeps gestures, keys and
+        // typing, which `read_only` refuses, so it ranks between `full` and `read_only`. It is not
+        // wider than `read_only` in every way: `helper` refuses `doctor diagnose` and the raw adb
+        // tools, while `read_only` answers `doctor diagnose`. So a device matched by both a
+        // `helper` and a `read_only` entry would get `doctor diagnose` back; that cannot happen
+        // yet, as the daemon never configures `helper` for a device.
         let narrowness = |m: DeviceMode| match m {
             DeviceMode::Full => 0,
             DeviceMode::Helper => 1,
