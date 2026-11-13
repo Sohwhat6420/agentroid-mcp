@@ -569,29 +569,42 @@ impl Daemon {
                 ),
             )
         })?;
-        self.backend()
-            .raw_pull(&t.serial, &remote, &local)
-            .map_err(|e| RpcError::new(DEVICE_ERROR, format!("pull failed: {e}")))?;
-        let (sha, got) = file_sha256(&local).map_err(|e| {
-            RpcError::new(
-                DEVICE_ERROR,
-                format!("pull_new: cannot read {}: {e}", local.display()),
-            )
-        })?;
-        if got != size {
-            return Err(RpcError::new(
-                DEVICE_ERROR,
-                format!("pull_new: {remote} is {size} bytes on the phone but {got} on the laptop"),
-            ));
-        }
-        if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
-            if theirs != sha {
+        // the size limit was checked against the phone's own answer, so whatever arrived is checked again
+        // here, and a pull that fails or does not match leaves nothing in the inbox (a file that grew after
+        // the size check, or a phone that reported a false size, must not stay on the laptop)
+        let verified = (|| -> Result<String, RpcError> {
+            self.backend()
+                .raw_pull(&t.serial, &remote, &local)
+                .map_err(|e| RpcError::new(DEVICE_ERROR, format!("pull failed: {e}")))?;
+            let (sha, got) = file_sha256(&local).map_err(|e| {
+                RpcError::new(
+                    DEVICE_ERROR,
+                    format!("pull_new: cannot read {}: {e}", local.display()),
+                )
+            })?;
+            if got != size || got > max {
                 return Err(RpcError::new(
                     DEVICE_ERROR,
-                    format!("pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}"),
+                    format!("pull_new: {remote} is {size} bytes on the phone but {got} on the laptop; the copy was deleted"),
                 ));
             }
-        }
+            if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
+                if theirs != sha {
+                    return Err(RpcError::new(
+                        DEVICE_ERROR,
+                        format!("pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}; the copy was deleted"),
+                    ));
+                }
+            }
+            Ok(sha)
+        })();
+        let sha = match verified {
+            Ok(sha) => sha,
+            Err(e) => {
+                let _ = std::fs::remove_file(&local);
+                return Err(e);
+            }
+        };
         let path = local_path_string(&local);
         Ok(
             json!({ "tool": "pull_new", "text": format!("pulled {remote} ({size} bytes, size stable across two polls) to {path}"), "image_bytes": null, "path": path, "size": size, "sha256": sha, "phone_path": remote }),

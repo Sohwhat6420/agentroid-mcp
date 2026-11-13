@@ -818,6 +818,43 @@ fn pull_new_refuses_a_file_over_the_limit_and_never_overwrites_an_inbox_file() {
     });
 }
 
+/// The size limit is checked against what the phone says. A phone that says 4 bytes and then sends
+/// 5000 (the file grew after the check, or the phone lies) gets an error, and nothing stays in the inbox.
+#[test]
+fn a_pull_bigger_than_the_phone_said_is_refused_and_deleted() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-grew");
+        let h = start(DeviceMode::Full);
+        h.daemon.set_max_pull_bytes(16);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["big.bin".into()];
+            p.files.insert("/sdcard/d/big.bin".into(), vec![1; 5000]);
+            p.sizes = VecDeque::from([4, 4]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() })).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("the copy was deleted"),
+            "{r}"
+        );
+        assert!(
+            reached(&h).iter().any(|l| l.starts_with("pull ")),
+            "the pull ran: {:?}",
+            reached(&h)
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join("inbox")).unwrap().count(),
+            0,
+            "nothing is left in the inbox"
+        );
+    });
+}
+
 #[test]
 fn a_phone_file_name_becomes_a_plain_laptop_file_name() {
     use bridged::devtools::local_name;
