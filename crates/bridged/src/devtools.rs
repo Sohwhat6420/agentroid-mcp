@@ -81,10 +81,19 @@ fn arg<'a>(call: &'a Value, name: &str) -> Result<&'a str, RpcError> {
         })
 }
 
-/// A phone path: absolute, no control character, no `..` segment.
+/// A phone path: absolute, no control character, no `..` or `.` segment (also spelt with invisible
+/// characters), and no invisible character where the file guard decides (the storage root, or an
+/// `Android` folder and the one after it; see `fileguard::invisible_where_decided`). A `.` is
+/// refused, not dropped (`/sdcard/./Android/data/<pkg>` is another app's folder by a second
+/// spelling). A file name further down may hold a joiner or soft hyphen, as real names do.
 pub fn check_phone_path(p: &str) -> Result<(), RpcError> {
-    if !p.starts_with('/') || p.chars().any(char::is_control) || p.split('/').any(|s| s == "..") {
-        return Err(RpcError::new(INVALID_PARAMS, format!("invalid params: phone path {p:?} must be absolute, with no `..` and no control character")));
+    use agentroid_core::fileguard::{invisible_where_decided, is_dot_segment};
+    if !p.starts_with('/')
+        || p.chars().any(char::is_control)
+        || invisible_where_decided(p).is_some()
+        || p.split('/').any(is_dot_segment)
+    {
+        return Err(RpcError::new(INVALID_PARAMS, format!("invalid params: phone path {p:?} must be absolute, with no `..` or `.` segment, no control character and no invisible character in the storage root or an Android folder")));
     }
     Ok(())
 }
@@ -95,12 +104,17 @@ fn parse_sha(out: &str) -> Option<String> {
     (w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit())).then(|| w.to_ascii_lowercase())
 }
 
-/// A file name from the phone, made safe to use as a laptop file name.
+/// A file name from the phone, made safe to use as a laptop file name. Invisible characters (bidi
+/// controls among them) become `_` too: `invoice\u{202E}fdp.exe` would show in Explorer as
+/// `invoiceexe.pdf`.
 fn local_name(n: &str) -> String {
     let s: String = n
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if c.is_control()
+                || agentroid_core::fileguard::is_invisible(c)
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
                 '_'
             } else {
                 c
@@ -111,6 +125,30 @@ fn local_name(n: &str) -> String {
         "pulled_file".into()
     } else {
         s
+    }
+}
+
+/// A phone path for a message: invisible characters written as `\u{..}`, so a bidi override cannot
+/// reorder the text around it.
+fn shown(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for c in p.chars() {
+        if agentroid_core::fileguard::is_invisible(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The names `pull_new` passed over, for its message: the first ten, then how many more.
+fn passed_over(skipped: &[&str]) -> String {
+    const SHOWN: usize = 10;
+    if skipped.len() <= SHOWN {
+        format!("{skipped:?}")
+    } else {
+        format!("{:?} and {} more", &skipped[..SHOWN], skipped.len() - SHOWN)
     }
 }
 
@@ -426,10 +464,13 @@ impl Daemon {
             }
         };
         let listing = self.sh(t, &format!("ls -1tp {}", diagnose::quote(dir)))?;
+        // a newer name the file guard would refuse (a shell metacharacter, say) is passed over and
+        // named in the answer, rather than failing the whole call
+        let mut skipped: Vec<&str> = Vec::new();
         let newest = listing
             .lines()
             .map(str::trim)
-            .find(|n| {
+            .filter(|n| {
                 !n.is_empty()
                     && !n.ends_with('/')
                     && !n.starts_with('.')
@@ -438,7 +479,27 @@ impl Daemon {
                     && !n.ends_with(".part")
                     && !n.ends_with(".crdownload")
             })
-            .ok_or_else(|| RpcError::new(DEVICE_ERROR, format!("pull_new: no file in {dir}")))?
+            .find(|n| {
+                let ok = agentroid_core::fileguard::path_syntax_ok(&format!(
+                    "{}/{n}",
+                    dir.trim_end_matches('/')
+                ))
+                .is_ok();
+                if !ok {
+                    skipped.push(n);
+                }
+                ok
+            })
+            .ok_or_else(|| {
+                RpcError::new(
+                    DEVICE_ERROR,
+                    if skipped.is_empty() {
+                        format!("pull_new: no file in {dir}")
+                    } else {
+                        format!("pull_new: no file in {dir} that the file guard accepts (passed over {})", passed_over(&skipped))
+                    },
+                )
+            })?
             .to_string();
         if newest.contains('/') || newest.chars().any(char::is_control) {
             return Err(RpcError::new(
@@ -460,7 +521,7 @@ impl Daemon {
                 .map_err(|_| {
                     RpcError::new(
                         DEVICE_ERROR,
-                        format!("pull_new: cannot read the size of {remote}"),
+                        format!("pull_new: cannot read the size of {}", shown(&remote)),
                     )
                 })?;
             if prev == Some(n) {
@@ -475,7 +536,10 @@ impl Daemon {
         let size = stable.ok_or_else(|| {
             RpcError::new(
                 DEVICE_ERROR,
-                format!("pull_new: {remote} was still changing after {MAX_POLLS} polls"),
+                format!(
+                    "pull_new: {} was still changing after {MAX_POLLS} polls",
+                    shown(&remote)
+                ),
             )
         })?;
         std::fs::create_dir_all(&local_dir).map_err(|e| {
@@ -509,20 +573,36 @@ impl Daemon {
         if got != size {
             return Err(RpcError::new(
                 DEVICE_ERROR,
-                format!("pull_new: {remote} is {size} bytes on the phone but {got} on the laptop"),
+                format!(
+                    "pull_new: {} is {size} bytes on the phone but {got} on the laptop",
+                    shown(&remote)
+                ),
             ));
         }
         if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
             if theirs != sha {
                 return Err(RpcError::new(
                     DEVICE_ERROR,
-                    format!("pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}"),
+                    format!(
+                        "pull_new: sha256 mismatch for {}: phone {theirs}, laptop {sha}",
+                        shown(&remote)
+                    ),
                 ));
             }
         }
         let path = local_path_string(&local);
+        let mut text = format!(
+            "pulled {} ({size} bytes, size stable across two polls) to {path}",
+            shown(&remote)
+        );
+        if !skipped.is_empty() {
+            text.push_str(&format!(
+                "; passed over newer names the file guard refuses: {}",
+                passed_over(&skipped)
+            ));
+        }
         Ok(
-            json!({ "tool": "pull_new", "text": format!("pulled {remote} ({size} bytes, size stable across two polls) to {path}"), "image_bytes": null, "path": path, "size": size, "sha256": sha, "phone_path": remote }),
+            json!({ "tool": "pull_new", "text": text, "image_bytes": null, "path": path, "size": size, "sha256": sha, "phone_path": remote }),
         )
     }
 }
