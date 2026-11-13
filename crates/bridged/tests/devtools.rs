@@ -612,6 +612,107 @@ fn pull_new_and_push_reject_invisible_characters_before_touching_the_phone() {
     });
 }
 
+/// Real file names keep their invisible characters: a Persian name with a ZWNJ, the family emoji
+/// (ZWJs) and a soft hyphen are pushed to and pulled from `/sdcard/Download/`. Only the storage root
+/// and an `Android` folder (where the guard decides) refuse them.
+#[test]
+fn push_and_pull_new_allow_joiners_and_soft_hyphens_in_file_names() {
+    const NAMES: [&str; 3] = [
+        "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}.pdf",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg",
+        "re\u{AD}port.pdf",
+    ];
+    run(async {
+        let dir = tmp_dir("devtools-joiner-names");
+        let local = local_file(&dir, "f.bin", b"abc");
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        for n in NAMES {
+            let remote = format!("/sdcard/Download/{n}");
+            let r = c
+                .tool(
+                    POCO,
+                    json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": remote }),
+                )
+                .await;
+            assert!(r["result"].is_object(), "push {n:?}: {r}");
+            {
+                let mut p = h.phone.lock().unwrap();
+                p.listing = vec![n.to_string()];
+                p.sizes = VecDeque::from([3, 3]);
+            }
+            let r = c
+                .tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() }))
+                .await;
+            assert_eq!(r["result"]["phone_path"], remote, "pull {n:?}: {r}");
+            assert_eq!(
+                std::fs::read(r["result"]["path"].as_str().unwrap()).unwrap(),
+                b"abc"
+            );
+        }
+        // still refused where the guard decides, before anything reaches the phone
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": "/sdcard/Andr\u{200D}oid/data/x" }),
+            )
+            .await;
+        assert_eq!(code(&r), INVALID_PARAMS, "{r}");
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "pull_new", "dir": "/sdcard/Andr\u{200D}oid/data/x", "poll_ms": 0 }),
+            )
+            .await;
+        assert_eq!(code(&r), INVALID_PARAMS, "{r}");
+        no_command_reached(&h);
+    });
+}
+
+/// `pull_new` passes over a newer file whose name the file guard would refuse (a shell
+/// metacharacter, an invisible character where the guard decides) and pulls the next one, naming
+/// what it passed over; with nothing else to pull it fails without pulling anything.
+#[test]
+fn pull_new_passes_over_a_newest_name_the_guard_refuses() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-skip");
+        let h = start(DeviceMode::Full);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["it's.png".into(), "Andr\u{200D}oid".into(), "ok.png".into()];
+            p.files.insert("/sdcard/ok.png".into(), b"okay".to_vec());
+            p.sizes = VecDeque::from([4, 4]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() })).await;
+        assert_eq!(r["result"]["phone_path"], "/sdcard/ok.png", "{r}");
+        let text = r["result"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("passed over") && text.contains("it's.png"),
+            "{text}"
+        );
+        assert!(!reached(&h).iter().any(|l| l.contains("it's")));
+        // nothing the guard accepts: an error that names what was passed over, and no pull
+        let h = start(DeviceMode::Full);
+        h.phone.lock().unwrap().listing = vec!["a;b.png".into()];
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0 }),
+            )
+            .await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        assert!(
+            r["error"]["message"].as_str().unwrap().contains("a;b.png"),
+            "{r}"
+        );
+        assert!(!reached(&h).iter().any(|l| l.starts_with("pull ")));
+    });
+}
+
 /// The laptop side is fenced: `push` reads only the outbox and `pull_new` writes only the inbox.
 /// A file elsewhere, a `..` name, or a pull into another folder is REFUSED (class `outbox` /
 /// `inbox`) and nothing reaches the phone.

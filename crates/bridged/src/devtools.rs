@@ -81,15 +81,19 @@ fn arg<'a>(call: &'a Value, name: &str) -> Result<&'a str, RpcError> {
         })
 }
 
-/// A phone path: absolute, no control or invisible character, no `..` or `.` segment. A `.` is refused, not
-/// dropped (`/sdcard/./Android/data/<pkg>` is another app's folder by a second spelling).
+/// A phone path: absolute, no control character, no `..` or `.` segment (also spelt with invisible
+/// characters), and no invisible character where the file guard decides (the storage root, or an
+/// `Android` folder and the one after it; see `fileguard::invisible_where_decided`). A `.` is
+/// refused, not dropped (`/sdcard/./Android/data/<pkg>` is another app's folder by a second
+/// spelling). A file name further down may hold a joiner or soft hyphen, as real names do.
 pub fn check_phone_path(p: &str) -> Result<(), RpcError> {
+    use agentroid_core::fileguard::{invisible_where_decided, is_dot_segment};
     if !p.starts_with('/')
-        || p.chars()
-            .any(|c| c.is_control() || agentroid_core::fileguard::is_invisible(c))
-        || p.split('/').any(|s| s == ".." || s == ".")
+        || p.chars().any(char::is_control)
+        || invisible_where_decided(p).is_some()
+        || p.split('/').any(is_dot_segment)
     {
-        return Err(RpcError::new(INVALID_PARAMS, format!("invalid params: phone path {p:?} must be absolute, with no `..` or `.` segment and no control or invisible character")));
+        return Err(RpcError::new(INVALID_PARAMS, format!("invalid params: phone path {p:?} must be absolute, with no `..` or `.` segment, no control character and no invisible character in the storage root or an Android folder")));
     }
     Ok(())
 }
@@ -431,10 +435,13 @@ impl Daemon {
             }
         };
         let listing = self.sh(t, &format!("ls -1tp {}", diagnose::quote(dir)))?;
+        // a newer name the file guard would refuse (a shell metacharacter, say) is passed over and
+        // named in the answer, rather than failing the whole call
+        let mut skipped: Vec<&str> = Vec::new();
         let newest = listing
             .lines()
             .map(str::trim)
-            .find(|n| {
+            .filter(|n| {
                 !n.is_empty()
                     && !n.ends_with('/')
                     && !n.starts_with('.')
@@ -443,7 +450,27 @@ impl Daemon {
                     && !n.ends_with(".part")
                     && !n.ends_with(".crdownload")
             })
-            .ok_or_else(|| RpcError::new(DEVICE_ERROR, format!("pull_new: no file in {dir}")))?
+            .find(|n| {
+                let ok = agentroid_core::fileguard::path_syntax_ok(&format!(
+                    "{}/{n}",
+                    dir.trim_end_matches('/')
+                ))
+                .is_ok();
+                if !ok {
+                    skipped.push(n);
+                }
+                ok
+            })
+            .ok_or_else(|| {
+                RpcError::new(
+                    DEVICE_ERROR,
+                    if skipped.is_empty() {
+                        format!("pull_new: no file in {dir}")
+                    } else {
+                        format!("pull_new: no file in {dir} that the file guard accepts (passed over {skipped:?})")
+                    },
+                )
+            })?
             .to_string();
         if newest.contains('/') || newest.chars().any(char::is_control) {
             return Err(RpcError::new(
@@ -526,8 +553,15 @@ impl Daemon {
             }
         }
         let path = local_path_string(&local);
+        let mut text =
+            format!("pulled {remote} ({size} bytes, size stable across two polls) to {path}");
+        if !skipped.is_empty() {
+            text.push_str(&format!(
+                "; passed over newer names the file guard refuses: {skipped:?}"
+            ));
+        }
         Ok(
-            json!({ "tool": "pull_new", "text": format!("pulled {remote} ({size} bytes, size stable across two polls) to {path}"), "image_bytes": null, "path": path, "size": size, "sha256": sha, "phone_path": remote }),
+            json!({ "tool": "pull_new", "text": text, "image_bytes": null, "path": path, "size": size, "sha256": sha, "phone_path": remote }),
         )
     }
 }
