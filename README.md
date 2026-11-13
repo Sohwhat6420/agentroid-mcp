@@ -31,11 +31,12 @@ It is meant for developers and testers who want an agent to drive an Android dev
 - **The screen stays on while you work.** On a `full` phone, a session's first call raises the screen timeout to 30 minutes and turns on stay-awake while plugged in. Your own values come back when the last session disconnects, after 15 minutes with no call, or when the daemon stops; a value you changed meanwhile is left alone. Both changes are written to `leases.json` first, so after a crash the next daemon puts them back. Lock, PIN and password settings are never touched. Emulators are skipped, and so are `read_only` phones, except the one hardcoded protected phone, which gets these two settings and nothing else (see [docs/SAFETY.md](docs/SAFETY.md)). The hold runs in the background, so no call waits for it. `AGENTROID_NO_STAY_AWAKE=1` turns it off.
 - **Jobs on the daemon.** `job_start` runs a YAML flow, or a short list of steps in one app, on the daemon so that each step does not cost a model round trip. Steps are written to a journal before they are sent, a job can be paused, stopped and resumed, and a finished run can be saved as a replayable flow (`record`), with an export to Maestro commands.
 - **An optional helper app.** The `android/` folder holds an Android helper (accessibility service, input method, link service). It is built and unit-tested, but this build's live transport has no link to it yet, so no tool needs it today. See [Quick start](#quick-start).
-- **No telemetry.** Nothing is sent to the project or to any analytics service. There are two optional outbound paths, both to [ntfy](https://ntfy.sh), and both are off until you set them up:
+- **No telemetry.** Nothing is sent to the project or to any analytics service. There are three optional outbound paths, all to [ntfy](https://ntfy.sh), and all are off until you set them up:
   - **Job pushes.** If you create `%USERPROFILE%\.agentroid\ntfy-topic.txt` (one line: a private topic name), the MCP server posts a short push when a job becomes stuck or done. It carries the run id, the flow name and step counts, not screen content. Set `AGENTROID_NO_PUSH=1` to turn it off.
   - **Approval requests.** If you start the daemon with `--approval-topic-file <file>`, every `asked` action posts an approval request to that topic and waits for your Allow or Deny. The request carries the tool, the phone's **hardware serial**, the guard's reason (which quotes the matched on-screen label, such as `"Delete"`) and the target label. The default server is `https://ntfy.sh`; `--ntfy-base <url>` points it at your own. `AGENTROID_NO_PUSH` does not affect this path.
+  - **Screen take-over asks (INTERIM).** `agentroid ask-screen --route <file>` posts one Yes / No push when a session wants a phone that is in use. It carries the label you pass with `--name` (not the serial), the minutes asked for, the session's reason and what made the phone count as in use (for example `com.whatsapp is open`). See [Ask before taking over a screen](#ask-before-taking-over-a-screen-interim).
 
-  Treat both topic names as secrets, and prefer a self-hosted ntfy server.
+  Treat the topic names as secrets, and prefer a self-hosted ntfy server.
 
 ## Safety model
 
@@ -182,6 +183,57 @@ What was measured, all on one phone (Xiaomi POCO X6 Pro, Android 15, HyperOS 2.0
 - *Not tested:* a real router outage, and a second access point (which needs its one prompt tapped).
 
 Limits: on this phone the Wi-Fi itself sometimes took 4 to 30 minutes to rejoin after being switched off with the screen off and the phone unplugged, and the adb link came back about 40 s after the Wi-Fi did. The keeper cannot shorten that. A later version wakes the screen for a few seconds while the network is gone to speed the rejoin; it is installed but has not been seen to fire in a test, so no claim is made for it. A flat battery stops everything. The 5555 address does not survive a reboot (the keeper restores Wireless debugging, and the TLS entry reconnects, but `adb tcpip 5555` must be run again).
+
+## Ask before taking over a screen (INTERIM)
+
+> **INTERIM.** For now the Yes is a plain tap on a push button. A later version will ask for the owner's fingerprint (a passkey) before a Yes counts. Until then, anyone who can tap the push on the owner's phone can say Yes. The push title starts with `INTERIM` so this is never forgotten.
+
+An agent that drives a phone someone is using takes the screen out of their hands. `agentroid ask-screen` is the one check to run first, whether the session then uses Agentroid's tools or raw adb:
+
+```text
+agentroid ask-screen --device <serial|ip:port> --minutes N --why "what and why" --session "who is asking" --route route.json
+```
+
+It prints one line of JSON and exits **0 (allowed)** or **1 (refused)**. Exit 2 is a usage error, and 3 means the phone could not be read.
+
+- **In use** means the screen is on and any of these holds:
+  - the focused app is one people type in: the Claude app (`com.anthropic.claude`), WhatsApp, Gmail, or any `--in-use-app <package>`;
+  - the keyboard is open (`mInputShown` in `dumpsys input_method`);
+  - the last touch was under `--idle-min` minutes ago (default 5; read from `dumpsys power`, which states it directly as the display group's `lastUserActivityTime ... ms ago`);
+  - the screen is held on: a screen wake lock in `dumpsys power` (a video, or a reader that keeps the screen awake), or the proximity lock a call holds while the phone is at someone's ear.
+
+  Anything it cannot read counts as in use, and so does any screen state other than Awake, Asleep, Dozing or Dreaming. A phone on the protected list answers only `dumpsys power`, so it counts as in use whenever its screen is on.
+- **Not in use** (the screen is off or dozing; or on, untouched, with nothing holding it on, no keyboard and no listed app): allowed at once, with no push. Run the command again before each burst of actions.
+- **In use:** one push with what the session wants and for about how long, with Allow and Deny buttons. Answer within `--wait-s` seconds (default 90, from 30 to 300). With the default it usually ends within about 100 s, but slow adb reads and polls can add up to about 45 s more, so give the command a tool timeout of at least `--wait-s` + 60 s (150 s with the default).
+  - **Allow** gives a lease of 1.5 × N minutes (at most 60) to that session and purpose only: the same `--session` (default: the `--why` text) and the same `--why`. Calls inside the lease are allowed without another push. Another session, or the same one asking for something else, is asked about on its own.
+  - **Deny, or no answer,** refuses. Every call for that phone in the next 5 minutes, from any session, is then refused without a push, even if the phone is put down meanwhile.
+  - **One ask at a time:** while an ask is waiting on the owner, other calls for that phone are refused without a second push. If that marker cannot be saved, the call is refused and nothing is sent.
+  - If the push could not be sent, the call is refused, but nothing is held against the next ask.
+- **State** (the leases, the cool-down, the pending ask and a log of every decision, `ask-screen.log.jsonl`) is kept in `--state-dir`. The default is `%LOCALAPPDATA%\agentroid\ask-screen`, or `$AGENTROID_STATE_DIR/ask-screen`. Files are named by a hash of the device, not its serial. Each write goes to a temporary file and is renamed into place, and only what changed is written, so another session's lease is kept. Values further ahead than the program ever writes are ignored, so a damaged or left-over file can only make it ask. The file is not signed: anyone who can write the state folder can forge a lease of up to 60 minutes, so keep it in your own profile.
+
+The route file names one or more ntfy servers. The ask goes to every one that can carry it, and an answer from any of them counts:
+
+```json
+{"routes": [
+  {"base": "http://127.0.0.1:2586", "tap_base": "http://<address the phone reaches>:2586",
+   "topic_file": "alerts.topic", "inbound_topic_file": "taps.topic",
+   "token_file": "sender.token", "tap_token_file": "tap.token", "login_topics": true},
+  {"base": "https://ntfy.sh", "topic_file": "ntfy-topic.key", "inbound_topic_file": "ntfy-answers.key"}
+]}
+```
+
+- `token_file` logs in to a server that needs one. The token goes to curl on its standard input, never on its command line, and only to an `https` or loopback `base` (over plain http it would travel in clear).
+- `tap_token_file` is a separate token the Allow / Deny buttons carry. It sits inside the push, so give it write access to the answer topic and nothing else.
+- `tap_base` is the address the phone's buttons post to, when it differs from `base`.
+- A `base` with a user part (`user@host`) is refused wherever a token or `login_topics` is set, and only real loopback addresses (`localhost`, `127.x.x.x`, `::1`) count as loopback.
+- Topics must be 24 to 64 hard-to-guess characters, unless the route says `"login_topics": true`: the server refuses anyone without a login (for ntfy, `auth-default-access: deny-all`), so a short name such as `alerts` is safe. That needs a `token_file` and is refused for ntfy.sh, where anyone may read a topic they can guess.
+- Every call to curl, with or without a token, passes the URL (which holds the topic) and the body on standard input and fails on an HTTP error status, so a refused or rate-limited push is never counted as sent.
+- Relative paths are read from the route file's folder.
+
+**Known limits of the interim version:**
+- The push usually arrives on the very phone being asked about. A session that drives that phone (or posts `allow <id>` to the answer topic itself, with the answer token from the same machine) can say its own Yes. The check stops honest sessions from interrupting; it does not stop a hostile one. The fingerprint step is meant to close this.
+- It is a check, not a lock: nothing yet stops a session that skips it. Agentroid's daemon does not call it on its own yet.
+- There is no file lock. Two sessions that ask in the same instant can both send a push.
 
 ## Demo
 

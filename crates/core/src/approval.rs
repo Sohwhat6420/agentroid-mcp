@@ -374,6 +374,17 @@ pub trait Http {
     fn post_json(&mut self, url: &str, body: &str) -> Result<String, String>;
     /// GET `url`; returns the response body.
     fn get(&mut self, url: &str) -> Result<String, String>;
+    /// As [`Http::post_json`], sending `Authorization: Bearer <token>`. The default refuses, so a
+    /// client that cannot keep a token off its command line never sends one.
+    fn post_json_auth(&mut self, url: &str, body: &str, bearer: &str) -> Result<String, String> {
+        let _ = (url, body, bearer);
+        Err("this HTTP client cannot send a token".into())
+    }
+    /// As [`Http::get`], sending `Authorization: Bearer <token>`. The default refuses.
+    fn get_auth(&mut self, url: &str, bearer: &str) -> Result<String, String> {
+        let _ = (url, bearer);
+        Err("this HTTP client cannot send a token".into())
+    }
 }
 
 /// A topic name as the habit tracker requires: 24 to 64 of `[A-Za-z0-9_-]`.
@@ -381,6 +392,48 @@ pub fn valid_topic(t: &str) -> bool {
     (24..=64).contains(&t.len())
         && t.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A topic on a server that needs a login: 1 to 64 of `[A-Za-z0-9_-]`. The token, not the name,
+/// keeps it private there, so a short name such as `alerts` is fine.
+pub fn valid_login_topic(t: &str) -> bool {
+    (1..=64).contains(&t.len())
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Read a bearer token from its key file: 8 to 200 printable ASCII characters, no spaces. The
+/// value is never logged and never put in an error.
+pub fn read_token(path: &Path) -> Result<String, String> {
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| format!("token file {}: {}", path.display(), e.kind()))?;
+    let t = s.trim();
+    if (8..=200).contains(&t.len()) && t.chars().all(|c| c.is_ascii_graphic()) {
+        Ok(t.to_string())
+    } else {
+        Err(format!(
+            "token file {} does not hold a token (8-200 printable characters)",
+            path.display()
+        ))
+    }
+}
+
+/// Read a topic from a key file, with the rule for a server that needs a login when `login`.
+fn read_topic_for(path: &Path, login: bool) -> Result<String, String> {
+    if !login {
+        return read_topic(path);
+    }
+    let s =
+        std::fs::read_to_string(path).map_err(|e| format!("topic file {}: {e}", path.display()))?;
+    let t = s.trim();
+    if valid_login_topic(t) {
+        Ok(t.to_string())
+    } else {
+        Err(format!(
+            "topic file {} does not hold a topic (1-64 of [A-Za-z0-9_-])",
+            path.display()
+        ))
+    }
 }
 
 /// Read a topic from its key file. The value is never logged.
@@ -408,6 +461,21 @@ pub struct NtfyConfig {
     /// `topic_file` (one private topic for both directions).
     pub inbound_topic_file: Option<PathBuf>,
     pub title: String,
+    /// Key file holding a bearer token, for a server that needs a login (a self-hosted ntfy with
+    /// `auth-default-access: deny-all`). Sent on publish and poll through curl's stdin, never on
+    /// its command line. With a token, short topic names are accepted.
+    pub token_file: Option<PathBuf>,
+    /// Key file holding a write-only token the Allow / Deny buttons carry, so the phone can post
+    /// its answer to a server that needs a login. It sits inside the push, so give it write access
+    /// to the inbound topic and nothing else.
+    pub tap_token_file: Option<PathBuf>,
+    /// The base URL the phone's buttons post to, when it differs from `base` (a loopback server
+    /// the phone reaches at a tailnet address). Defaults to `base`.
+    pub tap_base: Option<String>,
+    /// The server refuses anonymous reads and writes (a self-hosted ntfy with `auth-default-access:
+    /// deny-all`), so a short topic name such as `alerts` is safe. Only with `token_file` set, and
+    /// never for ntfy.sh, where anyone may read an unreserved topic.
+    pub login_topics: bool,
 }
 
 impl NtfyConfig {
@@ -417,6 +485,10 @@ impl NtfyConfig {
             topic_file: topic_file.into(),
             inbound_topic_file: None,
             title: "Agentroid asks".into(),
+            token_file: None,
+            tap_token_file: None,
+            tap_base: None,
+            login_topics: false,
         }
     }
 }
@@ -432,28 +504,80 @@ impl<H: Http> NtfyChannel<H> {
     }
 
     fn topics(&self) -> Result<(String, String), String> {
-        let out = read_topic(&self.cfg.topic_file)?;
+        let login = self.cfg.token_file.is_some() && self.cfg.login_topics;
+        if login {
+            match host_of(&self.cfg.base) {
+                None => return Err("login_topics needs a plain http(s)://host[:port] base".into()),
+                Some(h) if h == "ntfy.sh" || h.ends_with(".ntfy.sh") => {
+                    return Err("short topics are never safe on ntfy.sh: drop login_topics".into())
+                }
+                Some(_) => {}
+            }
+        }
+        let out = read_topic_for(&self.cfg.topic_file, login)?;
         let inb = match &self.cfg.inbound_topic_file {
-            Some(p) => read_topic(p)?,
+            Some(p) => read_topic_for(p, login)?,
             None => out.clone(),
         };
         Ok((out, inb))
     }
 
+    /// The login token and the button token, when configured. A configured file that cannot be
+    /// read makes the channel unavailable (the ask is refused), never anonymous.
+    fn tokens(&self) -> Result<(Option<String>, Option<String>), String> {
+        let t = match &self.cfg.token_file {
+            Some(p) => {
+                // a token travels in clear over plain http, so only to this machine
+                let host = host_of(&self.cfg.base)
+                    .ok_or("a token needs a plain http(s)://host[:port] base")?;
+                if !self.cfg.base.starts_with("https://") && !is_loopback_host(&host) {
+                    return Err("a token is sent only to an https or loopback base".into());
+                }
+                Some(read_token(p)?)
+            }
+            None => None,
+        };
+        let tap = match &self.cfg.tap_token_file {
+            Some(p) => Some(read_token(p)?),
+            None => None,
+        };
+        Ok((t, tap))
+    }
+
     /// The JSON ntfy publishes: the ask, plus Allow and Deny `http` actions that POST the exact
     /// grammar line to the inbound topic. Public so tests can check the body without a network.
     pub fn publish_body(&self, req: &Request, topic: &str, inbound: &str) -> String {
-        let inbound_url = format!("{}/{inbound}", self.cfg.base.trim_end_matches('/'));
+        self.publish_body_with(req, topic, inbound, None)
+    }
+
+    /// As [`NtfyChannel::publish_body`], with the buttons posting to `tap_base` (when set) and
+    /// carrying `tap_token` (when given) as their `Authorization` header.
+    pub fn publish_body_with(
+        &self,
+        req: &Request,
+        topic: &str,
+        inbound: &str,
+        tap_token: Option<&str>,
+    ) -> String {
+        let base = self.cfg.tap_base.as_deref().unwrap_or(&self.cfg.base);
+        let inbound_url = format!("{}/{inbound}", base.trim_end_matches('/'));
+        let button = |label: &str, verb: &str| {
+            let mut b = serde_json::json!({
+                "action": "http", "label": label, "url": inbound_url, "method": "POST",
+                "body": format!("{verb} {}", req.id), "clear": true
+            });
+            if let Some(t) = tap_token {
+                b["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
+            }
+            b
+        };
         serde_json::json!({
             "topic": topic,
             "title": self.cfg.title,
             "message": req.message(),
             "priority": 4,
             "tags": ["lock"],
-            "actions": [
-                { "action": "http", "label": "Allow", "url": inbound_url, "method": "POST", "body": format!("allow {}", req.id), "clear": true },
-                { "action": "http", "label": "Deny", "url": inbound_url, "method": "POST", "body": format!("deny {}", req.id), "clear": true }
-            ]
+            "actions": [button("Allow", "allow"), button("Deny", "deny")]
         })
         .to_string()
     }
@@ -494,22 +618,157 @@ impl<H: Http> Channel for NtfyChannel<H> {
     }
     fn send(&mut self, req: &Request) -> Result<(), String> {
         let (topic, inbound) = self.topics()?;
-        let body = self.publish_body(req, &topic, &inbound);
+        let (token, tap) = self.tokens()?;
+        let body = self.publish_body_with(req, &topic, &inbound, tap.as_deref());
         let url = format!("{}/", self.cfg.base.trim_end_matches('/'));
+        let secrets = [
+            topic.as_str(),
+            inbound.as_str(),
+            token.as_deref().unwrap_or(""),
+            tap.as_deref().unwrap_or(""),
+        ];
         // the topic is in the body, never in a log line
-        self.http
-            .post_json(&url, &body)
-            .map(|_| ())
-            .map_err(|e| format!("publish failed: {}", scrub(&e, &[&topic, &inbound])))
+        match &token {
+            Some(t) => self.http.post_json_auth(&url, &body, t),
+            None => self.http.post_json(&url, &body),
+        }
+        .map(|_| ())
+        .map_err(|e| format!("publish failed: {}", scrub(&e, &secrets)))
     }
     fn poll(&mut self, req: &Request) -> Result<Vec<Inbound>, String> {
         let (topic, inbound) = self.topics()?;
+        let (token, _) = self.tokens()?;
         let url = self.poll_url(req, &inbound);
-        let text = self
-            .http
-            .get(&url)
-            .map_err(|e| format!("poll failed: {}", scrub(&e, &[&topic, &inbound])))?;
+        let secrets = [
+            topic.as_str(),
+            inbound.as_str(),
+            token.as_deref().unwrap_or(""),
+        ];
+        let text = match &token {
+            Some(t) => self.http.get_auth(&url, t),
+            None => self.http.get(&url),
+        }
+        .map_err(|e| format!("poll failed: {}", scrub(&e, &secrets)))?;
         Ok(parse_ntfy_lines(&text))
+    }
+}
+
+/// The host of an `http(s)://host[:port]/...` URL, lower-cased and without a trailing dot (an IP
+/// literal with one is refused). `None`
+/// for anything else, including a user part (`http://127.0.0.1@far.example/` goes to far.example),
+/// so a check on the host can never be fooled by one.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('@') || authority.contains('\\') {
+        return None;
+    }
+    // only the characters a plain host name or IP literal is made of, so a percent-encoded name
+    // (`ntfy%2esh`, which curl decodes to ntfy.sh) never parses as some other host
+    let (host, after) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let (h, after) = v6.split_once(']')?;
+            if !h
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+            {
+                return None;
+            }
+            (h, after)
+        }
+        None => {
+            let (h, after) = match authority.find(':') {
+                Some(i) => (&authority[..i], &authority[i..]),
+                None => (authority, ""),
+            };
+            if !h
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return None;
+            }
+            (h, after)
+        }
+    };
+    // nothing after the host but an optional `:port` of digits
+    match after.strip_prefix(':') {
+        None if after.is_empty() => {}
+        Some(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {}
+        _ => return None,
+    }
+    let trimmed = host.trim_end_matches('.');
+    // curl takes `127.0.0.1.` for a name to look up in DNS, not an IP literal, so it is no proof of
+    // loopback: an IP literal with a trailing dot is refused (a name such as `localhost.` is kept)
+    if trimmed.len() != host.len() && trimmed.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let host = trimmed.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// `localhost`, or a loopback IP literal (`127.x.x.x`, `::1`). A name such as `127.example` is not.
+fn is_loopback_host(h: &str) -> bool {
+    h == "localhost"
+        || h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Several channels as one: the ask goes out on every channel that can carry it (it is refused
+/// only when none can), and an answer from any of them counts. Each channel's event ids are
+/// prefixed with its position, so the same id on two servers is two events. Used while pushes
+/// move from one server to another and the phone may be listening on either.
+pub struct AnyChannel {
+    channels: Vec<Box<dyn Channel + Send>>,
+}
+
+impl AnyChannel {
+    pub fn new(channels: Vec<Box<dyn Channel + Send>>) -> AnyChannel {
+        AnyChannel { channels }
+    }
+}
+
+impl Channel for AnyChannel {
+    fn name(&self) -> &'static str {
+        match self.channels.as_slice() {
+            [one] => one.name(),
+            _ => "any",
+        }
+    }
+    fn send(&mut self, req: &Request) -> Result<(), String> {
+        let mut errs = vec![];
+        let mut sent = 0;
+        for c in &mut self.channels {
+            match c.send(req) {
+                Ok(()) => sent += 1,
+                Err(e) => errs.push(e),
+            }
+        }
+        if sent > 0 {
+            Ok(())
+        } else if errs.is_empty() {
+            Err("no channel configured".into())
+        } else {
+            Err(errs.join("; "))
+        }
+    }
+    fn poll(&mut self, req: &Request) -> Result<Vec<Inbound>, String> {
+        let mut out = vec![];
+        let mut errs = vec![];
+        for (i, c) in self.channels.iter_mut().enumerate() {
+            match c.poll(req) {
+                Ok(evs) => out.extend(evs.into_iter().map(|mut e| {
+                    e.event_id = format!("{i}:{}", e.event_id);
+                    e
+                })),
+                Err(e) => errs.push(e),
+            }
+        }
+        if out.is_empty() && !errs.is_empty() && errs.len() == self.channels.len() {
+            return Err(errs.join("; "));
+        }
+        Ok(out)
     }
 }
 
@@ -578,23 +837,59 @@ impl CurlHttp {
 }
 
 impl Http for CurlHttp {
+    // Every call passes its URL (which holds the topic, a secret on a public server) and body to
+    // curl in a config on stdin, never on the command line, and fails on an HTTP error status.
     fn post_json(&mut self, url: &str, body: &str) -> Result<String, String> {
-        self.run(
-            &[
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-                url,
-            ],
-            Some(body),
-        )
+        let cfg = format!(
+            "url = {}\nfail-with-body\nheader = {}\ndata-binary = {}\n",
+            curl_quote(url),
+            curl_quote("Content-Type: application/json"),
+            curl_quote(body)
+        );
+        self.run(&["--config", "-"], Some(&cfg))
     }
     fn get(&mut self, url: &str) -> Result<String, String> {
-        self.run(&[url], None)
+        let cfg = format!("url = {}\nfail-with-body\n", curl_quote(url));
+        self.run(&["--config", "-"], Some(&cfg))
     }
+    fn post_json_auth(&mut self, url: &str, body: &str, bearer: &str) -> Result<String, String> {
+        let cfg = format!(
+            "url = {}\nfail-with-body\nheader = {}\nheader = {}\ndata-binary = {}\n",
+            curl_quote(url),
+            curl_quote("Content-Type: application/json"),
+            curl_quote(&format!("Authorization: Bearer {bearer}")),
+            curl_quote(body)
+        );
+        self.run(&["--config", "-"], Some(&cfg))
+    }
+    fn get_auth(&mut self, url: &str, bearer: &str) -> Result<String, String> {
+        let cfg = format!(
+            "url = {}\nfail-with-body\nheader = {}\n",
+            curl_quote(url),
+            curl_quote(&format!("Authorization: Bearer {bearer}"))
+        );
+        self.run(&["--config", "-"], Some(&cfg))
+    }
+}
+
+/// A value for a curl config file: double-quoted, with `\\`, `"` and line breaks escaped. The
+/// token travels in this config on curl's stdin, so it is never on a command line another
+/// process could read.
+pub fn curl_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1000,5 +1295,324 @@ mod tests {
             ),
             "HTTP 500 for /<topic>"
         );
+    }
+
+    /// One HTTP exchange on a loopback port: returns the port and a handle giving the raw request.
+    fn one_shot_server(status: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+                .unwrap();
+            let mut buf = vec![];
+            let mut chunk = [0u8; 4096];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        (port, h)
+    }
+
+    const TEST_TOKEN: &str = "tk_TESTTOKEN0123456789abcdefghij";
+
+    #[test]
+    fn curl_sends_the_token_as_a_header_and_the_body_intact() {
+        let (port, h) = one_shot_server("200 OK");
+        let body = r#"{"m":"quote \" backslash \\ newline \n end","t":"alerts"}"#;
+        let mut c = CurlHttp::default();
+        let out = c
+            .post_json_auth(&format!("http://127.0.0.1:{port}/"), body, TEST_TOKEN)
+            .unwrap();
+        assert_eq!(out, "{}");
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST / HTTP/1.1"), "{req}");
+        assert!(
+            req.contains(&format!("Authorization: Bearer {TEST_TOKEN}")),
+            "{req}"
+        );
+        assert!(req.ends_with(body), "the body arrives byte for byte: {req}");
+        // and a GET with the token
+        let (port, h) = one_shot_server("200 OK");
+        c.get_auth(
+            &format!("http://127.0.0.1:{port}/taps/json?poll=1"),
+            TEST_TOKEN,
+        )
+        .unwrap();
+        let req = h.join().unwrap();
+        assert!(
+            req.starts_with("GET /taps/json?poll=1 HTTP/1.1") && req.contains(TEST_TOKEN),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn curl_reports_a_refused_login_as_an_error() {
+        // positive control for fail-with-body: without it a 401 would read as a sent ask
+        let (port, h) = one_shot_server("401 Unauthorized");
+        let r = CurlHttp::default().post_json_auth(
+            &format!("http://127.0.0.1:{port}/"),
+            "{}",
+            TEST_TOKEN,
+        );
+        h.join().unwrap();
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[test]
+    fn a_client_without_token_support_refuses_rather_than_sending_anonymously() {
+        let mut h = RecHttp {
+            posts: vec![],
+            gets: vec![],
+            reply: String::new(),
+        };
+        assert!(h.post_json_auth("http://x/", "{}", TEST_TOKEN).is_err());
+        assert!(h.get_auth("http://x/", TEST_TOKEN).is_err());
+        assert!(h.posts.is_empty() && h.gets.is_empty());
+    }
+
+    type AuthLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+    struct AuthHttp(AuthLog);
+    impl Http for AuthHttp {
+        fn post_json(&mut self, _: &str, _: &str) -> Result<String, String> {
+            Err("anonymous post".into())
+        }
+        fn get(&mut self, _: &str) -> Result<String, String> {
+            Err("anonymous get".into())
+        }
+        fn post_json_auth(&mut self, url: &str, body: &str, t: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((url.into(), body.into(), t.into()));
+            Ok("{}".into())
+        }
+        fn get_auth(&mut self, url: &str, t: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((url.into(), String::new(), t.into()));
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn with_a_login_the_buttons_use_the_tap_base_and_carry_the_tap_token() {
+        let d = tmp("login");
+        std::fs::write(d.join("alerts.topic"), "alerts\n").unwrap();
+        std::fs::write(d.join("taps.topic"), "taps\n").unwrap();
+        std::fs::write(
+            d.join("laptop.token"),
+            "tk_LAPTOP000000000000000000000000\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("tap.token"), "tk_TAP00000000000000000000000000\n").unwrap();
+        let mut cfg = NtfyConfig::new(d.join("alerts.topic"));
+        cfg.base = "http://127.0.0.1:2586".into();
+        cfg.tap_base = Some("http://100.64.0.1:2586".into());
+        cfg.inbound_topic_file = Some(d.join("taps.topic"));
+        cfg.token_file = Some(d.join("laptop.token"));
+        cfg.tap_token_file = Some(d.join("tap.token"));
+        cfg.login_topics = true;
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut a, 1_700_000_000_000);
+        let log: AuthLog = Default::default();
+        let mut ch = NtfyChannel::new(cfg.clone(), AuthHttp(log.clone()));
+        ch.send(&r).unwrap();
+        ch.poll(&r).unwrap();
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(l[0].0, "http://127.0.0.1:2586/");
+            assert_eq!(l[0].2, "tk_LAPTOP000000000000000000000000");
+            let v: serde_json::Value = serde_json::from_str(&l[0].1).unwrap();
+            assert_eq!(v["topic"], "alerts");
+            assert_eq!(v["actions"][0]["url"], "http://100.64.0.1:2586/taps");
+            assert_eq!(
+                v["actions"][0]["headers"]["Authorization"],
+                "Bearer tk_TAP00000000000000000000000000"
+            );
+            assert!(l[1].0.starts_with("http://127.0.0.1:2586/taps/json?poll=1"));
+            assert_eq!(l[1].2, "tk_LAPTOP000000000000000000000000");
+        }
+        // a configured token file that is missing: unavailable, never anonymous
+        std::fs::remove_file(d.join("laptop.token")).unwrap();
+        let mut ch = NtfyChannel::new(cfg, AuthHttp(log.clone()));
+        assert!(ch.send(&r).is_err());
+        // short topics need a login
+        let plain = NtfyConfig::new(d.join("alerts.topic"));
+        let mut ch = NtfyChannel::new(plain, AuthHttp(log.clone()));
+        assert!(ch.send(&r).is_err());
+        std::fs::write(
+            d.join("laptop.token"),
+            "tk_LAPTOP000000000000000000000000\n",
+        )
+        .unwrap();
+        // a token alone does not make short topics safe: the route must say the server enforces logins
+        let mut no_flag = cfg_with_token(&d);
+        no_flag.login_topics = false;
+        assert!(NtfyChannel::new(no_flag, AuthHttp(log.clone()))
+            .send(&r)
+            .is_err());
+        // never on ntfy.sh
+        let mut public = cfg_with_token(&d);
+        public.base = "https://ntfy.sh".into();
+        assert!(NtfyChannel::new(public, AuthHttp(log.clone()))
+            .send(&r)
+            .is_err());
+        // a token over plain http only to this machine
+        let mut far = cfg_with_token(&d);
+        far.base = "http://192.0.2.7:2586".into();
+        assert!(NtfyChannel::new(far, AuthHttp(log.clone()))
+            .send(&r)
+            .is_err());
+        let mut v6 = cfg_with_token(&d);
+        v6.base = "http://[::1]:2586".into();
+        assert!(NtfyChannel::new(v6, AuthHttp(log)).send(&r).is_ok());
+    }
+
+    fn cfg_with_token(d: &Path) -> NtfyConfig {
+        let mut c = NtfyConfig::new(d.join("alerts.topic"));
+        c.base = "http://127.0.0.1:2586".into();
+        c.inbound_topic_file = Some(d.join("taps.topic"));
+        c.token_file = Some(d.join("laptop.token"));
+        c.login_topics = true;
+        c
+    }
+
+    #[test]
+    fn host_checks_cannot_be_fooled_by_a_user_part_a_trailing_dot_or_a_fake_name() {
+        assert_eq!(
+            host_of("http://127.0.0.1:2586/x").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(host_of("https://NTFY.SH./x").as_deref(), Some("ntfy.sh"));
+        assert_eq!(host_of("http://[::1]:2586").as_deref(), Some("::1"));
+        assert_eq!(host_of("http://127.0.0.1@192.0.2.7:2586"), None);
+        assert_eq!(host_of("ftp://127.0.0.1"), None);
+        // percent-encoding (curl decodes it), a junk port, junk after a bracketed address
+        assert_eq!(host_of("https://ntfy%2esh/x"), None);
+        assert_eq!(host_of("https://ntf%79.sh"), None);
+        assert_eq!(host_of("http://127.0.0.1:1:99/"), None);
+        assert_eq!(host_of("http://[::1]evil/"), None);
+        assert_eq!(host_of("http://[::1%25eth0]/"), None);
+        assert_eq!(host_of("http://localhost:/"), None);
+        assert_eq!(host_of("http://localhost").as_deref(), Some("localhost"));
+        // an IP literal with a trailing dot is a DNS name to curl, so it is refused; a name keeps
+        // its trailing-dot spelling
+        assert_eq!(host_of("http://127.0.0.1.:2586/"), None);
+        assert_eq!(host_of("http://127.0.0.1../"), None);
+        assert_eq!(host_of("http://[::1.]:2586/"), None);
+        assert_eq!(
+            host_of("http://localhost.:2586").as_deref(),
+            Some("localhost")
+        );
+        assert!(is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("::1") && is_loopback_host("localhost"));
+        assert!(!is_loopback_host("127.evil.example") && !is_loopback_host("192.0.2.7"));
+        let d = std::env::temp_dir().join(format!("agentroid-hosts-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("alerts.topic"), "alerts\n").unwrap();
+        std::fs::write(d.join("taps.topic"), "taps\n").unwrap();
+        std::fs::write(
+            d.join("laptop.token"),
+            "tk_LAPTOP000000000000000000000000\n",
+        )
+        .unwrap();
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = a.request(1, "X", "tap", "destructive", "delete", "");
+        let log: AuthLog = Default::default();
+        for (base, ok) in [
+            ("http://127.0.0.1@192.0.2.7:2586", false),
+            ("http://127.evil.example:2586", false),
+            ("https://x@ntfy.sh", false),
+            ("https://ntfy.sh.", false),
+            ("https://push.ntfy.sh", false),
+            ("http://localhost:2586", true),
+            ("https://ntfy.example.org", true),
+            // a token over plain http never goes to `127.0.0.1.` (a DNS lookup to curl)
+            ("http://127.0.0.1.:2586", false),
+            ("http://127.0.0.1:2586", true),
+        ] {
+            let mut c = cfg_with_token(&d);
+            c.base = base.into();
+            let sent = NtfyChannel::new(c, AuthHttp(log.clone())).send(&r);
+            assert_eq!(sent.is_ok(), ok, "{base}: {sent:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn curl_anonymous_calls_fail_on_an_http_error_and_keep_the_url_off_the_command_line() {
+        // an ntfy.sh 429 or 403 is not a sent ask
+        let (port, h) = one_shot_server("429 Too Many Requests");
+        let r = CurlHttp::default().post_json(&format!("http://127.0.0.1:{port}/"), "{}");
+        h.join().unwrap();
+        assert!(r.is_err(), "{r:?}");
+        let (port, h) = one_shot_server("200 OK");
+        CurlHttp::default()
+            .get(&format!(
+                "http://127.0.0.1:{port}/secret-topic-0123456789abcdef/json?poll=1"
+            ))
+            .unwrap();
+        assert!(h
+            .join()
+            .unwrap()
+            .starts_with("GET /secret-topic-0123456789abcdef/json?poll=1 HTTP/1.1"));
+    }
+
+    #[test]
+    fn any_channel_sends_on_each_and_takes_an_answer_from_either() {
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut a, 1_700_000_000_000);
+        let broken = FakeChannel {
+            send_fails: Some("down".into()),
+            ..FakeChannel::default()
+        };
+        let rid = r.id.clone();
+        let answering = FakeChannel {
+            answer_with: Some(Box::new(move |_, _| {
+                vec![Inbound {
+                    event_id: "e1".into(),
+                    time_ms: 1_700_000_001_000,
+                    message: format!("allow {rid}"),
+                }]
+            })),
+            ..FakeChannel::default()
+        };
+        let mut any = AnyChannel::new(vec![Box::new(broken), Box::new(answering)]);
+        assert!(any.send(&r).is_ok(), "one channel carried it");
+        let evs = any.poll(&r).unwrap();
+        assert_eq!(evs[0].event_id, "1:e1");
+        let mut none = AnyChannel::new(vec![Box::new(FakeChannel {
+            send_fails: Some("down".into()),
+            ..FakeChannel::default()
+        })]);
+        assert!(none.send(&r).is_err());
+        assert!(AnyChannel::new(vec![]).send(&r).is_err());
     }
 }

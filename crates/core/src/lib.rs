@@ -25,6 +25,7 @@
 //! Nothing here starts adb or touches a device; the live transport is a later task.
 
 pub mod approval;
+pub mod askscreen;
 pub mod audit;
 pub mod fake;
 pub mod fileguard;
