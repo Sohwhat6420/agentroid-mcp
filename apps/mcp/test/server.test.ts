@@ -145,7 +145,8 @@ test("a gate refusal (read_only) is a tool error, and the daemon's message is ke
     assert.equal(e?.kind, "refused");
     assert.equal(e?.code, CODE.REFUSED);
     assert.equal(e?.message, "tap refused: this device is read_only, so it only answers reads");
-    assert.match(res.content[0]?.text ?? "", /Refused by the device-mode gate: tap refused: this device is read_only, so it only answers reads/);
+    // the label is the server's; the daemon's message can quote the screen, so it sits inside the phone-data fence
+    assert.match(res.content[0]?.text ?? "", /Refused by the device-mode gate:\n<phone-data (k[0-9a-f]{12})>\ntap refused: this device is read_only, so it only answers reads\n<\/phone-data \1>\nerror kind: refused$/);
     // reads on the same device are fine
     const ok = await r.call("ui_tree", { device: RO14.device });
     assert.equal(ok.isError, undefined);

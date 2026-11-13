@@ -22,6 +22,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { NOTICE_MARKER } from "./untrusted.ts";
 
 /** The watchdog's rule for a topic: 16 to 64 of A-Z a-z 0-9 _ -. */
 export const TOPIC_RE = /^[A-Za-z0-9_-]{16,64}$/;
@@ -100,7 +101,7 @@ export function pushText(j: JobSnapshot, state: PushState): { title: string; mes
 export function cardInstruction(j: JobSnapshot, state: PushState, push: string): string {
   const id = clean(j.run_id, 64);
   const where = state === "stuck" ? `; the flight recorder (last 10 trees, 3 frames) is in runs/${id}/flight/` : "";
-  return `SESSION ACTION: tell the user about job ${id} (${clean(j.flow, 60)}): ${state}, ${counts(j)}. job_status carries the receipt${where}. Phone push: ${push}. The server never posts cards itself.`;
+  return `${NOTICE_MARKER}: tell the user about job ${id} (${clean(j.flow, 60)}): ${state}, ${counts(j)}. job_status carries the receipt${where}. Phone push: ${push}. The server never posts cards itself.`;
 }
 
 export interface SupervisorOptions {
