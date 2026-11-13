@@ -114,7 +114,12 @@ pub fn local_name(n: &str) -> String {
     let s: String = n
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            // invisible characters too, bidi controls among them: `invoice\u{202E}fdp.exe` would
+            // show in Explorer as `invoiceexe.pdf`
+            if c.is_control()
+                || is_invisible(c)
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
                 '_'
             } else {
                 c
@@ -150,6 +155,17 @@ pub fn local_name(n: &str) -> String {
     s
 }
 
+/// Invisible format characters: zero-width spaces and joiners, bidi controls, the byte-order mark,
+/// soft hyphen, variation selectors, tag characters and similar. The same set as the file guard's
+/// `fileguard::is_invisible` in the file-guard change; when both are in, this one can go.
+fn is_invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFFB | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
+}
+
 /// `("name", ".ext")`; the extension is empty when there is none (or the name starts with its only dot).
 fn split_ext(name: &str) -> (&str, &str) {
     match name.rfind('.') {
@@ -181,6 +197,35 @@ fn reserve_path(dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// How every temporary pull name starts. `pull_new` never reserves a name that starts this way: it
+/// passes over phone names that start with a dot, and (in case that ever changes) puts a `_` in
+/// front of one that does. So a temporary name and a reserved one are never the same.
+const PULL_TEMP_PREFIX: &str = ".agentroid-pull-";
+
+/// A new, unique, empty file in `dir` for adb to pull into, made with `create_new` (so it is no file
+/// that was already there). The copy is renamed over the call's reserved name once it is checked.
+fn temp_path(dir: &Path) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1000 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let p = dir.join(format!("{PULL_TEMP_PREFIX}{}-{n}.part", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary name",
+    ))
 }
 
 /// The laptop folder for `push` and `pull_new` when the daemon was given none:
@@ -576,7 +621,11 @@ impl Daemon {
         }
         // never over a file that is already there: a phone file named like an earlier pull gets a
         // number, and the name is reserved (an empty file) so a second pull at once cannot take it
-        let local: PathBuf = reserve_path(&local_dir, &local_name(&newest))
+        let mut name = local_name(&newest);
+        if name.starts_with(PULL_TEMP_PREFIX) {
+            name.insert(0, '_');
+        }
+        let local: PathBuf = reserve_path(&local_dir, &name)
             .map_err(|e| {
                 RpcError::new(
                     STATE_ERROR,
@@ -595,6 +644,25 @@ impl Daemon {
                     ),
                 )
             })?;
+        // adb pulls into a temporary name of this call's own, never into the reserved name: adb
+        // deletes and re-creates its destination, and in that gap another pull could reserve the
+        // same name. The reservation stays in place until the checked copy is renamed over it.
+        let temp = temp_path(&local_dir).map_err(|e| {
+            let mut err = RpcError::new(
+                STATE_ERROR,
+                format!(
+                    "pull_new: cannot make a temporary file in {}: {e}",
+                    local_dir.display()
+                ),
+            );
+            if let Err(r) = std::fs::remove_file(&local) {
+                err.message.push_str(&format!(
+                    "; the reserved name {} could not be deleted: {r}",
+                    local.display()
+                ));
+            }
+            err
+        })?;
         // the size limit was checked against the phone's own answer, so whatever arrived is checked again
         // here, and a pull that fails or does not match leaves nothing in the inbox (a file that grew after
         // the size check, or a phone that reported a false size, must not stay on the laptop). The check
@@ -602,12 +670,12 @@ impl Daemon {
         // as it can send before adb's timeout, until the copy is deleted here.
         let verified = (|| -> Result<String, RpcError> {
             self.backend()
-                .raw_pull(&t.serial, &remote, &local)
+                .raw_pull(&t.serial, &remote, &temp)
                 .map_err(|e| RpcError::new(DEVICE_ERROR, format!("pull failed: {e}")))?;
-            let (sha, got) = file_sha256(&local).map_err(|e| {
+            let (sha, got) = file_sha256(&temp).map_err(|e| {
                 RpcError::new(
                     DEVICE_ERROR,
-                    format!("pull_new: cannot read {}: {e}", local.display()),
+                    format!("pull_new: cannot read {}: {e}", temp.display()),
                 )
             })?;
             // `size` is at most `max` (checked above), so a matching copy is within the limit too
@@ -629,21 +697,39 @@ impl Daemon {
                     ));
                 }
             }
+            std::fs::rename(&temp, &local).map_err(|e| {
+                RpcError::new(
+                    STATE_ERROR,
+                    format!("pull_new: cannot move the copy to {}: {e}", local.display()),
+                )
+            })?;
             Ok(sha)
         })();
         let sha = match verified {
             Ok(sha) => sha,
             Err(mut e) => {
-                // only this call's own file: the name was reserved above, so no other pull holds it
-                match std::fs::remove_file(&local) {
-                    Ok(()) => e.message.push_str("; the laptop copy was deleted"),
-                    Err(r) if r.kind() == std::io::ErrorKind::NotFound => {
-                        e.message.push_str("; nothing was left on the laptop")
+                // only the two names this call created: its temporary file and its reserved (empty)
+                // name. No other pull is handed either name while they exist; a process outside the
+                // daemon that writes into the inbox is not guarded against. A copy with bytes in it
+                // is "the laptop copy"; an empty or missing one means adb wrote nothing.
+                let wrote = std::fs::metadata(&temp).is_ok_and(|m| m.len() > 0);
+                match std::fs::remove_file(&temp) {
+                    Err(r) if r.kind() != std::io::ErrorKind::NotFound => {
+                        e.message.push_str(&format!(
+                            "; the laptop copy at {} could not be deleted: {r}",
+                            temp.display()
+                        ))
                     }
-                    Err(r) => e.message.push_str(&format!(
-                        "; the laptop copy at {} could not be deleted: {r}",
-                        local.display()
-                    )),
+                    _ if wrote => e.message.push_str("; the laptop copy was deleted"),
+                    _ => e.message.push_str("; nothing was left on the laptop"),
+                }
+                if let Err(r) = std::fs::remove_file(&local) {
+                    if r.kind() != std::io::ErrorKind::NotFound {
+                        e.message.push_str(&format!(
+                            "; the reserved name {} could not be deleted: {r}",
+                            local.display()
+                        ));
+                    }
                 }
                 return Err(e);
             }
