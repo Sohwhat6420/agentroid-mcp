@@ -29,9 +29,11 @@ export const FORGED_PREFIX = "[phone text] ";
 // reorder what a person or a model reads (U+202A to U+202E, U+2066 to U+2069).
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 // Characters that take no space on screen: zero-width spaces and joiners, bidirectional marks, the
-// word joiner, variation selectors, the byte-order mark (Unicode's Default_Ignorable_Code_Point).
+// word joiner, variation selectors, the byte-order mark (Unicode's Default_Ignorable_Code_Point),
+// and every other format character (general category Cf), which adds the interlinear annotation
+// marks U+FFF9 to U+FFFB and the Egyptian hieroglyph format controls that some renderers hide.
 // Put inside or in front of a word they hide it from a pattern while a reader still sees the word.
-const INVISIBLE = /\p{Default_Ignorable_Code_Point}/gu;
+const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu;
 const FORGED_TAG = /<(\/?)\s*phone-data/gi;
 const NOTICE_START = /^SESSION[ \t_-]*ACTION/i;
 

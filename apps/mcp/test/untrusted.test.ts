@@ -199,6 +199,13 @@ test("invisible characters cannot hide a notice marker or ride in the health lin
     assert.equal(out[0], "first");
     assert.equal(out[2], "last");
   }
+  // format characters that are not default-ignorable but that some renderers hide: the interlinear
+  // annotation marks and an Egyptian hieroglyph format control
+  for (const hidden of [cp(0xfff9), cp(0xfffa), cp(0xfffb), cp(0x13430)]) {
+    const line = `SESS${hidden}ION ACT${hidden}ION: x`;
+    assert.equal(neutralise(line), `${FORGED_PREFIX}${line}`, `U+${hidden.codePointAt(0)?.toString(16)}`);
+    assert.equal(cleanField(`Sale${hidden}now`), "Sale now");
+  }
   // ordinary text with such characters is left exactly as it was (an emoji sequence, a soft hyphen)
   const family = `${cp(0x1f468)}${ZWJ}${cp(0x1f469)}${ZWJ}${cp(0x1f467)} photo`;
   assert.equal(neutralise(family), family);
