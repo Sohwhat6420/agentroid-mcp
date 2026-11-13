@@ -374,6 +374,17 @@ pub trait Http {
     fn post_json(&mut self, url: &str, body: &str) -> Result<String, String>;
     /// GET `url`; returns the response body.
     fn get(&mut self, url: &str) -> Result<String, String>;
+    /// As [`Http::post_json`], sending `Authorization: Bearer <token>`. The default refuses, so a
+    /// client that cannot keep a token off its command line never sends one.
+    fn post_json_auth(&mut self, url: &str, body: &str, bearer: &str) -> Result<String, String> {
+        let _ = (url, body, bearer);
+        Err("this HTTP client cannot send a token".into())
+    }
+    /// As [`Http::get`], sending `Authorization: Bearer <token>`. The default refuses.
+    fn get_auth(&mut self, url: &str, bearer: &str) -> Result<String, String> {
+        let _ = (url, bearer);
+        Err("this HTTP client cannot send a token".into())
+    }
 }
 
 /// A topic name as the habit tracker requires: 24 to 64 of `[A-Za-z0-9_-]`.
@@ -381,6 +392,48 @@ pub fn valid_topic(t: &str) -> bool {
     (24..=64).contains(&t.len())
         && t.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A topic on a server that needs a login: 1 to 64 of `[A-Za-z0-9_-]`. The token, not the name,
+/// keeps it private there, so a short name such as `alerts` is fine.
+pub fn valid_login_topic(t: &str) -> bool {
+    (1..=64).contains(&t.len())
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Read a bearer token from its key file: 8 to 200 printable ASCII characters, no spaces. The
+/// value is never logged and never put in an error.
+pub fn read_token(path: &Path) -> Result<String, String> {
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| format!("token file {}: {}", path.display(), e.kind()))?;
+    let t = s.trim();
+    if (8..=200).contains(&t.len()) && t.chars().all(|c| c.is_ascii_graphic()) {
+        Ok(t.to_string())
+    } else {
+        Err(format!(
+            "token file {} does not hold a token (8-200 printable characters)",
+            path.display()
+        ))
+    }
+}
+
+/// Read a topic from a key file, with the rule for a server that needs a login when `login`.
+fn read_topic_for(path: &Path, login: bool) -> Result<String, String> {
+    if !login {
+        return read_topic(path);
+    }
+    let s =
+        std::fs::read_to_string(path).map_err(|e| format!("topic file {}: {e}", path.display()))?;
+    let t = s.trim();
+    if valid_login_topic(t) {
+        Ok(t.to_string())
+    } else {
+        Err(format!(
+            "topic file {} does not hold a topic (1-64 of [A-Za-z0-9_-])",
+            path.display()
+        ))
+    }
 }
 
 /// Read a topic from its key file. The value is never logged.
@@ -408,6 +461,17 @@ pub struct NtfyConfig {
     /// `topic_file` (one private topic for both directions).
     pub inbound_topic_file: Option<PathBuf>,
     pub title: String,
+    /// Key file holding a bearer token, for a server that needs a login (a self-hosted ntfy with
+    /// `auth-default-access: deny-all`). Sent on publish and poll through curl's stdin, never on
+    /// its command line. With a token, short topic names are accepted.
+    pub token_file: Option<PathBuf>,
+    /// Key file holding a write-only token the Allow / Deny buttons carry, so the phone can post
+    /// its answer to a server that needs a login. It sits inside the push, so give it write access
+    /// to the inbound topic and nothing else.
+    pub tap_token_file: Option<PathBuf>,
+    /// The base URL the phone's buttons post to, when it differs from `base` (a loopback server
+    /// the phone reaches at a tailnet address). Defaults to `base`.
+    pub tap_base: Option<String>,
 }
 
 impl NtfyConfig {
@@ -417,6 +481,9 @@ impl NtfyConfig {
             topic_file: topic_file.into(),
             inbound_topic_file: None,
             title: "Agentroid asks".into(),
+            token_file: None,
+            tap_token_file: None,
+            tap_base: None,
         }
     }
 }
@@ -432,28 +499,63 @@ impl<H: Http> NtfyChannel<H> {
     }
 
     fn topics(&self) -> Result<(String, String), String> {
-        let out = read_topic(&self.cfg.topic_file)?;
+        let login = self.cfg.token_file.is_some();
+        let out = read_topic_for(&self.cfg.topic_file, login)?;
         let inb = match &self.cfg.inbound_topic_file {
-            Some(p) => read_topic(p)?,
+            Some(p) => read_topic_for(p, login)?,
             None => out.clone(),
         };
         Ok((out, inb))
     }
 
+    /// The login token and the button token, when configured. A configured file that cannot be
+    /// read makes the channel unavailable (the ask is refused), never anonymous.
+    fn tokens(&self) -> Result<(Option<String>, Option<String>), String> {
+        let t = match &self.cfg.token_file {
+            Some(p) => Some(read_token(p)?),
+            None => None,
+        };
+        let tap = match &self.cfg.tap_token_file {
+            Some(p) => Some(read_token(p)?),
+            None => None,
+        };
+        Ok((t, tap))
+    }
+
     /// The JSON ntfy publishes: the ask, plus Allow and Deny `http` actions that POST the exact
     /// grammar line to the inbound topic. Public so tests can check the body without a network.
     pub fn publish_body(&self, req: &Request, topic: &str, inbound: &str) -> String {
-        let inbound_url = format!("{}/{inbound}", self.cfg.base.trim_end_matches('/'));
+        self.publish_body_with(req, topic, inbound, None)
+    }
+
+    /// As [`NtfyChannel::publish_body`], with the buttons posting to `tap_base` (when set) and
+    /// carrying `tap_token` (when given) as their `Authorization` header.
+    pub fn publish_body_with(
+        &self,
+        req: &Request,
+        topic: &str,
+        inbound: &str,
+        tap_token: Option<&str>,
+    ) -> String {
+        let base = self.cfg.tap_base.as_deref().unwrap_or(&self.cfg.base);
+        let inbound_url = format!("{}/{inbound}", base.trim_end_matches('/'));
+        let button = |label: &str, verb: &str| {
+            let mut b = serde_json::json!({
+                "action": "http", "label": label, "url": inbound_url, "method": "POST",
+                "body": format!("{verb} {}", req.id), "clear": true
+            });
+            if let Some(t) = tap_token {
+                b["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
+            }
+            b
+        };
         serde_json::json!({
             "topic": topic,
             "title": self.cfg.title,
             "message": req.message(),
             "priority": 4,
             "tags": ["lock"],
-            "actions": [
-                { "action": "http", "label": "Allow", "url": inbound_url, "method": "POST", "body": format!("allow {}", req.id), "clear": true },
-                { "action": "http", "label": "Deny", "url": inbound_url, "method": "POST", "body": format!("deny {}", req.id), "clear": true }
-            ]
+            "actions": [button("Allow", "allow"), button("Deny", "deny")]
         })
         .to_string()
     }
@@ -494,22 +596,95 @@ impl<H: Http> Channel for NtfyChannel<H> {
     }
     fn send(&mut self, req: &Request) -> Result<(), String> {
         let (topic, inbound) = self.topics()?;
-        let body = self.publish_body(req, &topic, &inbound);
+        let (token, tap) = self.tokens()?;
+        let body = self.publish_body_with(req, &topic, &inbound, tap.as_deref());
         let url = format!("{}/", self.cfg.base.trim_end_matches('/'));
+        let secrets = [
+            topic.as_str(),
+            inbound.as_str(),
+            token.as_deref().unwrap_or(""),
+            tap.as_deref().unwrap_or(""),
+        ];
         // the topic is in the body, never in a log line
-        self.http
-            .post_json(&url, &body)
-            .map(|_| ())
-            .map_err(|e| format!("publish failed: {}", scrub(&e, &[&topic, &inbound])))
+        match &token {
+            Some(t) => self.http.post_json_auth(&url, &body, t),
+            None => self.http.post_json(&url, &body),
+        }
+        .map(|_| ())
+        .map_err(|e| format!("publish failed: {}", scrub(&e, &secrets)))
     }
     fn poll(&mut self, req: &Request) -> Result<Vec<Inbound>, String> {
         let (topic, inbound) = self.topics()?;
+        let (token, _) = self.tokens()?;
         let url = self.poll_url(req, &inbound);
-        let text = self
-            .http
-            .get(&url)
-            .map_err(|e| format!("poll failed: {}", scrub(&e, &[&topic, &inbound])))?;
+        let secrets = [
+            topic.as_str(),
+            inbound.as_str(),
+            token.as_deref().unwrap_or(""),
+        ];
+        let text = match &token {
+            Some(t) => self.http.get_auth(&url, t),
+            None => self.http.get(&url),
+        }
+        .map_err(|e| format!("poll failed: {}", scrub(&e, &secrets)))?;
         Ok(parse_ntfy_lines(&text))
+    }
+}
+
+/// Several channels as one: the ask goes out on every channel that can carry it (it is refused
+/// only when none can), and an answer from any of them counts. Each channel's event ids are
+/// prefixed with its position, so the same id on two servers is two events. Used while pushes
+/// move from one server to another and the phone may be listening on either.
+pub struct AnyChannel {
+    channels: Vec<Box<dyn Channel + Send>>,
+}
+
+impl AnyChannel {
+    pub fn new(channels: Vec<Box<dyn Channel + Send>>) -> AnyChannel {
+        AnyChannel { channels }
+    }
+}
+
+impl Channel for AnyChannel {
+    fn name(&self) -> &'static str {
+        match self.channels.as_slice() {
+            [one] => one.name(),
+            _ => "any",
+        }
+    }
+    fn send(&mut self, req: &Request) -> Result<(), String> {
+        let mut errs = vec![];
+        let mut sent = 0;
+        for c in &mut self.channels {
+            match c.send(req) {
+                Ok(()) => sent += 1,
+                Err(e) => errs.push(e),
+            }
+        }
+        if sent > 0 {
+            Ok(())
+        } else if errs.is_empty() {
+            Err("no channel configured".into())
+        } else {
+            Err(errs.join("; "))
+        }
+    }
+    fn poll(&mut self, req: &Request) -> Result<Vec<Inbound>, String> {
+        let mut out = vec![];
+        let mut errs = vec![];
+        for (i, c) in self.channels.iter_mut().enumerate() {
+            match c.poll(req) {
+                Ok(evs) => out.extend(evs.into_iter().map(|mut e| {
+                    e.event_id = format!("{i}:{}", e.event_id);
+                    e
+                })),
+                Err(e) => errs.push(e),
+            }
+        }
+        if out.is_empty() && !errs.is_empty() && errs.len() == self.channels.len() {
+            return Err(errs.join("; "));
+        }
+        Ok(out)
     }
 }
 
@@ -595,6 +770,44 @@ impl Http for CurlHttp {
     fn get(&mut self, url: &str) -> Result<String, String> {
         self.run(&[url], None)
     }
+    fn post_json_auth(&mut self, url: &str, body: &str, bearer: &str) -> Result<String, String> {
+        let cfg = format!(
+            "url = {}\nfail-with-body\nheader = {}\nheader = {}\ndata-binary = {}\n",
+            curl_quote(url),
+            curl_quote("Content-Type: application/json"),
+            curl_quote(&format!("Authorization: Bearer {bearer}")),
+            curl_quote(body)
+        );
+        self.run(&["--config", "-"], Some(&cfg))
+    }
+    fn get_auth(&mut self, url: &str, bearer: &str) -> Result<String, String> {
+        let cfg = format!(
+            "url = {}\nfail-with-body\nheader = {}\n",
+            curl_quote(url),
+            curl_quote(&format!("Authorization: Bearer {bearer}"))
+        );
+        self.run(&["--config", "-"], Some(&cfg))
+    }
+}
+
+/// A value for a curl config file: double-quoted, with `\\`, `"` and line breaks escaped. The
+/// token travels in this config on curl's stdin, so it is never on a command line another
+/// process could read.
+pub fn curl_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
