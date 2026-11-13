@@ -126,11 +126,33 @@ export function bearer(header: string | undefined): string | undefined {
 }
 
 /**
- * The mode rule, used by both enforcement points (the call gate and the scoped daemon).
- * read_only: read tools only. full and helper: any tool, and the daemon's own gate still applies.
+ * What a `helper` token may do besides reading: the calls the daemon's gate gives a helper route
+ * (gestures, keys and typing; `Call::has_helper_route` in crates/core/src/gate.rs, and `set_value`,
+ * which the daemon gates as a tap), plus `lease`, which acting needs. Everything that needs adb
+ * shell is absent: unlock, open_app, open_url, start_activity, push, pull_new, run_script and the
+ * job methods that act.
  */
-export function modeAllows(mode: Mode, readTool: boolean): boolean {
-  return readTool || mode !== "read_only";
+export const HELPER_ACTING: ReadonlySet<string> = new Set(["tap", "long_press", "swipe", "scroll", "type_text", "key", "set_value", "lease"]);
+/** Reads a `helper` token is refused, as the daemon refuses them on a helper device: `doctor` needs adb shell. */
+export const HELPER_REFUSED_READS: ReadonlySet<string> = new Set(["doctor"]);
+
+/**
+ * The mode rule, used by both enforcement points (the call gate and the scoped daemon). `name` is
+ * the tool, or the daemon method for a job call.
+ * - full: any tool; the daemon's own gate still applies.
+ * - read_only: read tools only.
+ * - helper: read tools except `doctor`, and the acting tools of HELPER_ACTING. The token's mode is
+ *   decided here and not left to the daemon, whose gate knows the device's mode, not the token's.
+ */
+export function modeAllows(mode: Mode, readTool: boolean, name: string): boolean {
+  if (mode === "full") return true;
+  if (mode === "read_only") return readTool;
+  return readTool ? !HELPER_REFUSED_READS.has(name) : HELPER_ACTING.has(name);
+}
+
+/** The end of a mode refusal: what this mode is limited to. */
+export function modeLimit(mode: Mode): string {
+  return mode === "helper" ? "so it may only call read tools (not doctor), gestures, keys and typing" : "so it may only call read tools";
 }
 
 export interface DeviceRow {
