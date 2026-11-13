@@ -633,7 +633,23 @@ impl crate::server::Daemon {
                     .map(|l| l.epoch)
                     .ok_or_else(|| RpcError::new(NOT_HOLDER, format!("no lease on {key}")))?;
                 if method == "link.segment" {
-                    to_value(&link.segment(&key, epoch, parse_params(params)?)?)
+                    let p: LinkSegmentParams = parse_params(params)?;
+                    let id = p.segment_id.clone();
+                    // the screen lock, before anything is built, signed or sent: a segment
+                    // changes the screen like any tap
+                    self.backend()
+                        .lock_admit(&d.serial, "link.segment")
+                        .map_err(|e| {
+                            RpcError::new(REFUSED, e.to_string())
+                                .with_data(json!({"rule": "screen_lock"}))
+                        })?;
+                    let r = link.segment(&key, epoch, p);
+                    // the phone's answer is in (or the segment may be running): the end of the
+                    // agent's own action
+                    if r.is_ok() || link.segment_is_running(&key, &id) {
+                        self.backend().lock_done(&d.serial);
+                    }
+                    to_value(&r?)
                 } else {
                     let p: LinkSegmentReportParams = parse_params(params)?;
                     to_value(&link.segment_report(&key, epoch, &p.segment_id)?)

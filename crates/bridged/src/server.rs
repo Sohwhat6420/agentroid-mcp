@@ -130,6 +130,14 @@ pub trait DeviceBackend: Send {
     /// Record a shell line the `run_script` sandbox refused before it reached the bridge (D3b), so
     /// the audit log holds every refused command. Default: not recorded.
     fn shell_refused(&mut self, _serial: &str, _line: &str, _reason: &str) {}
+    /// Core's screen lock alone, for screen-changing work core does not send itself (a link
+    /// segment). Default: no lock, so nothing is refused.
+    fn lock_admit(&mut self, _serial: &str, _tool: &'static str) -> Result<(), CoreError> {
+        Ok(())
+    }
+    /// Work the lock admitted ([`DeviceBackend::lock_admit`], or a shell line through
+    /// [`DeviceBackend::shell_gate`]) has run: its end is the agent's own activity. Default: none.
+    fn lock_done(&mut self, _serial: &str) {}
 }
 
 /// Why a backend without the phone half answers `pixel_probe` and element crops with an error.
@@ -227,6 +235,12 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
     }
     fn shell_refused(&mut self, serial: &str, line: &str, reason: &str) {
         self.core.record_shell_refusal(Some(serial), line, reason);
+    }
+    fn lock_admit(&mut self, serial: &str, tool: &'static str) -> Result<(), CoreError> {
+        self.core.lock_admit(Some(serial), tool)
+    }
+    fn lock_done(&mut self, serial: &str) {
+        self.core.lock_done(Some(serial));
     }
 }
 

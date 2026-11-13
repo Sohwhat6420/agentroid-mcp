@@ -12,7 +12,7 @@ use crate::frame::{Frame, FrameError, Shot};
 use crate::gate::{self, Call, DeviceMode, Refusal, Subject, Target};
 use crate::require::{read_require, RequireOpts, Required};
 use crate::screenguard::{self, Decision, Screen, Touch};
-use crate::screenlock::{ScreenLock, SHELL_SPAN_MS};
+use crate::screenlock::ScreenLock;
 use crate::selector::{resolve, Chosen, Resolution, ResolveError, Selector, Status};
 use crate::settle::{settle, Settle, SettleOpts, TreeSource};
 use crate::shell;
@@ -350,6 +350,10 @@ pub struct Core<T: Transport, C: Clock> {
     /// The phone (adb serial, hardware serial) the lock last admitted an acting call for, so the
     /// end of that call counts as the agent's own activity.
     lock_admitted: Option<(String, String)>,
+    /// Screen-changing work the lock admitted outside [`Core::call`] (a script's shell line, a
+    /// link segment) that has not reported its end yet, by the serial it was named with: the
+    /// end, from [`Core::lock_done`], is the agent's own activity.
+    lock_running: HashMap<String, (String, String)>,
 }
 
 impl<T: Transport, C: Clock> Core<T, C> {
@@ -368,6 +372,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             pending: None,
             lock: None,
             lock_admitted: None,
+            lock_running: HashMap::new(),
         }
     }
 
@@ -392,6 +397,42 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 Ok(())
             }
             Err(why) => Err(Refusal::ScreenLock { tool, why }),
+        }
+    }
+
+    /// The screen lock alone, for screen-changing work that does not go through [`Core::call`]
+    /// (a link segment, which the link signs and sends itself). `Ok`: it may go; then call
+    /// [`Core::lock_done`] once it has been sent and answered. A refusal is logged.
+    pub fn lock_admit(
+        &mut self,
+        serial: Option<&str>,
+        tool: &'static str,
+    ) -> Result<(), CoreError> {
+        self.pending = None;
+        self.lock_admitted = None;
+        let r = self
+            .find(serial, tool)
+            .and_then(|d| self.lock_check(&d, tool).map_err(CoreError::from));
+        if let Some(a) = self.lock_admitted.take() {
+            if r.is_ok() {
+                self.lock_running
+                    .insert(serial.unwrap_or_default().to_string(), a);
+            }
+        }
+        if let Err(CoreError::Refused(refusal)) = &r {
+            self.record_refusal(serial, tool, refusal, "");
+        }
+        r
+    }
+
+    /// Work that [`Core::lock_admit`] or [`Core::shell_gate`] let through for `serial` has run
+    /// (the runner or the link has returned): its end is the agent's own activity, so the burst
+    /// goes on past it. Nothing admitted: nothing recorded.
+    pub fn lock_done(&mut self, serial: Option<&str>) {
+        if let Some((s, h)) = self.lock_running.remove(serial.unwrap_or_default()) {
+            if let Some(lock) = self.lock.as_mut() {
+                lock.acted(&s, &h);
+            }
         }
     }
 
@@ -533,7 +574,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         if let Some((s, h)) = self.lock_admitted.take() {
             if !matches!(r, Err(CoreError::Refused(_))) {
                 if let Some(lock) = self.lock.as_mut() {
-                    lock.acted(&s, &h, None);
+                    lock.acted(&s, &h);
                 }
             }
         }
@@ -571,24 +612,27 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// A raw shell line (the sandbox's `shell` bridge call) through the device gate, the shell guard
     /// (D3b), the approval channel and the audit log. `Ok` means the runner may send it; every
     /// refusal is logged. The guard sees the whole line, so a refused line never reaches adb.
+    /// After the runner returns for an allowed line, call [`Core::lock_done`]: only then does the
+    /// line count as the agent's own activity.
     pub fn shell_gate(&mut self, serial: Option<&str>, line: &str) -> Result<(), CoreError> {
         self.pending = None;
+        self.lock_admitted = None;
         let r = self.pick_raw(serial, "shell").and_then(|d| {
             // the lock first, so a phone in use never gets an approval push for a line
             // a line on the read-only list changes nothing; any other may (an `input tap`)
             let argv: Vec<&str> = line.split(' ').filter(|a| !a.is_empty()).collect();
             if !shellguard::is_read_only(&argv) {
                 self.lock_check(&d, "shell")?;
-                // admitted before it runs, and its end is not seen here: count the next
-                // SHELL_SPAN_MS as the agent's own
-                if let (Some(lock), Some((s, h))) = (self.lock.as_mut(), self.lock_admitted.take())
-                {
-                    let until = lock.now_ms() + SHELL_SPAN_MS;
-                    lock.acted(&s, &h, Some(until));
-                }
             }
             self.raw_gate(&d, "shell", shellguard::classify_shell(line))
         });
+        // a line the lock admitted counts only once every gate has allowed it and it has run
+        if let Some(a) = self.lock_admitted.take() {
+            if r.is_ok() {
+                self.lock_running
+                    .insert(serial.unwrap_or_default().to_string(), a);
+            }
+        }
         if let Err(CoreError::Refused(refusal)) = &r {
             let target = shellguard::classify_shell(line).target;
             self.record_refusal(serial, "shell", refusal, &target);
@@ -2159,7 +2203,6 @@ mod tests {
     #[test]
     fn the_screen_lock_refuses_acting_calls_and_shell_lines_on_a_phone_in_use_and_never_reads() {
         use crate::askscreen::Signals;
-        use crate::screenlock::ScreenLock;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Mutex};
         const T0: u64 = 1_800_000_000_000;
@@ -2170,17 +2213,13 @@ mod tests {
             focus: Some(focus.into()),
             ime_shown: Some(ime),
             keyguard: Some(false),
+            in_call: Some(false),
         };
         let phone = Arc::new(Mutex::new(on("com.anthropic.claude", true, 1_000)));
         let clock = Arc::new(AtomicU64::new(T0));
         let dir = std::env::temp_dir().join(format!("agentroid-core-lock-{}", std::process::id()));
-        let (p, k) = (phone.clone(), clock.clone());
         let mut c = core();
-        c.set_screen_lock(ScreenLock::new(
-            dir.clone(),
-            Box::new(move |_| Some(p.lock().unwrap().clone())),
-            Box::new(move || k.load(Ordering::SeqCst)),
-        ));
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
         let back = Call::Key {
             name: "back".into(),
         };
@@ -2217,6 +2256,7 @@ mod tests {
         // put down: allowed, and the key reaches the phone
         *phone.lock().unwrap() = Signals {
             wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
             ..Signals::default()
         };
         assert!(c.call(None, &back).is_ok());
@@ -2233,6 +2273,160 @@ mod tests {
             Err(CoreError::Refused(Refusal::ScreenLock { .. }))
         ));
         assert_eq!(c.transport.acted.len(), n + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A screen lock over a fake phone; one fake clock serves as both the wall and the monotonic
+    /// clock, and the power read is instant.
+    fn test_lock(
+        dir: &std::path::Path,
+        phone: &std::sync::Arc<std::sync::Mutex<crate::askscreen::Signals>>,
+        clock: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> ScreenLock {
+        use std::sync::atomic::Ordering;
+        let (p, k1, k2) = (phone.clone(), clock.clone(), clock.clone());
+        ScreenLock::new(
+            dir.to_path_buf(),
+            Box::new(move |_, mono| {
+                let at = mono();
+                Some(crate::screenlock::Reading {
+                    signals: p.lock().unwrap().clone(),
+                    power_from: at,
+                    power_to: at,
+                })
+            }),
+            Box::new(move || k1.load(Ordering::SeqCst)),
+            Box::new(move || k2.load(Ordering::SeqCst)),
+        )
+    }
+
+    #[test]
+    fn a_shell_line_counts_as_the_agents_own_only_once_it_was_allowed_and_has_run() {
+        use crate::approval::{Approver, FakeChannel, Inbound};
+        use crate::askscreen::Signals;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let on = |idle_ms: u64| Signals {
+            wakefulness: Some("Awake".into()),
+            idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
+            focus: Some("com.whatsapp".into()),
+            ime_shown: Some(true),
+            keyguard: Some(false),
+            in_call: Some(false),
+        };
+        let phone = Arc::new(Mutex::new(Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        }));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-sh-{}", std::process::id()));
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // free: the key goes; its end (T0) starts the burst
+        assert!(c.call(None, &back).is_ok());
+        // inside the burst, a line the shell guard refuses outright (input injection): the lock
+        // admitted it, but it never ran, so it is not the agent's own activity
+        clock.store(T0 + 2_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(2_000);
+        assert!(matches!(
+            c.shell_gate(None, "input tap 10 20"),
+            Err(CoreError::Refused(Refusal::Screen { .. }))
+        ));
+        // the caller reports the end of the call after someone touched it (at T0 + 3000)
+        clock.store(T0 + 3_500, Ordering::SeqCst);
+        c.lock_done(None);
+        // that touch came after the key and the refused line is not the agent's: refused
+        clock.store(T0 + 4_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(1_000);
+        assert!(matches!(
+            c.shell_gate(None, "input tap 10 20"),
+            Err(CoreError::Refused(Refusal::ScreenLock { .. }))
+        ));
+        // an allowed line (a human says yes) that has run: its end continues the burst
+        let ch = FakeChannel {
+            answer_with: Some(Box::new(|r, _| {
+                vec![Inbound {
+                    event_id: format!("e-{}", r.id),
+                    time_ms: r.created_ms + 1,
+                    message: format!("allow {}", r.id),
+                }]
+            })),
+            ..FakeChannel::default()
+        };
+        c.set_approver(Approver::new(Box::new(ch)));
+        clock.store(T0 + 10_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        };
+        assert!(c.call(None, &back).is_ok());
+        clock.store(T0 + 12_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(2_000);
+        let r = c.shell_gate(None, "some_unknown_binary --flag");
+        assert!(r.is_ok(), "{r:?}");
+        // ... not before it has reported its end
+        clock.store(T0 + 15_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(1_000);
+        assert!(c.shell_gate(None, "some_unknown_binary --flag").is_err());
+        c.lock_done(None);
+        // the line ended at T0 + 15000 and its own touch was at T0 + 14000: the burst goes on
+        clock.store(T0 + 17_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(3_000);
+        let r = c.shell_gate(None, "some_unknown_binary --flag");
+        assert!(r.is_ok(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_segment_needs_the_lock_and_its_end_continues_the_burst() {
+        use crate::askscreen::Signals;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let on = |idle_ms: u64| Signals {
+            wakefulness: Some("Awake".into()),
+            idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
+            focus: Some("com.whatsapp".into()),
+            ime_shown: Some(true),
+            keyguard: Some(false),
+            in_call: Some(false),
+        };
+        let phone = Arc::new(Mutex::new(on(1_000)));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-seg-{}", std::process::id()));
+        let mut c = core();
+        // no lock: allowed
+        assert!(c.lock_admit(None, "link.segment").is_ok());
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        match c.lock_admit(None, "link.segment") {
+            Err(CoreError::Refused(Refusal::ScreenLock {
+                tool: "link.segment",
+                ..
+            })) => {}
+            other => panic!("{other:?}"),
+        }
+        // put down: allowed; the segment's answer at T0 + 1000 starts the burst
+        *phone.lock().unwrap() = Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        };
+        assert!(c.lock_admit(None, "link.segment").is_ok());
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        c.lock_done(None);
+        clock.store(T0 + 4_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(3_000);
+        assert!(c.lock_admit(None, "link.segment").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

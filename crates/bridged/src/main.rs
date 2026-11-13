@@ -497,23 +497,14 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
             .ask_screen_state_dir
             .clone()
             .unwrap_or_else(agentroid_core::askscreen::default_state_dir);
-        let lock_runner = GuardedRunner::new(AdbRunner::new(path));
         log(
             &args.state_dir,
             &format!(
-                "screen lock: on (leases from {}; emulators are not locked)",
+                "screen lock: on (leases from {}; emulators that say they are one are not locked)",
                 lock_dir.display()
             ),
         );
-        core.set_screen_lock(agentroid_core::screenlock::ScreenLock::new(
-            lock_dir,
-            Box::new(move |serial| agentroid_core::askscreen::read_signals(&lock_runner, serial)),
-            Box::new(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64)
-            }),
-        ));
+        bridged::live::install_screen_lock(&mut core, lock_dir, path);
         Box::new(CoreBackend::new(core))
     } else {
         Box::new(NoDevices)

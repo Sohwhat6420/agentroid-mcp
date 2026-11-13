@@ -15,6 +15,10 @@
 //!   screen on (a video, a reader with keep-screen-on). Anything that cannot be read counts as in
 //!   use, so a phone that answers only `dumpsys power` (a protected phone) is in use whenever its
 //!   screen is on.
+//! * **A call** that is ringing or live (`mCallState` from `dumpsys telephony.registry`, read
+//!   whatever the screen shows) is in use, screen on or off. A call state that cannot be read
+//!   counts as in use too, so a protected phone (which answers only `dumpsys power`) is always
+//!   asked.
 //! * **Not in use** (screen off or dozing; or on, untouched, nothing holding it on, no keyboard,
 //!   no listed app): allowed at once, with no push. Run the command again before each burst.
 //! * **In use:** one push with what the session wants and for how long. Yes gives a lease of
@@ -85,6 +89,9 @@ pub struct Signals {
     pub ime_shown: Option<bool>,
     /// Whether the lock screen is showing (reported only; it does not decide).
     pub keyguard: Option<bool>,
+    /// Whether a phone call is ringing or live (an `mCallState` other than 0 in
+    /// `dumpsys telephony.registry`), read whatever the screen state.
+    pub in_call: Option<bool>,
 }
 
 impl Signals {
@@ -280,19 +287,43 @@ pub fn parse_ime(text: &str) -> Option<bool> {
     None
 }
 
-/// Decide whether the phone is in use. Anything unknown while the screen is on counts as in use.
+/// Parse `dumpsys telephony.registry` (or its `mCallState=` lines, one per SIM): `Some(true)`
+/// when any of them is ringing (1) or off the hook (2), or not a number; `None` when there is no
+/// such line.
+pub fn parse_call_state(text: &str) -> Option<bool> {
+    let mut seen = None;
+    for word in text.split_whitespace() {
+        if let Some(v) = word.strip_prefix("mCallState=") {
+            let busy = v.parse::<u32>() != Ok(0);
+            seen = Some(seen.unwrap_or(false) || busy);
+        }
+    }
+    seen
+}
+
+/// Decide whether the phone is in use. Anything unknown while the screen is on counts as in use,
+/// and so does a call (ringing, live, or a call state that cannot be read) whatever the screen
+/// shows.
 pub fn judge(s: &Signals, idle_limit_ms: u64, extra_apps: &[String]) -> Use {
+    let call = match s.in_call {
+        Some(false) => None,
+        Some(true) => Some("a call is in progress"),
+        None => Some("whether a call is in progress is unknown"),
+    };
     match s.screen_on() {
         Some(false) => {
+            if let Some(c) = call {
+                return Use::InUse(vec![c.to_string()]);
+            }
             return Use::Free(format!(
                 "screen not on ({})",
                 s.wakefulness.as_deref().unwrap_or("")
-            ))
+            ));
         }
         None => return Use::InUse(vec!["screen state unknown".into()]),
         Some(true) => {}
     }
-    let mut why = vec![];
+    let mut why: Vec<String> = call.map(str::to_string).into_iter().collect();
     match s.focus.as_deref() {
         None => why.push("focused app unknown".to_string()),
         Some(p) if IN_USE_APPS.contains(&p) || extra_apps.iter().any(|a| a == p) => {
@@ -327,7 +358,7 @@ pub fn judge(s: &Signals, idle_limit_ms: u64, extra_apps: &[String]) -> Use {
     }
 }
 
-fn shell(r: &dyn Runner, device: &str, cmd: &str) -> Option<String> {
+pub(crate) fn shell(r: &dyn Runner, device: &str, cmd: &str) -> Option<String> {
     let a = vec![
         "-s".to_string(),
         device.to_string(),
@@ -343,13 +374,32 @@ fn shell(r: &dyn Runner, device: &str, cmd: &str) -> Option<String> {
 /// Read the signals through `r` (production: the guarded adb runner, so a protected phone answers
 /// `dumpsys power` and nothing else). `None` when not even `dumpsys power` could be read.
 pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
+    read_signals_timed(r, device, &|| 0).map(|(s, _, _)| s)
+}
+
+/// [`read_signals`], with the times on `clock` just before and just after the `dumpsys power`
+/// read (the read that states the last touch as "so many ms ago"). The screen lock uses them.
+pub fn read_signals_timed(
+    r: &dyn Runner,
+    device: &str,
+    clock: &dyn Fn() -> u64,
+) -> Option<(Signals, u64, u64)> {
+    let from = clock();
     let power = parse_power(&shell(r, device, "dumpsys power")?);
+    let to = clock().max(from);
     let mut s = Signals {
         wakefulness: power.wakefulness,
         idle_ms: power.idle_ms,
         screen_kept_on: power.screen_kept_on,
         ..Signals::default()
     };
+    // a call is in use whatever the screen shows (held at an ear, the screen may be off)
+    s.in_call = shell(
+        r,
+        device,
+        "dumpsys telephony.registry | grep -E 'mCallState='",
+    )
+    .and_then(|t| parse_call_state(&t));
     if s.screen_on() == Some(true) {
         if let Some(w) = shell(
             r,
@@ -362,7 +412,17 @@ pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
             s.ime_shown = parse_ime(&i);
         }
     }
-    Some(s)
+    Some((s, from, to))
+}
+
+/// A hardware serial too generic to tell phones apart (cheap phones and some boards all report
+/// `0123456789ABCDEF`): never used as a state or lock key.
+pub fn is_generic_serial(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    let mut c = l.chars();
+    let first = c.next();
+    matches!(l.as_str(), "0123456789abcdef" | "0123456789" | "unknown")
+        || first.is_some_and(|f| c.all(|x| x == f))
 }
 
 /// What the state file remembers per phone (Unix ms): the Yes leases, one per session and
@@ -786,6 +846,7 @@ fn signals_json(s: &Signals) -> serde_json::Value {
         "idle_s": s.idle_ms.map(|m| m / 1000),
         "screen_kept_on": s.screen_kept_on,
         "locked": s.keyguard,
+        "in_call": s.in_call,
     })
 }
 
@@ -815,7 +876,9 @@ pub fn command(args: &[String]) -> (String, i32) {
     // lock finds the lease whatever name adb gives the phone (serial, ip:port, mDNS name)
     let hw = shell(&runner, &p.ask.device, "getprop ro.serialno")
         .map(|s| s.trim().to_string())
-        .filter(|s| (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()));
+        .filter(|s| (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()))
+        // a junk serial shared by many phones would make them share leases: use --device then
+        .filter(|s| !is_generic_serial(s));
     let dir = &p.state_dir;
     let device: &str = hw.as_deref().unwrap_or(&p.ask.device);
     let loaded = load_memory(dir, device, unix_ms());
@@ -902,6 +965,7 @@ mod tests {
             focus: Some(focus.into()),
             ime_shown: Some(ime),
             keyguard: Some(false),
+            in_call: Some(false),
         }
     }
 
@@ -987,6 +1051,7 @@ mod tests {
         for w in ["Asleep", "Dozing", "Dreaming"] {
             let s = Signals {
                 wakefulness: Some(w.into()),
+                in_call: Some(false),
                 ..Signals::default()
             };
             assert!(matches!(judge(&s, 60_000, &[]), Use::Free(_)), "{w}");
@@ -1094,9 +1159,61 @@ mod tests {
         // screen off is free
         let off = Signals {
             wakefulness: Some("Dozing".into()),
+            in_call: Some(false),
             ..Signals::default()
         };
         assert!(matches!(judge(&off, lim, &[]), Use::Free(_)));
+    }
+
+    #[test]
+    fn a_call_is_in_use_screen_on_or_off_and_an_unreadable_call_state_is_never_free() {
+        let lim = 5 * 60_000;
+        let off = |c: Option<bool>| Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: c,
+            ..Signals::default()
+        };
+        assert!(matches!(judge(&off(Some(false)), lim, &[]), Use::Free(_)));
+        match judge(&off(Some(true)), lim, &[]) {
+            Use::InUse(r) => assert_eq!(r, vec!["a call is in progress".to_string()]),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(judge(&off(None), lim, &[]), Use::InUse(_)));
+        // screen on, untouched for an hour, nothing else: the call alone makes it in use
+        let mut on = awake("com.example.reader", false, 3_600_000);
+        assert!(matches!(judge(&on, lim, &[]), Use::Free(_)));
+        on.in_call = Some(true);
+        assert!(matches!(judge(&on, lim, &[]), Use::InUse(_)));
+        on.in_call = None;
+        assert!(matches!(judge(&on, lim, &[]), Use::InUse(_)));
+        // the registry's lines, one per SIM: any ringing (1) or off-hook (2) line is a call
+        assert_eq!(
+            parse_call_state("  mCallState=0\n  mCallState=0\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_call_state("  mCallState=0\n  mCallState=2\n"),
+            Some(true)
+        );
+        assert_eq!(parse_call_state("  mCallState=1\n"), Some(true));
+        assert_eq!(parse_call_state("  mCallState=x\n"), Some(true));
+        assert_eq!(parse_call_state("nothing here"), None);
+    }
+
+    #[test]
+    fn generic_serials_are_never_keys() {
+        for s in [
+            "0123456789ABCDEF",
+            "0123456789abcdef",
+            "unknown",
+            "0000000000000000",
+            "1",
+        ] {
+            assert!(is_generic_serial(s), "{s}");
+        }
+        for s in ["R5CX12345AB", "a1b2c3d4", "EMULATOR35X1X11X0"] {
+            assert!(!is_generic_serial(s), "{s}");
+        }
     }
 
     #[test]
@@ -1127,6 +1244,8 @@ mod tests {
         ime: Option<&'static str>,
         sent: Mutex<Vec<String>>,
     }
+    /// The call-state line a phone in no call gives.
+    const NO_CALL: &str = "  mCallState=0\n";
     impl Runner for Phone {
         fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
             let cmd = a.last().cloned().unwrap_or_default();
@@ -1137,6 +1256,9 @@ mod tests {
                 self.window
             } else if cmd.starts_with("dumpsys input_method") {
                 self.ime
+            } else if cmd.starts_with("dumpsys telephony.registry") {
+                // like the window and keyboard reads: answered only when the phone answers them
+                self.window.map(|_| NO_CALL)
             } else {
                 None
             };
@@ -1152,7 +1274,19 @@ mod tests {
     }
 
     #[test]
-    fn a_dozing_phone_is_read_with_one_command() {
+    fn a_dozing_phone_is_read_with_two_commands_power_and_the_call_state() {
+        let p = Phone {
+            power: POWER_DOZING,
+            window: Some(""),
+            ime: None,
+            sent: Mutex::new(vec![]),
+        };
+        let s = read_signals(&p, "X").unwrap();
+        assert_eq!((s.screen_on(), s.in_call), (Some(false), Some(false)));
+        assert!(matches!(judge(&s, 60_000, &[]), Use::Free(_)));
+        let sent = p.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        // a phone that does not give its call state is in use even with the screen off
         let p = Phone {
             power: POWER_DOZING,
             window: None,
@@ -1160,8 +1294,8 @@ mod tests {
             sent: Mutex::new(vec![]),
         };
         let s = read_signals(&p, "X").unwrap();
-        assert_eq!(s.screen_on(), Some(false));
-        assert_eq!(p.sent.lock().unwrap().len(), 1);
+        assert_eq!(s.in_call, None);
+        assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
     }
 
     #[test]
@@ -1361,6 +1495,7 @@ mod tests {
         );
         let off = Signals {
             wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
             ..Signals::default()
         };
         t.set(t.get() + 60_000);

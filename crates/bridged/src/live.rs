@@ -21,6 +21,7 @@
 use agentroid_adb_link::parse::parse_devices;
 use agentroid_adb_link::runner::{RunError, RunOutput, Runner};
 use agentroid_core::frame::Shot;
+use agentroid_core::screenlock::{Reading, ScreenLock};
 use agentroid_core::transport::{
     Backend, DeviceInfo, HealthHint, Input, Screenshot, Transport, TransportError,
 };
@@ -596,6 +597,70 @@ impl<R: Runner> Transport for AdbTransport<R> {
                 out.stderr.trim()
             )))
         }
+    }
+}
+
+/// The screen lock for live adb (13 Nov 2026): no screen-changing call to a real phone unless
+/// `ask-screen` gave a live lease or the phone is not in use at the time of the call. It reads the
+/// phone through its own guarded runners and the leases from `lease_dir`. There is no switch to
+/// turn it off; `bridged --adb` always installs it.
+pub fn screen_lock_for_adb(lease_dir: std::path::PathBuf, adb: &Path) -> ScreenLock {
+    use agentroid_adb_link::guard::GuardedRunner;
+    use agentroid_adb_link::runner::AdbRunner;
+    let read_runner = GuardedRunner::new(AdbRunner::new(adb));
+    let probe_runner = GuardedRunner::new(AdbRunner::new(adb));
+    let origin = Instant::now();
+    ScreenLock::new(
+        lease_dir,
+        Box::new(move |serial, mono| {
+            agentroid_core::askscreen::read_signals_timed(&read_runner, serial, mono).map(
+                |(signals, power_from, power_to)| Reading {
+                    signals,
+                    power_from,
+                    power_to,
+                },
+            )
+        }),
+        Box::new(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        }),
+        Box::new(move || u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)),
+    )
+    .with_emulator_probe(Box::new(move |serial| {
+        agentroid_core::screenlock::probe_emulator(&probe_runner, serial)
+    }))
+}
+
+/// Put [`screen_lock_for_adb`] on `core`.
+pub fn install_screen_lock<T: Transport, C: agentroid_adb_link::runner::Clock>(
+    core: &mut agentroid_core::transport::Core<T, C>,
+    lease_dir: std::path::PathBuf,
+    adb: &Path,
+) {
+    core.set_screen_lock(screen_lock_for_adb(lease_dir, adb));
+}
+
+#[cfg(test)]
+mod lock_wiring_tests {
+    use super::*;
+    use agentroid_core::fake::{FakeClock, FakeDevice};
+    use agentroid_core::transport::Core;
+
+    #[test]
+    fn the_adb_wiring_installs_the_screen_lock_with_the_lease_folder() {
+        let mut core = Core::new(FakeDevice::new(), FakeClock::new());
+        assert!(core.screen_lock().is_none());
+        let dir = std::env::temp_dir().join("agentroid-lock-wiring-leases");
+        // an adb path that does not exist: building the lock runs nothing
+        install_screen_lock(
+            &mut core,
+            dir.clone(),
+            Path::new("Z:/no/such/adb/for/this/test.exe"),
+        );
+        let lock = core.screen_lock().expect("the lock is installed");
+        assert_eq!(lock.state_dir(), dir.as_path());
     }
 }
 

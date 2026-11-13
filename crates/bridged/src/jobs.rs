@@ -2030,7 +2030,7 @@ impl sandbox::Bridge for DaemonBridge {
             line,
         ];
         let t = self.shell_timeout_ms;
-        with_timeout(t + 1_000, move || match runner.run(&args, t) {
+        let out = with_timeout(t + 1_000, move || match runner.run(&args, t) {
             Ok(o) if o.ok() => Ok(o.stdout),
             Ok(o) => Err(format!(
                 "adb shell exited {:?}: {}",
@@ -2038,7 +2038,11 @@ impl sandbox::Bridge for DaemonBridge {
                 o.stderr.trim()
             )),
             Err(e) => Err(e.to_string()),
-        })
+        });
+        // the line was allowed and has run (or timed out running): only now is its end the
+        // agent's own activity for the screen lock's burst
+        self.daemon.backend().lock_done(&self.serial);
+        out
     }
 
     fn shell_refused(&mut self, cmd: &str, reason: &str) {

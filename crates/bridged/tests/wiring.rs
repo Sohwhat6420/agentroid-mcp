@@ -186,20 +186,33 @@ struct Harness {
 }
 
 fn start(dir: &Path, mode: DeviceMode, care: Option<CareConfig>) -> Harness {
+    start_with(dir, mode, care, None)
+}
+
+fn start_with(
+    dir: &Path,
+    mode: DeviceMode,
+    care: Option<CareConfig>,
+    lock: Option<agentroid_core::screenlock::ScreenLock>,
+) -> Harness {
     let dev = Arc::new(Mutex::new(FakeDevice::new()));
     dev.lock().unwrap().xml_override = Some(tree(&[]));
     let (hold_input, in_input) = (
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     );
-    let mut backend = CoreBackend::new(Core::new(
+    let mut core = Core::new(
         Shared {
             dev: dev.clone(),
             hold_input: hold_input.clone(),
             in_input: in_input.clone(),
         },
         CoreClock::new(),
-    ));
+    );
+    if let Some(l) = lock {
+        core.set_screen_lock(l);
+    }
+    let mut backend = CoreBackend::new(core);
     backend.set_mode(POCO_SERIAL, mode);
     let mut cfg = JobsConfig::new(dir.join("runs"));
     cfg.care = care;
@@ -883,6 +896,129 @@ async fn segments_are_signed_fenced_with_the_lease_epoch_and_r2_is_refused_unsen
         )
         .await;
     assert_eq!(code(&rep), DEVICE_ERROR, "{rep}");
+    runner.stop().await;
+    link.shutdown();
+}
+
+/// The screen lock covers link segments: a phone in use gets no segment (nothing is signed or
+/// sent), a phone put down does, and the segment's answer continues the agent's burst.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_is_sent() {
+    use agentroid_core::askscreen::Signals;
+    use agentroid_core::screenlock::{Reading, ScreenLock};
+    let dir = tmp_dir("hub-seg-lock");
+    let busy = Signals {
+        wakefulness: Some("Awake".into()),
+        idle_ms: Some(1_000),
+        screen_kept_on: Some(false),
+        focus: Some("com.anthropic.claude".into()),
+        ime_shown: Some(true),
+        keyguard: Some(false),
+        in_call: Some(false),
+    };
+    let phone_state = Arc::new(Mutex::new(busy.clone()));
+    // when set, the phone's last touch (on the lock's monotonic clock): its idle time follows
+    let touched = Arc::new(Mutex::new(None::<u64>));
+    let reads = Arc::new(AtomicU64::new(0));
+    let (ps, tt, n) = (phone_state.clone(), touched.clone(), reads.clone());
+    let origin = Instant::now();
+    let mono = move || origin.elapsed().as_millis() as u64 + 1_000_000;
+    let lock = ScreenLock::new(
+        dir.join("leases"),
+        Box::new(move |_, clock| {
+            n.fetch_add(1, Ordering::SeqCst);
+            let at = clock();
+            let mut signals = ps.lock().unwrap().clone();
+            if let Some(t) = *tt.lock().unwrap() {
+                signals.idle_ms = Some(at.saturating_sub(t));
+            }
+            Some(Reading {
+                signals,
+                power_from: at,
+                power_to: at,
+            })
+        }),
+        Box::new(|| TEST_EPOCH_MS),
+        Box::new(mono),
+    );
+    let h = start_with(&dir, DeviceMode::Full, None, Some(lock));
+    let mut a = Client::named(&h, "claude-a").await;
+    let hub_dir = dir.join("hub");
+    let link = h
+        .daemon
+        .attach_link(link_cfg(&hub_dir, "127.0.0.1"))
+        .unwrap();
+    let p = phone::FakePhone::new(phone::PhoneCfg {
+        serial: POCO_SERIAL.into(),
+        key: phone::phone_key(47),
+        hub_spki: link.hub().hub_key().spki().to_vec(),
+        sign_with: None,
+        lie_epoch_seen: None,
+        record: true,
+        tls_fp: None,
+    });
+    phone::pair_direct(&hub_dir, POCO_SERIAL, &p.cfg.key);
+    for id in ["seg-free", "seg-burst", "seg-late"] {
+        p.st().canned.insert(
+            id.into(),
+            json!({"accepted": true, "outcome": "started", "segment_id": id}),
+        );
+    }
+    let runner = phone::PhoneRunner::start(p.clone(), link.hub().url());
+    let hub = link.hub();
+    phone::wait_until("the phone is connected", 20, || {
+        hub.status(POCO_SERIAL).is_some_and(|s| s.connected)
+    })
+    .await;
+    let epoch = a
+        .ok("lease.acquire", json!({ "device": POCO_SERIAL }))
+        .await["epoch"]
+        .as_u64()
+        .unwrap();
+    phone::wait_until("the phone is back at the lease epoch", 20, || {
+        hub.status(POCO_SERIAL)
+            .is_some_and(|s| s.connected && s.epoch == Some(epoch))
+            && p.st().epoch == epoch
+    })
+    .await;
+    // in use: refused by the lock, nothing signed or sent
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-busy", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(code(&r), REFUSED, "{r}");
+    assert_eq!(r["error"]["data"]["rule"], "screen_lock", "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("screen lock") && m.contains("ask-screen")),
+        "{r}"
+    );
+    assert!(p.st().segments_seen.is_empty(), "nothing reached the phone");
+    assert!(
+        !p.st().hub_frames.iter().any(|f| f["t"] == "segment"),
+        "no segment frame went out"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the lock read the phone");
+    // put down: the segment goes
+    *phone_state.lock().unwrap() = Signals {
+        wakefulness: Some("Asleep".into()),
+        in_call: Some(false),
+        ..Signals::default()
+    };
+    let before = mono();
+    let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-free", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
+    assert_eq!(p.st().segments_seen.len(), 1);
+    // its own steps woke the phone and opened an app: the segment's answer continues the burst
+    *phone_state.lock().unwrap() = busy;
+    *touched.lock().unwrap() = Some(before);
+    let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-burst", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
+    assert_eq!(p.st().segments_seen.len(), 2);
+    // someone touches it well after that answer: refused, nothing sent
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    *touched.lock().unwrap() = Some(mono());
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-late", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(code(&r), REFUSED, "{r}");
+    assert_eq!(p.st().segments_seen.len(), 2);
     runner.stop().await;
     link.shutdown();
 }
