@@ -1230,12 +1230,12 @@ mod tests {
         assert!(t.screenshot(ip, 540).is_err());
         assert!(t.tree_xml(ip, Backend::Uiautomator).is_err());
         assert!(
-            t.shell(ip, "dumpsys power").is_err(),
+            t.shell(ip, "dumpsys window").is_err(),
             "an unapproved read is refused"
         );
         assert!(
             t.shell(ip, "dumpsys battery").is_ok(),
-            "one of the 10 approved reads still passes"
+            "one of the 11 approved reads still passes"
         );
         // ... but nothing but the identity probe and the device list ever left
         for l in lines(&log) {

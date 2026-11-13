@@ -9,7 +9,7 @@
 //! * `full`: everything.
 //! * The protected phone is always `read_only`, and never a *target*, with one exception: the
 //!   "serial + approved probes" rule. It answers only a call whose shell form is exactly
-//!   an entry of adb-link's `S24_READS` (`getprop ro.serialno` and the 9 approved probes); every other call that names
+//!   an entry of adb-link's `S24_READS` (`getprop ro.serialno` and the 10 approved probes); every other call that names
 //!   it is refused, reads included, in every mode and every spelling of its name.
 
 use crate::selector::Selector;

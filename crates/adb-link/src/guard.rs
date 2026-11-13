@@ -15,8 +15,8 @@ use crate::runner::{RunError, RunOutput, Runner};
 pub const S24_SERIAL: &str = "PROTECTED0000EXAMPLE";
 
 /// The commands the protected phone may answer. The rule is "serial + approved probes
-/// only", and the approved set is the 10 commands of
-/// `probes/readonly-s24.txt` (`getprop ro.serialno` plus the 9 below). Each is an exact string
+/// only", and the approved set is the 11 commands of
+/// `probes/readonly-s24.txt` (`getprop ro.serialno` plus the 10 below). Each is an exact string
 /// (`shell ` + the file line), never a pattern. Adding one is a deliberate policy change; the test
 /// `s24_reads_equal_the_approved_file` builds the file in with `include_str!`, so the list and the
 /// file cannot drift.
@@ -31,6 +31,9 @@ pub const S24_READS: &[&str] = &[
     "shell pm list features",
     "shell dumpsys battery",
     "shell dumpsys thermalservice",
+    // Added 13 Nov 2026 on the owner's yes: screen state and last-touch time, so a session can tell
+    // whether the phone is in use before it asks to take over (design: ask-before-take-over).
+    "shell dumpsys power",
 ];
 
 /// The one exception to the protected phone rule, chosen by its owner on 12 Nov 2026: keep its screen on while a
@@ -119,7 +122,7 @@ pub const ALWAYS_REFUSED: [&str; 5] =
 /// Task 2.15, Detector 1: the only `getevent` argv shapes the hub sends, after `-s <serial>`. Each is
 /// exact (no pattern, no extra word). **Full devices only, never the protected phone**: [`Guard::check_getevent`]
 /// refuses any other device mode, and the protected phone is refused in every spelling because no entry of
-/// [`S24_READS`] is a `getevent` (only the 10 approved reads reach it).
+/// [`S24_READS`] is a `getevent` (only the 11 approved reads reach it).
 pub const GETEVENT_SHAPES: [&[&str]; 3] = [
     // the device map (the same read as probes/readonly.txt, through exec-out so no pty rewrites it)
     &["exec-out", "getevent", "-pl"],
@@ -799,7 +802,7 @@ mod tests {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(|l| format!("shell {l}"))
             .collect();
-        assert_eq!(from_file.len(), 10, "exactly 10 commands are approved");
+        assert_eq!(from_file.len(), 11, "exactly 11 commands are approved");
         assert_eq!(
             S24_READS.to_vec(),
             from_file,
@@ -1085,7 +1088,7 @@ mod tests {
                     Guard::new().check_getevent(&args(&a), true).is_err(),
                     "{sp} {shape:?}"
                 );
-                // and the plain guard refuses it too (getevent is not one of the 10 approved reads)
+                // and the plain guard refuses it too (getevent is not one of the 11 approved reads)
                 assert!(g(&a).is_err(), "{sp} {shape:?}");
             }
         }
@@ -1413,8 +1416,8 @@ mod tests {
                 Some("getprop ro.serialno")
             );
         }
-        // and the protected phone's approved list is untouched: exactly the 10 approved reads, none of them a link shape
-        assert_eq!(S24_READS.len(), 10);
+        // and the protected phone's approved list is untouched: exactly the 11 approved reads, none of them a link shape
+        assert_eq!(S24_READS.len(), 11);
         assert!(S24_READS.iter().all(|r| !r.contains("agentroid")
             && !r.contains("broadcast")
             && !r.contains("activity service")));

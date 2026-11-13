@@ -552,6 +552,7 @@ mod tests {
             "pm list features",
             "dumpsys battery",
             "dumpsys thermalservice",
+            "dumpsys power",
         ]
         .map(String::from)
         .to_vec()
@@ -582,6 +583,7 @@ mod tests {
             "ime list -s",
             "dumpsys battery",
             "dumpsys thermalservice",
+            "dumpsys power",
         ]
         .map(String::from)
         .to_vec()
