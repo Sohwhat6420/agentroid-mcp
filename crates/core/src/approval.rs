@@ -1214,4 +1214,206 @@ mod tests {
             "HTTP 500 for /<topic>"
         );
     }
+
+    /// One HTTP exchange on a loopback port: returns the port and a handle giving the raw request.
+    fn one_shot_server(status: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+                .unwrap();
+            let mut buf = vec![];
+            let mut chunk = [0u8; 4096];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        (port, h)
+    }
+
+    const TEST_TOKEN: &str = "tk_TESTTOKEN0123456789abcdefghij";
+
+    #[test]
+    fn curl_sends_the_token_as_a_header_and_the_body_intact() {
+        let (port, h) = one_shot_server("200 OK");
+        let body = r#"{"m":"quote \" backslash \\ newline \n end","t":"alerts"}"#;
+        let mut c = CurlHttp::default();
+        let out = c
+            .post_json_auth(&format!("http://127.0.0.1:{port}/"), body, TEST_TOKEN)
+            .unwrap();
+        assert_eq!(out, "{}");
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST / HTTP/1.1"), "{req}");
+        assert!(
+            req.contains(&format!("Authorization: Bearer {TEST_TOKEN}")),
+            "{req}"
+        );
+        assert!(req.ends_with(body), "the body arrives byte for byte: {req}");
+        // and a GET with the token
+        let (port, h) = one_shot_server("200 OK");
+        c.get_auth(
+            &format!("http://127.0.0.1:{port}/taps/json?poll=1"),
+            TEST_TOKEN,
+        )
+        .unwrap();
+        let req = h.join().unwrap();
+        assert!(
+            req.starts_with("GET /taps/json?poll=1 HTTP/1.1") && req.contains(TEST_TOKEN),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn curl_reports_a_refused_login_as_an_error() {
+        // positive control for fail-with-body: without it a 401 would read as a sent ask
+        let (port, h) = one_shot_server("401 Unauthorized");
+        let r = CurlHttp::default().post_json_auth(
+            &format!("http://127.0.0.1:{port}/"),
+            "{}",
+            TEST_TOKEN,
+        );
+        h.join().unwrap();
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[test]
+    fn a_client_without_token_support_refuses_rather_than_sending_anonymously() {
+        let mut h = RecHttp {
+            posts: vec![],
+            gets: vec![],
+            reply: String::new(),
+        };
+        assert!(h.post_json_auth("http://x/", "{}", TEST_TOKEN).is_err());
+        assert!(h.get_auth("http://x/", TEST_TOKEN).is_err());
+        assert!(h.posts.is_empty() && h.gets.is_empty());
+    }
+
+    type AuthLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+    struct AuthHttp(AuthLog);
+    impl Http for AuthHttp {
+        fn post_json(&mut self, _: &str, _: &str) -> Result<String, String> {
+            Err("anonymous post".into())
+        }
+        fn get(&mut self, _: &str) -> Result<String, String> {
+            Err("anonymous get".into())
+        }
+        fn post_json_auth(&mut self, url: &str, body: &str, t: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((url.into(), body.into(), t.into()));
+            Ok("{}".into())
+        }
+        fn get_auth(&mut self, url: &str, t: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((url.into(), String::new(), t.into()));
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn with_a_login_the_buttons_use_the_tap_base_and_carry_the_tap_token() {
+        let d = tmp("login");
+        std::fs::write(d.join("alerts.topic"), "alerts\n").unwrap();
+        std::fs::write(d.join("taps.topic"), "taps\n").unwrap();
+        std::fs::write(
+            d.join("laptop.token"),
+            "tk_LAPTOP000000000000000000000000\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("tap.token"), "tk_TAP00000000000000000000000000\n").unwrap();
+        let mut cfg = NtfyConfig::new(d.join("alerts.topic"));
+        cfg.base = "http://127.0.0.1:2586".into();
+        cfg.tap_base = Some("http://100.64.0.1:2586".into());
+        cfg.inbound_topic_file = Some(d.join("taps.topic"));
+        cfg.token_file = Some(d.join("laptop.token"));
+        cfg.tap_token_file = Some(d.join("tap.token"));
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut a, 1_700_000_000_000);
+        let log: AuthLog = Default::default();
+        let mut ch = NtfyChannel::new(cfg.clone(), AuthHttp(log.clone()));
+        ch.send(&r).unwrap();
+        ch.poll(&r).unwrap();
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(l[0].0, "http://127.0.0.1:2586/");
+            assert_eq!(l[0].2, "tk_LAPTOP000000000000000000000000");
+            let v: serde_json::Value = serde_json::from_str(&l[0].1).unwrap();
+            assert_eq!(v["topic"], "alerts");
+            assert_eq!(v["actions"][0]["url"], "http://100.64.0.1:2586/taps");
+            assert_eq!(
+                v["actions"][0]["headers"]["Authorization"],
+                "Bearer tk_TAP00000000000000000000000000"
+            );
+            assert!(l[1].0.starts_with("http://127.0.0.1:2586/taps/json?poll=1"));
+            assert_eq!(l[1].2, "tk_LAPTOP000000000000000000000000");
+        }
+        // a configured token file that is missing: unavailable, never anonymous
+        std::fs::remove_file(d.join("laptop.token")).unwrap();
+        let mut ch = NtfyChannel::new(cfg, AuthHttp(log.clone()));
+        assert!(ch.send(&r).is_err());
+        // short topics need a login
+        let plain = NtfyConfig::new(d.join("alerts.topic"));
+        let mut ch = NtfyChannel::new(plain, AuthHttp(log));
+        assert!(ch.send(&r).is_err());
+    }
+
+    #[test]
+    fn any_channel_sends_on_each_and_takes_an_answer_from_either() {
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut a, 1_700_000_000_000);
+        let broken = FakeChannel {
+            send_fails: Some("down".into()),
+            ..FakeChannel::default()
+        };
+        let rid = r.id.clone();
+        let answering = FakeChannel {
+            answer_with: Some(Box::new(move |_, _| {
+                vec![Inbound {
+                    event_id: "e1".into(),
+                    time_ms: 1_700_000_001_000,
+                    message: format!("allow {rid}"),
+                }]
+            })),
+            ..FakeChannel::default()
+        };
+        let mut any = AnyChannel::new(vec![Box::new(broken), Box::new(answering)]);
+        assert!(any.send(&r).is_ok(), "one channel carried it");
+        let evs = any.poll(&r).unwrap();
+        assert_eq!(evs[0].event_id, "1:e1");
+        let mut none = AnyChannel::new(vec![Box::new(FakeChannel {
+            send_fails: Some("down".into()),
+            ..FakeChannel::default()
+        })]);
+        assert!(none.send(&r).is_err());
+        assert!(AnyChannel::new(vec![]).send(&r).is_err());
+    }
 }

@@ -391,6 +391,14 @@ pub fn decide(
                 asked: true,
             }
         }
+        // the push never went out: refused, but no cool-down (the owner said nothing)
+        o @ Outcome::Unavailable(_) => Decision {
+            allowed: false,
+            why: format!("in use ({in_use}): {o}"),
+            lease_minutes: 0,
+            retry_after_s: 60,
+            asked: false,
+        },
         o => {
             mem.denied_until_ms = after + REASK_AFTER_MS;
             Decision {
@@ -398,7 +406,7 @@ pub fn decide(
                 why: format!("in use ({in_use}): {o}"),
                 lease_minutes: 0,
                 retry_after_s: REASK_AFTER_MS / 1000,
-                asked: !matches!(o, Outcome::Unavailable(_)),
+                asked: true,
             }
         }
     }
@@ -978,6 +986,37 @@ mod tests {
         );
         assert!(!d.allowed && d.asked);
         assert!(d.why.contains("no human answer"), "{}", d.why);
+        assert!(m.denied_until_ms > 0, "no answer starts the cool-down");
+    }
+
+    #[test]
+    fn a_push_that_never_went_out_refuses_without_a_cool_down() {
+        let t = Cell::new(1_000_000u64);
+        let mut m = Memory::default();
+        let down = FakeChannel {
+            send_fails: Some("network down".into()),
+            ..FakeChannel::default()
+        };
+        let busy = awake("com.anthropic.claude", false, 1_000);
+        let d = decide(
+            &ask(),
+            &busy,
+            &mut m,
+            Some(Box::new(down)),
+            &|| t.get(),
+            &|ms| t.set(t.get() + ms),
+        );
+        assert!(!d.allowed && !d.asked && d.retry_after_s == 60);
+        assert_eq!(
+            m.denied_until_ms, 0,
+            "the owner said nothing, so nothing is held against the next ask"
+        );
+        let (ch, _) = answering("allow");
+        assert!(
+            decide(&ask(), &busy, &mut m, Some(ch), &|| t.get(), &|ms| t
+                .set(t.get() + ms))
+            .allowed
+        );
     }
 
     #[test]
