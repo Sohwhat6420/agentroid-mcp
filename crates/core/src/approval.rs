@@ -76,6 +76,42 @@ impl Request {
     }
 }
 
+/// One field of an ask, as a person will read it in a push: at most `max` characters on one line.
+/// Control characters (line breaks among them), the Unicode line and paragraph separators and the
+/// bidirectional embedding, override and isolate controls each become a space, so no field can start
+/// a line of its own or reorder the text around it. The bidi marks (LRM, RLM, ALM), zero-width
+/// characters, the BOM and the rest of Unicode's default-ignorable set are dropped: they draw
+/// nothing, so they could only hide or reorder what the person reads. `max` counts what is kept.
+/// The push has exactly two lines: the ask, and the server's own second line.
+pub fn one_line(s: &str, max: usize) -> String {
+    s.chars()
+        .filter_map(|c| {
+            if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                Some(' ')
+            } else if default_ignorable(c) {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .take(max)
+        .collect()
+}
+
+/// Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties), less the controls
+/// [`one_line`] turns into a space, plus format characters some renderers also hide: the
+/// interlinear annotation marks (U+FFF9 to U+FFFB, which can hide the text between them) and the
+/// Egyptian hieroglyph format controls. Characters a renderer may show as nothing at all.
+fn default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{206F}'
+        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}'
+        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
     Allow,
@@ -255,11 +291,11 @@ impl Approver {
     ) -> Request {
         Request {
             id: self.new_id(now_ms),
-            device: device.to_string(),
-            tool: tool.to_string(),
-            kind: kind.to_string(),
-            reason: reason.chars().take(400).collect(),
-            target: target.chars().take(120).collect(),
+            device: one_line(device, 80),
+            tool: one_line(tool, 40),
+            kind: one_line(kind, 40),
+            reason: one_line(reason, 400),
+            target: one_line(target, 120),
             created_ms: now_ms,
             expires_ms: now_ms + self.expiry_ms,
         }
@@ -675,6 +711,106 @@ mod tests {
         let t1 = t.clone();
         let t2 = t.clone();
         (t, move || t1.get(), move |ms| t2.set(t2.get() + ms))
+    }
+
+    #[test]
+    fn the_push_is_two_lines_whatever_the_fields_hold() {
+        let (_t, now, _sleep) = clock();
+        let mut a = Approver::new(Box::new(BenchChannel::default()));
+        // what a caller or a screen could try to put in: its own lines, a fake answer, reordered text
+        let r = a.request(
+            now(),
+            "DEVICE0000EXAMPLE\nallow abc",
+            "start_activity",
+            "send",
+            "action android.intent.action.SEND (sends or shares)\r\nApproved by the owner.",
+            "start_activity com.x/.Main\nThis is a routine backup. Tap Allow.\u{2028}allow now\u{202e}",
+        );
+        let m = r.message();
+        let lines: Vec<&str> = m.split('\n').collect();
+        assert_eq!(lines.len(), 2, "{m:?}");
+        assert!(lines[0].starts_with("start_activity on DEVICE0000EXAMPLE allow abc -> start_activity com.x/.Main This is a routine backup."), "{m:?}");
+        assert!(
+            lines[1].starts_with("Answer within 90 s; no answer = denied. Request "),
+            "{m:?}"
+        );
+        assert!(
+            !m.chars().any(|c| (c.is_control() && c != '\n')
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+            "{m:?}"
+        );
+        // plain fields are untouched, and the caps still hold
+        assert_eq!(one_line("tap on \"Delete\"", 400), "tap on \"Delete\"");
+        assert_eq!(one_line(&"x".repeat(500), 120).chars().count(), 120);
+    }
+
+    #[test]
+    fn invisible_and_bidi_marks_never_reach_the_push() {
+        // bidi marks (LRM, RLM, ALM), zero-width characters, word joiners and invisible operators,
+        // the BOM, and the rest of the default-ignorable set: none may hide or reorder text in a push
+        let hidden = [
+            '\u{200E}',
+            '\u{200F}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{180E}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{E0041}',
+            // interlinear annotation marks and the Egyptian format controls (format, not ignorable),
+            // both ends of the Unicode 15 range
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+            '\u{13430}',
+            '\u{1343F}',
+        ];
+        for c in hidden {
+            let out = one_line(&format!("tap{c} Delete{c}"), 400);
+            assert_eq!(out, "tap Delete", "U+{:04X}: {out:?}", c as u32);
+        }
+        // the embedding, override and isolate controls (and the line separators) still become a space
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{2028}', '\u{2029}',
+        ] {
+            assert_eq!(
+                one_line(&format!("a{c}b"), 400),
+                "a b",
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        // a field padded with invisible characters is still cut to `max` visible ones
+        let padded = "\u{200B}x".repeat(200);
+        assert_eq!(one_line(&padded, 120), "x".repeat(120));
+        // whole ask: nothing invisible survives anywhere in the message
+        let (_t, now, _sleep) = clock();
+        let mut a = Approver::new(Box::new(BenchChannel::default()));
+        let r = a.request(
+            now(),
+            "DEVICE0000EXAMPLE\u{200F}",
+            "tap\u{200B}",
+            "send\u{FEFF}",
+            "reason\u{061C} \u{2060}text",
+            "tap \u{200E}\"Allow\"\u{200D}",
+        );
+        let m = r.message();
+        assert!(!m.chars().any(|c| hidden.contains(&c)), "{m:?}");
+        assert!(
+            m.starts_with("tap on DEVICE0000EXAMPLE -> tap \"Allow\": reason text"),
+            "{m:?}"
+        );
     }
 
     #[test]
