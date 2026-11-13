@@ -418,6 +418,8 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// `adb-<serial>-...`. A serial typed in another letter case, or a phone that connected over
     /// Wi-Fi, must not fall back to `full`. When several entries match, the narrowest mode wins.
     pub fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
+        // how little a mode allows: `helper` keeps gestures, keys and typing, which `read_only` also
+        // refuses, so it sits between the two
         let narrowness = |m: DeviceMode| match m {
             DeviceMode::Full => 0,
             DeviceMode::Helper => 1,
