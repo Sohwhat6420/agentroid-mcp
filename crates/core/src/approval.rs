@@ -767,11 +767,13 @@ mod tests {
             '\u{3164}',
             '\u{FE0F}',
             '\u{E0041}',
-            // interlinear annotation marks and an Egyptian format control (format, not ignorable)
+            // interlinear annotation marks and the Egyptian format controls (format, not ignorable),
+            // both ends of the Unicode 15 range
             '\u{FFF9}',
             '\u{FFFA}',
             '\u{FFFB}',
             '\u{13430}',
+            '\u{1343F}',
         ];
         for c in hidden {
             let out = one_line(&format!("tap{c} Delete{c}"), 400);
