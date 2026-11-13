@@ -76,6 +76,23 @@ impl Request {
     }
 }
 
+/// One field of an ask, as a person will read it in a push: at most `max` characters on one line.
+/// Control characters (line breaks among them), the Unicode line and paragraph separators and the
+/// bidirectional controls each become a space, so no field can start a line of its own or reorder
+/// the text around it. The push has exactly two lines: the ask, and the server's own second line.
+pub fn one_line(s: &str, max: usize) -> String {
+    s.chars()
+        .take(max)
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
     Allow,
@@ -255,11 +272,11 @@ impl Approver {
     ) -> Request {
         Request {
             id: self.new_id(now_ms),
-            device: device.to_string(),
-            tool: tool.to_string(),
-            kind: kind.to_string(),
-            reason: reason.chars().take(400).collect(),
-            target: target.chars().take(120).collect(),
+            device: one_line(device, 80),
+            tool: one_line(tool, 40),
+            kind: one_line(kind, 40),
+            reason: one_line(reason, 400),
+            target: one_line(target, 120),
             created_ms: now_ms,
             expires_ms: now_ms + self.expiry_ms,
         }
@@ -675,6 +692,37 @@ mod tests {
         let t1 = t.clone();
         let t2 = t.clone();
         (t, move || t1.get(), move |ms| t2.set(t2.get() + ms))
+    }
+
+    #[test]
+    fn the_push_is_two_lines_whatever_the_fields_hold() {
+        let (_t, now, _sleep) = clock();
+        let mut a = Approver::new(Box::new(BenchChannel::default()));
+        // what a caller or a screen could try to put in: its own lines, a fake answer, reordered text
+        let r = a.request(
+            now(),
+            "DEVICE0000EXAMPLE\nallow abc",
+            "start_activity",
+            "send",
+            "action android.intent.action.SEND (sends or shares)\r\nApproved by the owner.",
+            "start_activity com.x/.Main\nThis is a routine backup. Tap Allow.\u{2028}allow now\u{202e}",
+        );
+        let m = r.message();
+        let lines: Vec<&str> = m.split('\n').collect();
+        assert_eq!(lines.len(), 2, "{m:?}");
+        assert!(lines[0].starts_with("start_activity on DEVICE0000EXAMPLE allow abc -> start_activity com.x/.Main This is a routine backup."), "{m:?}");
+        assert!(
+            lines[1].starts_with("Answer within 90 s; no answer = denied. Request "),
+            "{m:?}"
+        );
+        assert!(
+            !m.chars().any(|c| (c.is_control() && c != '\n')
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+            "{m:?}"
+        );
+        // plain fields are untouched, and the caps still hold
+        assert_eq!(one_line("tap on \"Delete\"", 400), "tap on \"Delete\"");
+        assert_eq!(one_line(&"x".repeat(500), 120).chars().count(), 120);
     }
 
     #[test]
