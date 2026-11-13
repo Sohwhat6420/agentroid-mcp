@@ -320,8 +320,9 @@ def make_env(console_port: int = 5554, grpc_port: int = 8554, adb_path: str = SC
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    # The CI sign-in token is for `claude` only. Take it out of this process's environment before anything is
-    # started, so bridged, the MCP server and android_world never inherit it (claude_session.child_env).
+    # The CI sign-in token is for `claude` only. Take it out of os.environ before anything is started, so the
+    # processes started from here (bridged, the MCP server, adb) do not inherit it (claude_session.child_env).
+    # android_world runs in this process and could still read it: see the note in claude_session.
     if str(HERE / "policy-v3") not in sys.path:
         sys.path.insert(0, str(HERE / "policy-v3"))
     import claude_session as _cs  # noqa: E402

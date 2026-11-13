@@ -28,9 +28,12 @@ from typing import Any, Callable, Sequence
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 
-# The CI sign-in token. It is for `claude` children only: hold_token() takes it out of this process's environment
-# (so bridged, the MCP server, android_world and anything else started from here never inherit it), and
-# child_env() hands it back to each `claude` child alone.
+# The CI sign-in token. It is for `claude` children only: hold_token() takes it out of os.environ, so the processes
+# started from here (bridged, the MCP server, adb) do not inherit it, and child_env() hands it back to each `claude`
+# child alone. What this does NOT do: code running inside this process (android_world and its dependencies) can still
+# read the held token, and the process's initial environment (/proc/<pid>/environ) still shows it to other processes
+# of the same user. The defence against android_world's dependencies is the hash lock on them
+# (ci/aw-requirements.lock); full isolation would need a separate process or user.
 TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 _held_token: str | None = None
 

@@ -41,7 +41,7 @@ class TokenIsolation(unittest.TestCase):
 
     def test_hold_takes_it_out_of_the_environment(self):
         self.assertTrue(cs.hold_token())
-        self.assertNotIn(cs.TOKEN_VAR, os.environ)
+        self.assertFalse(cs.TOKEN_VAR in os.environ, "the token is still in os.environ")
         self.assertTrue(cs.hold_token(), "idempotent: still held after a second call")
 
     def test_an_ordinary_child_no_longer_inherits_it(self):
