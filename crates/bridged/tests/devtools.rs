@@ -45,6 +45,10 @@ struct Phone {
     sizes: VecDeque<u64>,
     stats: usize,
     corrupt_push: bool,
+    /// the pull flips the first byte (same size, another sha256)
+    corrupt_pull: bool,
+    /// the pull writes half the file, then fails (as an adb pull cut off mid-way)
+    break_pull: bool,
 }
 
 #[derive(Clone)]
@@ -131,6 +135,14 @@ impl Transport for Shared {
             .get(remote)
             .cloned()
             .ok_or_else(|| TransportError(format!("{remote}: no such file")))?;
+        if p.break_pull {
+            std::fs::write(local, &b[..b.len() / 2]).map_err(|e| TransportError(e.to_string()))?;
+            return Err(TransportError("connection reset mid-pull".into()));
+        }
+        let mut b = b;
+        if p.corrupt_pull && !b.is_empty() {
+            b[0] ^= 0xff;
+        }
         std::fs::write(local, b).map_err(|e| TransportError(e.to_string()))
     }
 }
@@ -839,7 +851,7 @@ fn a_pull_bigger_than_the_phone_said_is_refused_and_deleted() {
             r["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("the copy was deleted"),
+                .contains("the laptop copy was deleted"),
             "{r}"
         );
         assert!(
@@ -852,6 +864,78 @@ fn a_pull_bigger_than_the_phone_said_is_refused_and_deleted() {
             0,
             "nothing is left in the inbox"
         );
+    });
+}
+
+/// A copy whose sha256 does not match the phone's, a pull cut off half-way, and a pull that fails
+/// before writing anything each end in an error and leave nothing in the inbox (not the partial
+/// copy, not the reserved empty name). A file already in the inbox is left alone.
+#[test]
+fn a_sha256_mismatch_or_a_failed_pull_leaves_nothing_in_the_inbox() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-fails");
+        let inbox = dir.join("inbox");
+        std::fs::write(inbox.join("keep.txt"), b"mine").unwrap();
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        let pull = json!({ "tool": "pull_new", "dir": "/sdcard/d", "poll_ms": 0 });
+        let only_keep = || {
+            let names: Vec<_> = std::fs::read_dir(&inbox)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["keep.txt"], "only the earlier file is left");
+            assert_eq!(std::fs::read(inbox.join("keep.txt")).unwrap(), b"mine");
+        };
+        // the same size, another sha256
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["shot.png".into()];
+            p.files
+                .insert("/sdcard/d/shot.png".into(), b"0123456789".to_vec());
+            p.corrupt_pull = true;
+        }
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let m = r["error"]["message"].as_str().unwrap();
+        assert!(
+            m.contains("sha256 mismatch") && m.contains("the laptop copy was deleted"),
+            "{r}"
+        );
+        only_keep();
+        // cut off half-way: the partial copy goes too
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.corrupt_pull = false;
+            p.break_pull = true;
+        }
+        let r = c.tool(POCO, pull.clone()).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let m = r["error"]["message"].as_str().unwrap();
+        assert!(
+            m.contains("pull failed") && m.contains("the laptop copy was deleted"),
+            "{r}"
+        );
+        only_keep();
+        // the phone file is gone by the time adb pulls it: nothing was written, and the reserved
+        // name is not left behind either
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.break_pull = false;
+            p.files.clear();
+            p.listing = vec!["gone.bin".into()];
+            p.sizes = VecDeque::from([3, 3]);
+        }
+        let r = c.tool(POCO, pull).await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pull failed"),
+            "{r}"
+        );
+        only_keep();
     });
 }
 

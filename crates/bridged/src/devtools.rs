@@ -38,6 +38,9 @@ pub const MAX_POLLS: u32 = 20;
 const MAX_TEXT: usize = 256 * 1024;
 /// The largest file `pull_new` fetches unless the daemon was told otherwise: 512 MiB. The phone
 /// decides how big its newest file is, so without a limit one call could fill the laptop's disk.
+/// The limit is checked against the phone's answer before the pull, and the copy's size only after
+/// adb pull has finished: a phone that lies about the size can still write up to what it sends
+/// within adb's timeout before the copy is deleted.
 pub const DEFAULT_MAX_PULL_BYTES: u64 = 512 * 1024 * 1024;
 /// Longest laptop file name kept from a phone file name, in characters.
 const MAX_LOCAL_NAME: usize = 120;
@@ -155,17 +158,29 @@ fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-/// A path in `dir` for `name` that is not taken: `name` itself, else `stem (1).ext`, `stem (2).ext`...
-/// A pulled file never replaces one that is already in the inbox.
-fn free_path(dir: &Path, name: &str) -> Option<PathBuf> {
-    let first = dir.join(name);
-    if std::fs::symlink_metadata(&first).is_err() {
-        return Some(first);
-    }
+/// Reserves a path in `dir` for `name` that is not taken: `name` itself, else `stem (1).ext`,
+/// `stem (2).ext`... The name is taken by creating an empty file with `create_new`, which fails if
+/// anything (a file, a folder, a link) is already there, so two pulls at once never pick the same
+/// name and a pulled file never replaces one that is already in the inbox. `Ok(None)` when every
+/// name is taken.
+fn reserve_path(dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
     let (stem, ext) = split_ext(name);
-    (1..=MAX_NAME_TRIES)
-        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
-        .find(|p| std::fs::symlink_metadata(p).is_err())
+    let candidates = std::iter::once(dir.join(name))
+        .chain((1..=MAX_NAME_TRIES).map(|i| dir.join(format!("{stem} ({i}){ext}"))));
+    for p in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(Some(p)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Windows answers "access denied" for a folder by that name: it is taken all the same
+            Err(_) if std::fs::symlink_metadata(&p).is_ok() => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 /// The laptop folder for `push` and `pull_new` when the daemon was given none:
@@ -559,19 +574,32 @@ impl Daemon {
                 ),
             ));
         }
-        // never over a file that is already there: a phone file named like an earlier pull gets a number
-        let local: PathBuf = free_path(&local_dir, &local_name(&newest)).ok_or_else(|| {
-            RpcError::new(
-                STATE_ERROR,
-                format!(
-                    "pull_new: {} already holds {MAX_NAME_TRIES} files named like {newest:?}; clear the inbox",
-                    local_dir.display()
-                ),
-            )
-        })?;
+        // never over a file that is already there: a phone file named like an earlier pull gets a
+        // number, and the name is reserved (an empty file) so a second pull at once cannot take it
+        let local: PathBuf = reserve_path(&local_dir, &local_name(&newest))
+            .map_err(|e| {
+                RpcError::new(
+                    STATE_ERROR,
+                    format!(
+                        "pull_new: cannot reserve a name in {}: {e}",
+                        local_dir.display()
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                RpcError::new(
+                    STATE_ERROR,
+                    format!(
+                        "pull_new: {} already holds {MAX_NAME_TRIES} files named like {newest:?}; clear the inbox",
+                        local_dir.display()
+                    ),
+                )
+            })?;
         // the size limit was checked against the phone's own answer, so whatever arrived is checked again
         // here, and a pull that fails or does not match leaves nothing in the inbox (a file that grew after
-        // the size check, or a phone that reported a false size, must not stay on the laptop)
+        // the size check, or a phone that reported a false size, must not stay on the laptop). The check
+        // runs after adb pull has finished, so a phone that lies about the size can still write as much
+        // as it can send before adb's timeout, until the copy is deleted here.
         let verified = (|| -> Result<String, RpcError> {
             self.backend()
                 .raw_pull(&t.serial, &remote, &local)
@@ -582,17 +610,22 @@ impl Daemon {
                     format!("pull_new: cannot read {}: {e}", local.display()),
                 )
             })?;
-            if got != size || got > max {
+            // `size` is at most `max` (checked above), so a matching copy is within the limit too
+            if got != size {
                 return Err(RpcError::new(
                     DEVICE_ERROR,
-                    format!("pull_new: {remote} is {size} bytes on the phone but {got} on the laptop; the copy was deleted"),
+                    format!(
+                        "pull_new: {remote} is {size} bytes on the phone but {got} on the laptop"
+                    ),
                 ));
             }
             if let Some(theirs) = parse_sha(&self.sh(t, &format!("sha256sum {rq}"))?) {
                 if theirs != sha {
                     return Err(RpcError::new(
                         DEVICE_ERROR,
-                        format!("pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}; the copy was deleted"),
+                        format!(
+                            "pull_new: sha256 mismatch for {remote}: phone {theirs}, laptop {sha}"
+                        ),
                     ));
                 }
             }
@@ -600,8 +633,18 @@ impl Daemon {
         })();
         let sha = match verified {
             Ok(sha) => sha,
-            Err(e) => {
-                let _ = std::fs::remove_file(&local);
+            Err(mut e) => {
+                // only this call's own file: the name was reserved above, so no other pull holds it
+                match std::fs::remove_file(&local) {
+                    Ok(()) => e.message.push_str("; the laptop copy was deleted"),
+                    Err(r) if r.kind() == std::io::ErrorKind::NotFound => {
+                        e.message.push_str("; nothing was left on the laptop")
+                    }
+                    Err(r) => e.message.push_str(&format!(
+                        "; the laptop copy at {} could not be deleted: {r}",
+                        local.display()
+                    )),
+                }
                 return Err(e);
             }
         };
@@ -614,4 +657,27 @@ impl Daemon {
 
 fn local_path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two pulls that want the same name at once get two names: the first reservation exists on
+    /// disk before the second looks, so the second cannot pick it.
+    #[test]
+    fn a_reserved_name_is_never_handed_out_twice() {
+        let dir = std::env::temp_dir().join(format!("agentroid-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = reserve_path(&dir, "shot.png").unwrap().unwrap();
+        let b = reserve_path(&dir, "shot.png").unwrap().unwrap();
+        assert_eq!(a, dir.join("shot.png"));
+        assert_eq!(b, dir.join("shot (1).png"));
+        assert!(a.is_file() && b.is_file());
+        // a folder by that name is taken too
+        std::fs::create_dir(dir.join("x")).unwrap();
+        assert_eq!(reserve_path(&dir, "x").unwrap().unwrap(), dir.join("x (1)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
