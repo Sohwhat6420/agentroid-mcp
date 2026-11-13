@@ -24,7 +24,8 @@ if [ "${BENCH_STOP_AT_START:-}" = "1" ]; then
 fi
 read_stop() { [ -n "${GH_TOKEN:-}" ] && gh api "repos/${GITHUB_REPOSITORY}/actions/variables/BENCH_STOP" --jq .value 2>/dev/null || true; }
 if [ "$(read_stop)" = "1" ]; then echo "BENCH_STOP=1: running nothing"; record_stop; exit 0; fi
-( while sleep 60; do
+( unset CLAUDE_CODE_OAUTH_TOKEN   # the poller needs only GH_TOKEN
+  while sleep 60; do
     if [ "$(read_stop)" = "1" ]; then echo "BENCH_STOP=1 seen at $(date -u +%H:%MZ): ending after the current task"; : > STOP; exit 0; fi
   done ) &
 poller=$!
@@ -32,7 +33,7 @@ trap 'kill "$poller" 2>/dev/null || true' EXIT
 
 adb wait-for-device
 # AndroidWorld's apps (the laptop installed these once with install_apps.py; a CI AVD starts empty).
-python3 -B "$here/install_apps.py"
+env -u CLAUDE_CODE_OAUTH_TOKEN python3 -B "$here/install_apps.py"   # the installer never needs the sign-in token
 mkdir -p out
 python3 -B -u "$here/run_pilot.py" --subset "$here/subset-all.json" --tasks "$tasks" --out out \
   --max-steps 0 --backend claude-p --policy v3 --v3 "$v3" --model opus --bench-approve

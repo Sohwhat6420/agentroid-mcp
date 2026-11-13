@@ -46,7 +46,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       # One binary for both configs: run2 sets AGENTROID_NO_IDLE_FALLBACK=1 at run time (the guard as run 2 had it;
       # fix (a) only changes the audit's reason text).
@@ -129,7 +128,10 @@ jobs:
         run: |
           git clone --filter=blob:none https://github.com/google-research/android_world.git /tmp/aw
           git -C /tmp/aw checkout "${ANDROID_WORLD_COMMIT}"
-          pip install -r /tmp/aw/requirements.txt && pip install /tmp/aw
+          # every dependency pinned by version and SHA-256 (bench/androidworld/ci/aw-requirements.lock), then the
+          # package itself with no further downloads
+          pip install --require-hashes -r bench/androidworld/ci/aw-requirements.lock
+          pip install --no-deps --no-build-isolation /tmp/aw
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22 }   # the MCP server runs its TypeScript source with --experimental-strip-types (laptop: 22.17)
       - run: npm ci

@@ -57,7 +57,7 @@ jobs:
       - name: Offline bench and receipt tests (no emulator, no API key)
         working-directory: bench/androidworld
         run: |
-          for t in test_receipts.py test_policy_claude.py test_run_pilot.py test_action_map.py test_integration_fake.py policy-v2/test_policy_claude_v2.py ci/test_ci.py; do
+          for t in test_receipts.py test_policy_claude.py test_run_pilot.py test_action_map.py test_integration_fake.py policy-v2/test_policy_claude_v2.py ci/test_ci.py policy-v3/test_token_isolation.py; do
             python -B "$t"
           done
       - run: pip install jsonschema cryptography
@@ -161,4 +161,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - run: python scripts/check_dco.py origin/${{ github.base_ref }}..HEAD
+      - run: python scripts/check_dco.py "origin/$BASE_REF..HEAD"
+        env:
+          BASE_REF: ${{ github.base_ref }}
