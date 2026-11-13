@@ -73,6 +73,20 @@ pub trait Runner {
 
     /// Tell the runner a token (address, serial) must never be used as a target. Default: no-op.
     fn deny(&self, _token: &str) {}
+
+    /// [`Runner::run`], calling `mark` once just before the command itself is sent: after any
+    /// checks the runner makes first (the guard's own adb round trip for the target's serial), so
+    /// a caller timing the command times the command alone. `mark` is not called when the command
+    /// is refused before it is sent. Default: mark, then run.
+    fn run_marked(
+        &self,
+        args: &[String],
+        timeout_ms: u64,
+        mark: &mut dyn FnMut(),
+    ) -> Result<RunOutput, RunError> {
+        mark();
+        self.run(args, timeout_ms)
+    }
 }
 
 /// Build an owned argument vector from literals.

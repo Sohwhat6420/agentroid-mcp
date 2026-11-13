@@ -9,7 +9,8 @@
 //!
 //! 1. **A live lease.** A Yes to `ask-screen` for this phone (any session, any purpose) whose
 //!    lease has not run out: allowed. The lease is read from `ask-screen`'s own state file, keyed
-//!    by the phone's hardware serial or its adb serial.
+//!    by the phone's hardware serial or its adb serial. A call a lease let through never starts
+//!    or carries on a burst, and the lease ends any burst from before it.
 //! 2. **A No stands.** Inside the 5-minute cool-down after a No (or no answer): refused.
 //! 3. **Not in use now.** The phone is read at the moment of the call, with the same rules as
 //!    `ask-screen` (screen off or dozing; or on, untouched for 5 minutes, nothing holding it on, no
@@ -196,7 +197,9 @@ impl ScreenLock {
     }
 
     /// A real emulator: an `emulator-<port>` adb name, and the device says so. Asked once per
-    /// (adb serial, hardware serial); an answer that could not be read is asked again next time.
+    /// (adb serial, hardware serial); an answer that could not be read is asked again next time,
+    /// and so is any answer for a device whose hardware serial could not be read (the daemon then
+    /// passes the adb serial, which a different device on the same port would share).
     fn is_emulator(&mut self, adb_serial: &str, hw_serial: &str) -> bool {
         if !adb_serial.starts_with("emulator-") {
             return false;
@@ -205,12 +208,19 @@ impl ScreenLock {
             return true;
         }
         let k = (adb_serial.to_string(), hw_serial.to_string());
-        if let Some(&e) = self.emulators.get(&k) {
-            return e;
+        let known = !hw_serial.is_empty()
+            && !hw_serial.eq_ignore_ascii_case(adb_serial)
+            && !is_generic_serial(hw_serial);
+        if known {
+            if let Some(&e) = self.emulators.get(&k) {
+                return e;
+            }
         }
         match (self.probe)(adb_serial) {
             Some(e) => {
-                self.emulators.insert(k, e);
+                if known {
+                    self.emulators.insert(k, e);
+                }
                 e
             }
             None => false,
@@ -238,7 +248,12 @@ impl ScreenLock {
         let ask = format!(
             "run `agentroid ask-screen --device {adb_serial} --minutes N --why \"...\"` first (a Yes gives a lease this lock honours)"
         );
+        let key = phone_key(hw_serial, adb_serial);
         if lease_until > t {
+            // the owner's Yes covers this call; a burst from before the lease does not carry on
+            // past it (the caller records no burst for a call a lease let through)
+            self.ours.remove(&key);
+            self.verdicts.remove(&key);
             return Ok(Admitted::Lease((lease_until - t).div_ceil(60_000)));
         }
         if t < denied_until {
@@ -247,7 +262,6 @@ impl ScreenLock {
                 (denied_until - t).div_ceil(1000).min(REASK_AFTER_MS / 1000)
             ));
         }
-        let key = phone_key(hw_serial, adb_serial);
         let start = (self.mono)();
         if let Some((at, v)) = self.verdicts.get(&key) {
             if start.saturating_sub(*at) <= VERDICT_TTL_MS {
@@ -798,6 +812,133 @@ mod tests {
         assert!(lock.admit("emulator-5558", "R5CX9").is_err());
         assert!(lock.admit("emulator-5558", "R5CX9").is_err());
         assert_eq!(asked.load(Ordering::SeqCst), 4);
+    }
+
+    /// Put an emulator probe on the rig's lock that answers `answer` and counts its questions.
+    fn probed(r: &mut Rig, answer: &Arc<Mutex<Option<bool>>>) -> Arc<AtomicUsize> {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (a, ans) = (asked.clone(), answer.clone());
+        let lock = std::mem::replace(
+            &mut r.lock,
+            ScreenLock::new(
+                PathBuf::new(),
+                Box::new(|_, _| None),
+                Box::new(|| 0),
+                Box::new(|| 0),
+            ),
+        );
+        r.lock = lock.with_emulator_probe(Box::new(move |_| {
+            a.fetch_add(1, Ordering::SeqCst);
+            *ans.lock().unwrap()
+        }));
+        asked
+    }
+
+    #[test]
+    fn only_an_emulator_adb_name_can_be_exempt_whatever_the_device_says() {
+        let mut r = rig("emuname");
+        r.set(Some(awake("com.anthropic.claude", true, 0)));
+        let answer = Arc::new(Mutex::new(Some(true)));
+        let asked = probed(&mut r, &answer);
+        // an emulator's hardware serial, or qemu=1, behind a name that is not `emulator-<port>`:
+        // locked, and the device is not even asked
+        assert!(r.lock.admit("192.0.2.9:5555", "EMULATOR35X1X11X0").is_err());
+        assert!(r.lock.admit("R5CX12345AB", "R5CX12345AB").is_err());
+        assert!(r
+            .lock
+            .admit("adb-R5CX1-x._adb-tls-connect._tcp", "R5CX1")
+            .is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        // the positive control: the same answers behind an emulator name exempt it
+        assert_eq!(
+            r.lock.admit("emulator-5554", "EMULATOR35X1X11X0"),
+            Ok(Admitted::Emulator)
+        );
+        assert_eq!(
+            r.lock.admit("emulator-5556", "R5CX12345AB"),
+            Ok(Admitted::Emulator)
+        );
+    }
+
+    #[test]
+    fn a_probe_answer_is_not_kept_for_a_device_whose_hardware_serial_was_not_read() {
+        let mut r = rig("emucache");
+        r.set(Some(awake("com.anthropic.claude", true, 0)));
+        let answer = Arc::new(Mutex::new(Some(true)));
+        let asked = probed(&mut r, &answer);
+        // the daemon passes the adb serial (or nothing) when it could not read ro.serialno: an
+        // emulator now, maybe a forwarded real phone on the same port later
+        for hw in ["emulator-5554", "EMULATOR-5554", "", "0123456789ABCDEF"] {
+            *answer.lock().unwrap() = Some(true);
+            assert_eq!(
+                r.lock.admit("emulator-5554", hw),
+                Ok(Admitted::Emulator),
+                "{hw:?}"
+            );
+            *answer.lock().unwrap() = Some(false);
+            assert!(r.lock.admit("emulator-5554", hw).is_err(), "{hw:?}");
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 8);
+        // the positive control: a hardware serial that was read keeps its answer
+        *answer.lock().unwrap() = Some(true);
+        assert_eq!(
+            r.lock.admit("emulator-5554", "ABC123"),
+            Ok(Admitted::Emulator)
+        );
+        *answer.lock().unwrap() = Some(false);
+        assert_eq!(
+            r.lock.admit("emulator-5554", "ABC123"),
+            Ok(Admitted::Emulator)
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 9);
+    }
+
+    #[test]
+    fn a_lease_ends_the_burst_it_interrupts() {
+        // the positive control first: without a lease the agent's own touch carries the burst on
+        let mut r = rig("leaseburst0");
+        r.acted_at(T0);
+        r.at(T0 + 120_000);
+        r.set(Some(awake("com.whatsapp", true, 120_000)));
+        assert_eq!(r.lock.admit("s1", "HW1"), Ok(Admitted::Burst));
+        // the review's probe: a burst at T0, then a lease to T0 + 60 s used at T0 + 59 s; at
+        // T0 + 120 s, with an app open, the keyboard up and the agent's touch the last one, the
+        // lease is over and so is the burst
+        let mut r = rig("leaseburst");
+        r.acted_at(T0);
+        let mut m = Memory::default();
+        m.leases.insert("0123456789abcdef".into(), T0 + 60_000);
+        save_memory(&r.dir, "hw1", &m).unwrap();
+        r.at(T0 + 59_000);
+        r.set(Some(awake("com.whatsapp", true, 59_000)));
+        assert_eq!(r.lock.admit("s1", "HW1"), Ok(Admitted::Lease(1)));
+        r.at(T0 + 120_000);
+        r.set(Some(awake("com.whatsapp", true, 120_000)));
+        let e = r.lock.admit("s1", "HW1").unwrap_err();
+        assert!(e.contains("in use"), "{e}");
+    }
+
+    #[test]
+    fn a_slow_power_read_cannot_strip_the_agents_left_overs_either() {
+        // the positive control: a quick power read after the gap, untouched since the agent's
+        // action: its left-over app and keyboard are not counted
+        let (mut lock, clock, touch) = slow("leftquick", 0, 10);
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        lock.acted("s1", "HW1");
+        touch.store(T0 + 900, Ordering::SeqCst);
+        clock.store(T0 + BURST_GAP_MS + 60_000, Ordering::SeqCst);
+        match lock.admit("s1", "HW1") {
+            Ok(Admitted::Free(why)) => assert!(why.contains("left by the agent"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // the same with a power read too slow to date the touch: counted, so in use
+        let (mut lock, clock, touch) = slow("leftslow", 0, MAX_POWER_READ_MS + 500);
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        lock.acted("s1", "HW1");
+        touch.store(T0 + 900, Ordering::SeqCst);
+        clock.store(T0 + BURST_GAP_MS + 60_000, Ordering::SeqCst);
+        let e = lock.admit("s1", "HW1").unwrap_err();
+        assert!(e.contains("in use"), "{e}");
     }
 
     #[test]

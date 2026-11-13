@@ -637,7 +637,8 @@ impl crate::server::Daemon {
                     let id = p.segment_id.clone();
                     // the screen lock, before anything is built, signed or sent: a segment
                     // changes the screen like any tap
-                    self.backend()
+                    let ticket = self
+                        .backend()
                         .lock_admit(&d.serial, "link.segment")
                         .map_err(|e| {
                             RpcError::new(REFUSED, e.to_string())
@@ -645,9 +646,13 @@ impl crate::server::Daemon {
                         })?;
                     let r = link.segment(&key, epoch, p);
                     // the phone's answer is in (or the segment may be running): the end of the
-                    // agent's own action
-                    if r.is_ok() || link.segment_is_running(&key, &id) {
-                        self.backend().lock_done(&d.serial);
+                    // agent's own action. A segment that failed before it ran cancels its ticket
+                    // (dropped: nothing it did is the agent's)
+                    match ticket {
+                        Some(t) if r.is_ok() || link.segment_is_running(&key, &id) => {
+                            self.backend().lock_done(t)
+                        }
+                        cancelled => drop(cancelled),
                     }
                     to_value(&r?)
                 } else {

@@ -667,6 +667,17 @@ impl<R: Runner> Runner for GuardedRunner<R> {
     fn deny(&self, token: &str) {
         self.guard.deny(token);
     }
+
+    fn run_marked(
+        &self,
+        args: &[String],
+        timeout_ms: u64,
+        mark: &mut dyn FnMut(),
+    ) -> Result<RunOutput, RunError> {
+        // the checks (and their serial read) first, outside the marked window
+        self.admit(args)?;
+        self.inner.run_marked(args, timeout_ms, mark)
+    }
 }
 
 #[cfg(test)]
@@ -914,6 +925,35 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    #[test]
+    fn a_marked_run_marks_after_the_serial_read_and_not_at_all_when_refused() {
+        let r = GuardedRunner::new(Spy {
+            hw: "R5CX12345AB".into(),
+            calls: RefCell::new(vec![]),
+        });
+        let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys power"]);
+        let marked_after = RefCell::new(None);
+        r.run_marked(&argv, 1000, &mut || {
+            *marked_after.borrow_mut() = Some(r.inner.calls.borrow().len())
+        })
+        .unwrap();
+        let calls = r.inner.calls.borrow().clone();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].last().unwrap(), "getprop ro.serialno");
+        assert_eq!(calls[1].last().unwrap(), "dumpsys power");
+        // marked once the serial read was done, before the command
+        assert_eq!(*marked_after.borrow(), Some(1));
+        // the protected phone: refused before anything is sent, and never marked
+        let s24 = GuardedRunner::new(Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        });
+        let mut marked = false;
+        let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys window"]);
+        assert!(s24.run_marked(&argv, 1000, &mut || marked = true).is_err());
+        assert!(!marked);
     }
 
     #[test]

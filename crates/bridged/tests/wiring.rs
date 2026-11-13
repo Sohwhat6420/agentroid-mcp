@@ -1008,14 +1008,30 @@ async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_i
     assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
     assert_eq!(p.st().segments_seen.len(), 1);
     // its own steps woke the phone and opened an app: the segment's answer continues the burst
+    // (past the 1 s the lock keeps a verdict, so only the recorded answer can let it through)
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     *phone_state.lock().unwrap() = busy;
     *touched.lock().unwrap() = Some(before);
     let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-burst", "run_id": "run-a", "steps": r1_steps() })).await;
     assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
     assert_eq!(p.st().segments_seen.len(), 2);
-    // someone touches it well after that answer: refused, nothing sent
+    let after_burst = mono();
+    // the review's probe: a segment the lock admits (the agent's own touch is still the last)
+    // that fails before it runs, 700 ms on: it is not the agent's activity, so it does not move
+    // the end of the burst
     tokio::time::sleep(Duration::from_millis(700)).await;
-    *touched.lock().unwrap() = Some(mono());
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-bad", "run_id": "run-a", "steps": [{"bogus": 1}] })).await;
+    assert_ne!(
+        code(&r),
+        REFUSED,
+        "admitted, then refused by the build: {r}"
+    );
+    assert!(r.get("error").is_some(), "{r}");
+    assert_eq!(p.st().segments_seen.len(), 2);
+    // someone touched it 500 ms after the burst's answer (before the failed segment returned):
+    // refused, nothing sent (past the 1 s the lock keeps a verdict)
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    *touched.lock().unwrap() = Some(after_burst + 500);
     let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-late", "run_id": "run-a", "steps": r1_steps() })).await;
     assert_eq!(code(&r), REFUSED, "{r}");
     assert_eq!(p.st().segments_seen.len(), 2);

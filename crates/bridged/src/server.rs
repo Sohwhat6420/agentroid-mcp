@@ -12,7 +12,7 @@ use agentroid_core::fileguard::FileOp;
 use agentroid_core::gate::{self, Call, DeviceMode};
 use agentroid_core::settle::{Settle, SettleOpts};
 use agentroid_core::transport::{
-    Core, CoreError, DeviceInfo, HealthHint, Outcome, Transport, TransportError,
+    Core, CoreError, DeviceInfo, HealthHint, LockTicket, Outcome, Transport, TransportError,
 };
 use agentroid_core::tree::Bounds;
 use serde::de::DeserializeOwned;
@@ -113,8 +113,10 @@ pub trait DeviceBackend: Send {
         Err(TransportError("this backend cannot pull files".into()))
     }
     /// A raw shell line through core's device gate, shell guard, approval channel and audit log
-    /// (D3b). `Ok` means the caller may send it. Default: nothing is admitted.
-    fn shell_gate(&mut self, _serial: &str, _line: &str) -> Result<(), CoreError> {
+    /// (D3b). `Ok` means the caller may send it; `Ok(Some(ticket))` means the screen lock admitted
+    /// it, and the ticket goes to [`DeviceBackend::lock_done`] once it has run. Default: nothing
+    /// is admitted.
+    fn shell_gate(&mut self, _serial: &str, _line: &str) -> Result<Option<LockTicket>, CoreError> {
         Err(CoreError::Invalid("this backend has no shell guard".into()))
     }
     /// A `push` / `pull` of `phone_path` through core's device gate, file guard, approval channel
@@ -131,13 +133,18 @@ pub trait DeviceBackend: Send {
     /// the audit log holds every refused command. Default: not recorded.
     fn shell_refused(&mut self, _serial: &str, _line: &str, _reason: &str) {}
     /// Core's screen lock alone, for screen-changing work core does not send itself (a link
-    /// segment). Default: no lock, so nothing is refused.
-    fn lock_admit(&mut self, _serial: &str, _tool: &'static str) -> Result<(), CoreError> {
-        Ok(())
+    /// segment). `Ok(Some(ticket))`: give the ticket to [`DeviceBackend::lock_done`] once the work
+    /// has run, or drop it if it never ran. Default: no lock, so nothing is refused.
+    fn lock_admit(
+        &mut self,
+        _serial: &str,
+        _tool: &'static str,
+    ) -> Result<Option<LockTicket>, CoreError> {
+        Ok(None)
     }
-    /// Work the lock admitted ([`DeviceBackend::lock_admit`], or a shell line through
+    /// The work `ticket` names ([`DeviceBackend::lock_admit`], or a shell line through
     /// [`DeviceBackend::shell_gate`]) has run: its end is the agent's own activity. Default: none.
-    fn lock_done(&mut self, _serial: &str) {}
+    fn lock_done(&mut self, _ticket: LockTicket) {}
 }
 
 /// Why a backend without the phone half answers `pixel_probe` and element crops with an error.
@@ -227,7 +234,7 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
     ) -> Result<(), TransportError> {
         self.core.transport.pull(serial, remote, local)
     }
-    fn shell_gate(&mut self, serial: &str, line: &str) -> Result<(), CoreError> {
+    fn shell_gate(&mut self, serial: &str, line: &str) -> Result<Option<LockTicket>, CoreError> {
         self.core.shell_gate(Some(serial), line)
     }
     fn file_gate(&mut self, serial: &str, op: FileOp, phone_path: &str) -> Result<(), CoreError> {
@@ -236,11 +243,15 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
     fn shell_refused(&mut self, serial: &str, line: &str, reason: &str) {
         self.core.record_shell_refusal(Some(serial), line, reason);
     }
-    fn lock_admit(&mut self, serial: &str, tool: &'static str) -> Result<(), CoreError> {
+    fn lock_admit(
+        &mut self,
+        serial: &str,
+        tool: &'static str,
+    ) -> Result<Option<LockTicket>, CoreError> {
         self.core.lock_admit(Some(serial), tool)
     }
-    fn lock_done(&mut self, serial: &str) {
-        self.core.lock_done(Some(serial));
+    fn lock_done(&mut self, ticket: LockTicket) {
+        self.core.lock_done(ticket);
     }
 }
 

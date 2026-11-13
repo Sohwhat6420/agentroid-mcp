@@ -16,9 +16,10 @@
 //!   use, so a phone that answers only `dumpsys power` (a protected phone) is in use whenever its
 //!   screen is on.
 //! * **A call** that is ringing or live (`mCallState` from `dumpsys telephony.registry`, read
-//!   whatever the screen shows) is in use, screen on or off. A call state that cannot be read
-//!   counts as in use too, so a protected phone (which answers only `dumpsys power`) is always
-//!   asked.
+//!   whatever the screen shows) is in use, screen on or off. A dump that ran and has no
+//!   `mCallState` line at all (a device with no telephony) means no carrier call. A call state
+//!   that cannot be read (the read failed or was refused) counts as in use, so a protected phone
+//!   (which answers only `dumpsys power`) is always asked.
 //! * **Not in use** (screen off or dozing; or on, untouched, nothing holding it on, no keyboard,
 //!   no listed app): allowed at once, with no push. Run the command again before each burst.
 //! * **In use:** one push with what the session wants and for how long. Yes gives a lease of
@@ -287,9 +288,11 @@ pub fn parse_ime(text: &str) -> Option<bool> {
     None
 }
 
-/// Parse `dumpsys telephony.registry` (or its `mCallState=` lines, one per SIM): `Some(true)`
-/// when any of them is ringing (1) or off the hook (2), or not a number; `None` when there is no
-/// such line.
+/// Parse the output of a `dumpsys telephony.registry` that ran (exit 0): `Some(true)` when any
+/// `mCallState=` line (one per SIM) is ringing (1) or off the hook (2), or not a number;
+/// `Some(false)` when every such line is idle (0), or when there is no such line at all (no
+/// telephony, so no carrier call); `None` when the dump is a refusal (`Permission Denial`). A
+/// read that failed or was refused never gets here: the caller keeps it unknown.
 pub fn parse_call_state(text: &str) -> Option<bool> {
     let mut seen = None;
     for word in text.split_whitespace() {
@@ -298,7 +301,21 @@ pub fn parse_call_state(text: &str) -> Option<bool> {
             seen = Some(seen.unwrap_or(false) || busy);
         }
     }
-    seen
+    match seen {
+        Some(v) => Some(v),
+        None if text.contains("Permission Denial") => None,
+        None => Some(false),
+    }
+}
+
+/// The hardware serial `ask-screen` keeps its state under, from what `getprop ro.serialno` gave
+/// (`None`: it could not be read). `None` too for anything that is not a plain serial, and for a
+/// junk serial many phones share: then the state is kept under `--device`.
+pub(crate) fn state_serial(read: Option<&str>) -> Option<String> {
+    read.map(|s| s.trim().to_string())
+        .filter(|s| (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()))
+        // a junk serial shared by many phones would make them share leases: use --device then
+        .filter(|s| !is_generic_serial(s))
 }
 
 /// Decide whether the phone is in use. Anything unknown while the screen is on counts as in use,
@@ -371,6 +388,21 @@ pub(crate) fn shell(r: &dyn Runner, device: &str, cmd: &str) -> Option<String> {
     }
 }
 
+/// [`shell`], with `mark` called just before the command itself is sent (after the guard's own
+/// checks): see [`Runner::run_marked`].
+fn shell_marked(r: &dyn Runner, device: &str, cmd: &str, mark: &mut dyn FnMut()) -> Option<String> {
+    let a = vec![
+        "-s".to_string(),
+        device.to_string(),
+        "shell".to_string(),
+        cmd.to_string(),
+    ];
+    match r.run_marked(&a, 15_000, mark) {
+        Ok(o) if o.ok() => Some(o.stdout),
+        _ => None,
+    }
+}
+
 /// Read the signals through `r` (production: the guarded adb runner, so a protected phone answers
 /// `dumpsys power` and nothing else). `None` when not even `dumpsys power` could be read.
 pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
@@ -379,14 +411,18 @@ pub fn read_signals(r: &dyn Runner, device: &str) -> Option<Signals> {
 
 /// [`read_signals`], with the times on `clock` just before and just after the `dumpsys power`
 /// read (the read that states the last touch as "so many ms ago"). The screen lock uses them.
+/// "Just before" is after the guarded runner's own serial read, so only the power read is timed.
 pub fn read_signals_timed(
     r: &dyn Runner,
     device: &str,
     clock: &dyn Fn() -> u64,
 ) -> Option<(Signals, u64, u64)> {
-    let from = clock();
-    let power = parse_power(&shell(r, device, "dumpsys power")?);
-    let to = clock().max(from);
+    let mut sent = None;
+    let power = shell_marked(r, device, "dumpsys power", &mut || sent = Some(clock()));
+    let to = clock();
+    let from = sent.unwrap_or(to);
+    let power = parse_power(&power?);
+    let to = to.max(from);
     let mut s = Signals {
         wakefulness: power.wakefulness,
         idle_ms: power.idle_ms,
@@ -394,12 +430,9 @@ pub fn read_signals_timed(
         ..Signals::default()
     };
     // a call is in use whatever the screen shows (held at an ear, the screen may be off)
-    s.in_call = shell(
-        r,
-        device,
-        "dumpsys telephony.registry | grep -E 'mCallState='",
-    )
-    .and_then(|t| parse_call_state(&t));
+    // the whole dump, not a grep: a grep that finds nothing exits 1, which would make a device
+    // with no telephony read as unknown; a dump that failed or was refused stays unknown
+    s.in_call = shell(r, device, "dumpsys telephony.registry").and_then(|t| parse_call_state(&t));
     if s.screen_on() == Some(true) {
         if let Some(w) = shell(
             r,
@@ -874,11 +907,7 @@ pub fn command(args: &[String]) -> (String, i32) {
     };
     // keep the state under the phone's hardware serial when it can be read, so the daemon's screen
     // lock finds the lease whatever name adb gives the phone (serial, ip:port, mDNS name)
-    let hw = shell(&runner, &p.ask.device, "getprop ro.serialno")
-        .map(|s| s.trim().to_string())
-        .filter(|s| (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()))
-        // a junk serial shared by many phones would make them share leases: use --device then
-        .filter(|s| !is_generic_serial(s));
+    let hw = state_serial(shell(&runner, &p.ask.device, "getprop ro.serialno").as_deref());
     let dir = &p.state_dir;
     let device: &str = hw.as_deref().unwrap_or(&p.ask.device);
     let loaded = load_memory(dir, device, unix_ms());
@@ -1197,7 +1226,140 @@ mod tests {
         );
         assert_eq!(parse_call_state("  mCallState=1\n"), Some(true));
         assert_eq!(parse_call_state("  mCallState=x\n"), Some(true));
-        assert_eq!(parse_call_state("nothing here"), None);
+        // a dump that ran with no such line: no telephony, so no carrier call
+        assert_eq!(parse_call_state("nothing here"), Some(false));
+        assert_eq!(
+            parse_call_state("Can't find service: telephony.registry\n"),
+            Some(false)
+        );
+        assert_eq!(parse_call_state(""), Some(false));
+        // a refusal printed by dumpsys itself stays unknown
+        assert_eq!(
+            parse_call_state("Permission Denial: can't dump telephony.registry from pid=1\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_state_is_kept_under_a_real_hardware_serial_and_never_a_junk_one() {
+        assert_eq!(
+            state_serial(Some("R5CX12345AB\n")).as_deref(),
+            Some("R5CX12345AB")
+        );
+        // junk serials many phones share: under --device instead
+        for junk in [
+            "0123456789ABCDEF",
+            "0123456789abcdef",
+            "unknown",
+            "0000000000",
+        ] {
+            assert_eq!(state_serial(Some(junk)), None, "{junk}");
+        }
+        // unreadable, empty, too long, not plain
+        assert_eq!(state_serial(None), None);
+        assert_eq!(state_serial(Some("  \n")), None);
+        assert_eq!(state_serial(Some(&"A1".repeat(33))), None);
+        assert_eq!(state_serial(Some("R5CX-12")), None);
+    }
+
+    /// Answers `dumpsys power` (dozing) and the call-state read with `call`; `None` refuses it.
+    struct CallPhone {
+        call: Option<(i32, &'static str)>,
+    }
+    impl Runner for CallPhone {
+        fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
+            let cmd = a.last().cloned().unwrap_or_default();
+            let (code, out) = if cmd == "dumpsys power" {
+                (0, POWER_DOZING)
+            } else if cmd == "dumpsys telephony.registry" {
+                match self.call {
+                    Some(c) => c,
+                    None => return Err(RunError::Refused("not on the list".into())),
+                }
+            } else {
+                return Err(RunError::Refused("not on the list".into()));
+            };
+            Ok(RunOutput {
+                code: Some(code),
+                stdout: out.into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_device_with_no_telephony_has_no_call_but_a_failed_call_read_stays_unknown() {
+        // the dump ran and has no mCallState line (a tablet, an emulator without a radio)
+        for out in [
+            "Can't find service: telephony.registry\n",
+            "  mServiceState=...\n",
+        ] {
+            let s = read_signals(
+                &CallPhone {
+                    call: Some((0, out)),
+                },
+                "X",
+            )
+            .unwrap();
+            assert_eq!(s.in_call, Some(false), "{out:?}");
+            assert!(matches!(judge(&s, 60_000, &[]), Use::Free(_)));
+        }
+        // the read failed (non-zero exit) or was refused (a protected phone): unknown, in use
+        for p in [
+            CallPhone {
+                call: Some((1, "")),
+            },
+            CallPhone { call: None },
+        ] {
+            let s = read_signals(&p, "X").unwrap();
+            assert_eq!(s.in_call, None);
+            assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
+        }
+        // the positive control: a call the registry reports
+        let s = read_signals(
+            &CallPhone {
+                call: Some((0, "  mCallState=2\n")),
+            },
+            "X",
+        )
+        .unwrap();
+        assert_eq!(s.in_call, Some(true));
+    }
+
+    #[test]
+    fn only_the_power_read_itself_is_timed() {
+        use std::cell::Cell;
+        // a runner that spends 900 ms on its own checks before it sends each command (the guard's
+        // serial read), then 40 ms on the command
+        struct Checked<'a>(&'a Cell<u64>);
+        impl Runner for Checked<'_> {
+            fn run(&self, a: &[String], t: u64) -> Result<RunOutput, RunError> {
+                self.run_marked(a, t, &mut || {})
+            }
+            fn run_marked(
+                &self,
+                a: &[String],
+                _t: u64,
+                mark: &mut dyn FnMut(),
+            ) -> Result<RunOutput, RunError> {
+                self.0.set(self.0.get() + 900);
+                mark();
+                self.0.set(self.0.get() + 40);
+                let out = if a.last().map(String::as_str) == Some("dumpsys power") {
+                    POWER_DOZING
+                } else {
+                    NO_CALL
+                };
+                Ok(RunOutput {
+                    code: Some(0),
+                    stdout: out.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let clock = Cell::new(1_000);
+        let (_, from, to) = read_signals_timed(&Checked(&clock), "X", &|| clock.get()).unwrap();
+        assert_eq!((from, to), (1_900, 1_940));
     }
 
     #[test]
