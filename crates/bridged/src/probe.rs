@@ -849,7 +849,7 @@ mod tests {
         inner.serial = Some(S24_SERIAL.to_string());
         let guarded = GuardedRunner::new(inner);
         let p = probe(&guarded, TARGET, DeviceMode::ReadOnly);
-        assert!(p.probed, "the 10 approved commands got through the guard");
+        assert!(p.probed, "the 11 approved commands got through the guard");
         assert_eq!(p.serial, S24_SERIAL);
         assert_eq!(
             (p.maker.as_str(), p.skin.as_str(), p.skin_version.as_str()),
