@@ -27,3 +27,4 @@ wm density
 ime list -s
 dumpsys battery
 dumpsys thermalservice
+dumpsys power

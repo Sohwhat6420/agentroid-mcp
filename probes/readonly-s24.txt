@@ -1,4 +1,4 @@
-# The protected-device probe list: the ten read-only commands a device on the protected list may answer.
+# The protected-device probe list: the eleven read-only commands a device on the protected list may answer.
 # A protected device is read-only and never a target; it answers only these exact commands.
 # One exact command per line, matched whole: no arguments added, no metacharacters, 5 s timeout each.
 # Lines starting with # and blank lines are ignored. Adding a line here is a deliberate policy change.
@@ -17,3 +17,4 @@ wm density
 pm list features
 dumpsys battery
 dumpsys thermalservice
+dumpsys power

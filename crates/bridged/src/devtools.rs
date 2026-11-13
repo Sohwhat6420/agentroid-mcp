@@ -6,7 +6,7 @@
 //! the transport, and is journalled in the daemon log ([`devtools_log`], and stderr).
 //!
 //! * `doctor` with `diagnose`: the read-only allowlist of [`crate::diagnose`]. `full` and `read_only`
-//!   devices; the protected phone only its 10 approved reads; `helper` devices have no adb shell, so refused.
+//!   devices; the protected phone only its 11 approved reads; `helper` devices have no adb shell, so refused.
 //! * `push`: `full` devices only (the plan's 3.2 matrix row). SHA-256 of the laptop file, then of
 //!   the phone file by `sha256sum` (the read-back); a mismatch is an error. Paths are quoted here.
 //! * `pull_new`: `full` devices only too (it writes the laptop). The newest file of a phone

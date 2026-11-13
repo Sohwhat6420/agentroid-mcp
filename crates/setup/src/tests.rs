@@ -283,14 +283,14 @@ fn doctor_on_the_s24_sends_only_approved_reads() {
         assert_eq!(r.mode, DeviceMode::ReadOnly);
         assert!(r.findings.is_empty() && !r.unchecked.is_empty());
         assert!(r.sent.iter().all(|l| approved(l)), "{:?}", r.sent);
-        assert_eq!(r.sent.len(), 10, "the 10 approved reads, each once");
+        assert_eq!(r.sent.len(), 11, "the 11 approved reads, each once");
         // ... and without it: doctor itself sends nothing else
         let mut bare = Recorded::new(ALL_GOOD);
         bare.serial = Some(S24_SERIAL.to_string());
         doctor::doctor(&bare, IP, configured, &q()).unwrap();
         let lines = bare.lines();
         assert!(lines.iter().all(|l| approved(l)), "{lines:?}");
-        assert_eq!(lines.len(), 10);
+        assert_eq!(lines.len(), 11);
     }
     // spelt as the protected phone: the same
     let bare = Recorded::new(ALL_GOOD);
