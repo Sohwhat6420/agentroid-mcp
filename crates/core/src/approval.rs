@@ -101,13 +101,15 @@ pub fn one_line(s: &str, max: usize) -> String {
 }
 
 /// Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties), less the controls
-/// [`one_line`] turns into a space: characters a renderer shows as nothing at all.
+/// [`one_line`] turns into a space, plus format characters some renderers also hide: the
+/// interlinear annotation marks (U+FFF9 to U+FFFB, which can hide the text between them) and the
+/// Egyptian hieroglyph format controls. Characters a renderer may show as nothing at all.
 fn default_ignorable(c: char) -> bool {
     matches!(c,
         '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
         | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{206F}'
-        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}'
-        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}'
+        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,6 +767,11 @@ mod tests {
             '\u{3164}',
             '\u{FE0F}',
             '\u{E0041}',
+            // interlinear annotation marks and an Egyptian format control (format, not ignorable)
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+            '\u{13430}',
         ];
         for c in hidden {
             let out = one_line(&format!("tap{c} Delete{c}"), 400);
