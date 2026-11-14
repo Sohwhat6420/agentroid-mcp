@@ -91,6 +91,11 @@ Geist and JetBrains Mono fonts ................... SIL Open Font License 1.1
   Bundled as woff2 files in web/jobview/src/fonts/. The licence texts sit
   beside the fonts (LICENSE-Geist-OFL.txt, LICENSE-JetBrainsMono-OFL.txt).
 
+Instrument Serif, Hanken Grotesk, JetBrains Mono and Antonio fonts ... SIL Open Font License 1.1
+  Bundled as ttf files in docs/media/src/fonts/, used only at build time to
+  outline the text of the README's card and banner. The licence texts sit
+  beside the fonts (*-OFL.txt).
+
 ------------------------------------------------------------------------------
 4. Studied for design; no code incorporated
 ------------------------------------------------------------------------------
