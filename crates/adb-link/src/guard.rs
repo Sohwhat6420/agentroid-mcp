@@ -67,20 +67,21 @@ pub const S24_SCREEN_AWAKE_KEYS: [(&str, &str); 2] = [
 /// (`askscreen::parse_call_state`) and drops the text. It is not in [`S24_READS`].
 pub const S24_CALL_STATE_READ: &str = "dumpsys telephony.registry";
 
-/// The protected phone's focused app and keyboard, for the screen lock alone. Added 14 Nov 2026 on
-/// the owner's ruling, word for word: "Allow the two reads (Recommended)". Without them the
-/// protected phone's focused app and keyboard are unknown, so with its screen on it always reads
-/// as in use, and work on it was limited to bursts.
+/// The protected phone's focused app and keyboard, for the screen lock and `ask-screen` alone.
+/// Added 14 Nov 2026 on the owner's rulings, word for word: "Allow the two reads (Recommended)"
+/// (the daemon's screen lock), then "Yes, ask-screen too". Without them the protected phone's
+/// focused app and keyboard are unknown, so with its screen on it always reads as in use, and work
+/// on it was limited to bursts.
 ///
 /// These are exactly the two lines the screen lock sends to every phone
 /// (`askscreen::read_signals_timed` uses these constants). Only a runner built with
-/// [`GuardedRunner::with_s24_lock_reads`] (the daemon's screen-lock reader, and no other) lets them
-/// through to the protected phone, and only in the exact shape [`Checked::is_s24_lock_read`]
-/// accepts (`shell` plus one of these two arguments, word for word). Every other runner (the
-/// call-state runner `ask-screen` uses included), the plain [`Guard`], `doctor` and the MCP tools
-/// still refuse them for the protected phone. They are not in [`S24_READS`]. The reader keeps only
-/// the focused package and the keyboard's yes or no (`askscreen::lock_signals`) and drops the
-/// text.
+/// [`GuardedRunner::with_s24_lock_reads`] (the daemon's screen-lock reader and `ask-screen`'s
+/// reader, and no other) lets them through to the protected phone, and only in the exact shape
+/// [`Checked::is_s24_lock_read`] accepts (`shell` plus one of these two arguments, word for word).
+/// Every other runner (the call-state runner included), the plain [`Guard`], the leased guard,
+/// `doctor` and the MCP tools still refuse them for the protected phone. They are not in
+/// [`S24_READS`]. Both readers keep only the focused package and the keyboard's yes or no
+/// (`askscreen::lock_signals`) and drop the text.
 pub const S24_FOCUS_READ: &str = "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='";
 /// See [`S24_FOCUS_READ`].
 pub const S24_KEYBOARD_READ: &str = "dumpsys input_method | grep -E 'mInputShown='";
@@ -950,9 +951,10 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
-    /// The runner the screen lock and `ask-screen` read the phone through, and nothing else: as
-    /// [`GuardedRunner::new`], plus the protected phone's call-state read ([`S24_CALL_STATE_READ`],
-    /// exactly as [`Checked::is_s24_call_state`] accepts it).
+    /// As [`GuardedRunner::new`], plus the protected phone's call-state read
+    /// ([`S24_CALL_STATE_READ`], exactly as [`Checked::is_s24_call_state`] accepts it), and
+    /// nothing else. The screen lock and `ask-screen` now read through
+    /// [`Self::with_s24_lock_reads`], which adds the focused-app and keyboard reads to this.
     pub fn with_s24_call_state(inner: R) -> Self {
         Self {
             inner,
@@ -963,7 +965,8 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
-    /// The daemon's screen-lock reader, and nothing else: as [`Self::with_s24_call_state`], plus
+    /// The daemon's screen-lock reader and `ask-screen`'s reader, and nothing else: as
+    /// [`Self::with_s24_call_state`], plus
     /// the protected phone's focused-app and keyboard reads ([`S24_FOCUS_READ`],
     /// [`S24_KEYBOARD_READ`], exactly as [`Checked::is_s24_lock_read`] accepts them).
     pub fn with_s24_lock_reads(inner: R) -> Self {
@@ -2501,6 +2504,9 @@ mod tests {
         for (sub, line) in [
             ("shell", "dumpsys notification"),
             ("shell", "dumpsys notification --noredact"),
+            // the screen lock's own reads (review round 4c/4d): never under the lease
+            ("shell", S24_FOCUS_READ),
+            ("shell", S24_KEYBOARD_READ),
             ("shell", "content query --uri content://sms"),
             ("shell", "cat /data/system/notification_log.db"),
             ("shell", "input tap 1 1; reboot"),

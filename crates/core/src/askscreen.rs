@@ -13,15 +13,17 @@
 //!   is likely typing in (the Claude app, WhatsApp, Gmail, plus `--in-use-app`), the keyboard is
 //!   open, the last touch was under `--idle-min` minutes ago (default 5), or an app is holding the
 //!   screen on (a video, a reader with keep-screen-on). Anything that cannot be read counts as in
-//!   use, so a phone that answers only `dumpsys power` (a protected phone) is in use whenever its
-//!   screen is on.
+//!   use, so a phone that answers only `dumpsys power` is in use whenever its screen is on. The
+//!   protected phone answers this reader's focused-app and keyboard reads too (the owner's
+//!   rulings of 14 Nov 2026, "Allow the two reads (Recommended)" and "Yes, ask-screen too"), so
+//!   it is judged like any phone; only its package and keyboard yes or no are kept.
 //! * **A call** that is ringing or live (`mCallState` from `dumpsys telephony.registry`, read
 //!   whatever the screen shows) is in use, screen on or off. No carrier call only when every
 //!   `mCallState` line is idle, the service does not exist (`Can't find service`), or a finished
 //!   registry dump has no phone slots (a device with no telephony). A call state that cannot be
 //!   read (the read failed or was refused, the dump timed out or errored, or came back empty or
-//!   unrecognised) counts as in use, so a protected phone (which answers only `dumpsys power`)
-//!   is always asked. See [`parse_call_state`].
+//!   unrecognised) counts as in use. The protected phone answers this reader's call-state read
+//!   (14 Nov 2026). See [`parse_call_state`].
 //! * **Not in use** (screen off or dozing; or on, untouched, nothing holding it on, no keyboard,
 //!   no listed app): allowed at once, with no push. Run the command again before each burst.
 //! * **In use:** one push with what the session wants and for how long. Yes gives a lease of
@@ -957,6 +959,28 @@ fn signals_json(s: &Signals) -> serde_json::Value {
     })
 }
 
+/// `ask-screen`'s phone reader over `inner`: the one runner, with the daemon's screen lock, that
+/// may read the protected phone's call state, focused app and keyboard (adb-link's
+/// `S24_CALL_STATE_READ`, `S24_FOCUS_READ` and `S24_KEYBOARD_READ`). The owner's rulings of
+/// 14 Nov 2026, word for word: "Allow the two reads (Recommended)", then "Yes, ask-screen too".
+pub fn reader<R: Runner>(inner: R) -> agentroid_adb_link::guard::GuardedRunner<R> {
+    agentroid_adb_link::guard::GuardedRunner::with_s24_lock_reads(inner)
+}
+
+/// What `ask-screen` reads of `device` through `r` ([`reader`]): the signals, and the hardware
+/// serial when it can be read ([`state_serial`]). On the protected phone, or a phone whose serial
+/// cannot be read, only what the lock decides on is kept ([`lock_signals`]: the focused package,
+/// the keyboard's yes or no, the power and call fields; no lock-screen flag). `None`: the phone
+/// could not be read.
+pub fn ask_signals(r: &dyn Runner, device: &str) -> Option<(Signals, Option<String>)> {
+    let s = read_signals(r, device)?;
+    let raw = shell(r, device, "getprop ro.serialno");
+    let protected =
+        crate::gate::is_s24(device) || raw.as_deref().is_none_or(|v| crate::gate::is_s24(v.trim()));
+    let s = if protected { lock_signals(s) } else { s };
+    Some((s, state_serial(raw.as_deref())))
+}
+
 /// `agentroid ask-screen ...`: (the JSON line, the exit code).
 pub fn command(args: &[String]) -> (String, i32) {
     let p = match parse_args(args) {
@@ -970,11 +994,10 @@ pub fn command(args: &[String]) -> (String, i32) {
         },
         None => None,
     };
-    // the one reader that may read the protected phone's call state (and keeps only the parsed
-    // state): see adb-link's S24_CALL_STATE_READ
-    let runner =
-        agentroid_adb_link::guard::GuardedRunner::with_s24_call_state(AdbRunner::new(&p.adb));
-    let Some(signals) = read_signals(&runner, &p.ask.device) else {
+    // the reader that may read the protected phone's call state, focused app and keyboard (and
+    // keeps only the parsed state): see adb-link's S24_CALL_STATE_READ and S24_FOCUS_READ
+    let runner = reader(AdbRunner::new(&p.adb));
+    let Some((signals, hw)) = ask_signals(&runner, &p.ask.device) else {
         let out = serde_json::json!({
             "decision": "denied", "interim": true,
             "why": "the phone could not be read (not connected, or adb refused)",
@@ -984,7 +1007,6 @@ pub fn command(args: &[String]) -> (String, i32) {
     };
     // keep the state under the phone's hardware serial when it can be read, so the daemon's screen
     // lock finds the lease whatever name adb gives the phone (serial, ip:port, mDNS name)
-    let hw = state_serial(shell(&runner, &p.ask.device, "getprop ro.serialno").as_deref());
     let dir = &p.state_dir;
     let device: &str = hw.as_deref().unwrap_or(&p.ask.device);
     let loaded = load_memory(dir, device, unix_ms());
@@ -1690,7 +1712,7 @@ mod tests {
             matches!(judge(&s, 60_000, &[]), Use::InUse(_)),
             "the keyboard is open"
         );
-        // ask-screen's call-state runner and the plain runner still cannot read them
+        // the call-state runner and the plain runner still cannot read them
         for other in [
             GuardedRunner::with_s24_call_state(ProtectedPhone(Mutex::new(vec![]))),
             GuardedRunner::new(ProtectedPhone(Mutex::new(vec![]))),
@@ -1717,6 +1739,111 @@ mod tests {
 
     /// A budget the fake clock never spends.
     const LOCK_BUDGET: u64 = 60_000;
+
+    /// The protected phone, untouched for an hour, with a notes app in front and no keyboard.
+    struct QuietProtected(Arc<Mutex<Vec<String>>>, bool);
+    impl Runner for QuietProtected {
+        fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
+            use agentroid_adb_link::guard::{
+                S24_CALL_STATE_READ, S24_FOCUS_READ, S24_KEYBOARD_READ, S24_SERIAL,
+            };
+            let cmd = a.last().cloned().unwrap_or_default();
+            self.0.lock().unwrap().push(cmd.clone());
+            let out = match cmd.as_str() {
+                "getprop ro.serialno" => format!("{S24_SERIAL}\n"),
+                "dumpsys power" => POWER_AWAKE.replace("(10000 ms ago)", "(3600000 ms ago)"),
+                c if c == S24_CALL_STATE_READ => NO_CALL.into(),
+                c if c == S24_FOCUS_READ => "  mCurrentFocus=Window{535f00b u0 com.example.notes/com.example.notes.secret.EditActivity}\n    isKeyguardShowing=false\n".into(),
+                c if c == S24_KEYBOARD_READ => format!("  mInputShown={}\n", self.1),
+                _ => return Err(RunError::Refused("not on the list".into())),
+            };
+            Ok(RunOutput {
+                code: Some(0),
+                stdout: out,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Review round 4d, the owner's ruling (14 Nov 2026): "Yes, ask-screen too". `ask-screen`'s
+    /// reader reads the protected phone's focused app and keyboard with the same two lines, keeps
+    /// only the package and the keyboard's yes or no, and judges it as any phone: an untouched
+    /// phone with its screen on, no listed app and no keyboard is free, so nothing is asked.
+    #[test]
+    fn ask_screen_reads_the_protected_phones_app_and_keyboard_and_judges_it_like_any_phone() {
+        use agentroid_adb_link::guard::{S24_FOCUS_READ, S24_KEYBOARD_READ};
+        let dev = "192.0.2.99:40000";
+        let sent = Arc::new(Mutex::new(vec![]));
+        let r = reader(QuietProtected(sent.clone(), false));
+        let (s, _) = ask_signals(&r, dev).expect("read");
+        assert_eq!(s.wakefulness.as_deref(), Some("Awake"));
+        assert_eq!(
+            s.focus.as_deref(),
+            Some("com.example.notes"),
+            "the package only"
+        );
+        assert_eq!(s.ime_shown, Some(false));
+        assert_eq!(s.keyguard, None, "the lock-screen flag is dropped");
+        let out = signals_json(&s).to_string();
+        assert!(
+            !out.contains("EditActivity") && !out.contains("secret"),
+            "{out}"
+        );
+        assert!(out.contains(r#""locked":null"#), "{out}");
+        assert!(matches!(judge(&s, 60_000, &[]), Use::Free(_)), "{s:?}");
+        let lines = sent.lock().unwrap().clone();
+        assert!(lines.iter().any(|c| c == S24_FOCUS_READ), "{lines:?}");
+        assert!(lines.iter().any(|c| c == S24_KEYBOARD_READ), "{lines:?}");
+        // the same rules as any phone: the keyboard up is in use
+        let r = reader(QuietProtected(Arc::new(Mutex::new(vec![])), true));
+        let (s, _) = ask_signals(&r, dev).unwrap();
+        assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)), "{s:?}");
+        // the positive control: ask-screen's old call-state runner cannot read them, so the same
+        // quiet phone with its screen on is in use
+        let old = agentroid_adb_link::guard::GuardedRunner::with_s24_call_state(QuietProtected(
+            Arc::new(Mutex::new(vec![])),
+            false,
+        ));
+        let (s, _) = ask_signals(&old, dev).unwrap();
+        assert_eq!((s.focus.clone(), s.ime_shown), (None, None));
+        assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
+    }
+
+    #[test]
+    fn an_ordinary_phone_keeps_its_lock_screen_flag_in_ask_screen() {
+        let p = Phone {
+            power: POWER_AWAKE,
+            window: Some("  mCurrentFocus=Window{1 u0 com.example.notes/com.example.notes.Main}\n    isKeyguardShowing=true\n"),
+            ime: Some("  mInputShown=false\n"),
+            sent: Mutex::new(vec![]),
+        };
+        // the plain fake answers no serial: that counts as possibly protected, so the flag goes
+        let (s, _) = ask_signals(&p, "192.0.2.10:5555").unwrap();
+        assert_eq!(s.keyguard, None);
+        // a phone whose serial reads as another phone keeps it
+        struct Named(Phone);
+        impl Runner for Named {
+            fn run(&self, a: &[String], t: u64) -> Result<RunOutput, RunError> {
+                if a.last().is_some_and(|c| c == "getprop ro.serialno") {
+                    return Ok(RunOutput {
+                        code: Some(0),
+                        stdout: "POCO0000EXAMPLE\n".into(),
+                        stderr: String::new(),
+                    });
+                }
+                self.0.run(a, t)
+            }
+        }
+        let n = Named(Phone {
+            power: POWER_AWAKE,
+            window: Some("  mCurrentFocus=Window{1 u0 com.example.notes/com.example.notes.Main}\n    isKeyguardShowing=true\n"),
+            ime: Some("  mInputShown=false\n"),
+            sent: Mutex::new(vec![]),
+        });
+        let (s, hw) = ask_signals(&n, "192.0.2.10:5555").unwrap();
+        assert_eq!(s.keyguard, Some(true));
+        assert_eq!(hw.as_deref(), Some("POCO0000EXAMPLE"));
+    }
 
     #[test]
     fn a_dozing_phone_is_read_with_two_commands_power_and_the_call_state() {
