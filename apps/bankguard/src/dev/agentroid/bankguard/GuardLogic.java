@@ -95,7 +95,7 @@ public final class GuardLogic {
         Action(Integer usb, Integer wifi, String event) { this.usb = usb; this.wifi = wifi; this.event = event; }
         public boolean writes() { return usb != null || wifi != null; }
         public boolean switchesOff() { return (usb != null && usb == 0) || (wifi != null && wifi == 0); }
-        static final Action NONE = new Action(null, null, null);
+        public static final Action NONE = new Action(null, null, null);
     }
 
     /**
