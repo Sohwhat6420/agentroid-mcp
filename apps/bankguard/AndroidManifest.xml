@@ -57,9 +57,12 @@
             android:exported="true"
             android:excludeFromRecents="true" />
 
+        <!-- EXPORTED only so `adb shell am start-foreground-service` can start it at setup: only a caller holding
+             DUMP (the adb shell) reaches it. This app's own notification buttons are the same uid. -->
         <service
             android:name=".GuardService"
-            android:exported="false"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
             android:directBootAware="true"
             android:foregroundServiceType="specialUse">
             <property
