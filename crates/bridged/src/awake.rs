@@ -82,6 +82,41 @@ pub const LONG_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 /// How long one alert stays quiet before it may be raised again, across daemon restarts too.
 pub const ALERT_QUIET_MS: u64 = 24 * 60 * 60 * 1000;
+/// After a failed push, how long before the same alert may be tried again.
+pub const ALERT_RETRY_MS: u64 = 60 * 60 * 1000;
+
+/// An alert's id: the phone (as a stable 64-bit FNV-1a hash, so no serial is stored) and the
+/// finding (setting, kind, value). Wording and the session-end reason are not part of it.
+fn alert_id(key: &str, what: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}|{what}")
+}
+
+/// `std::fs::rename`, tried again after 20, 50 and 100 ms when it is refused (Windows: a scanner
+/// or indexer holding the target).
+fn rename_retrying(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let mut last = None;
+    for wait in [0u64, 20, 50, 100] {
+        if wait > 0 {
+            std::thread::sleep(Duration::from_millis(wait));
+        }
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32))) =>
+            {
+                last = Some(e)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename refused")))
+}
 
 /// Whether this value of one of the two keys keeps a screen on: any `stay_on_while_plugged_in` bit
 /// (1 AC, 2 USB, 4 wireless, 8 dock), or a `screen_off_timeout` above [`LONG_TIMEOUT_MS`]. Any other
@@ -283,8 +318,8 @@ pub struct SessionAwake {
     alert_file: Mutex<Option<PathBuf>>,
     /// Where alerts are pushed, besides `bridged.log`.
     notifier: Mutex<Option<Arc<dyn Notifier + Send + Sync>>>,
-    /// Pushes waiting until no lock is held (a push can take seconds): (phone, text).
-    outbox: Mutex<Vec<(String, String)>>,
+    /// Pushes waiting until no lock is held (a push can take seconds): (alert id, phone, text).
+    outbox: Mutex<Vec<(String, String, String)>>,
 }
 
 /// One queued piece of work for the worker, in arrival order.
@@ -358,7 +393,9 @@ impl SessionAwake {
         *lock(&self.alert_file) = Some(p);
     }
 
-    /// Write `alerted` to the alert file, if one is set (temporary file, then rename).
+    /// Write `alerted` to the alert file, if one is set: a temporary file, then a rename, retried
+    /// briefly while Windows refuses it (a scanner holding the target); the temporary file never
+    /// stays behind.
     fn save_alerts(&self, a: &HashMap<String, u64>) {
         let Some(p) = lock(&self.alert_file).clone() else {
             return;
@@ -367,47 +404,61 @@ impl SessionAwake {
         let r = serde_json::to_string(a)
             .map_err(|e| e.to_string())
             .and_then(|s| std::fs::write(&tmp, s).map_err(|e| e.to_string()))
-            .and_then(|()| std::fs::rename(&tmp, &p).map_err(|e| e.to_string()));
+            .and_then(|()| rename_retrying(&tmp, &p).map_err(|e| e.to_string()));
         if let Err(e) = r {
+            let _ = std::fs::remove_file(&tmp);
             self.note(format!("stay-awake: the alert file was not saved: {e}"));
         }
     }
 
     /// One alert per finding per [`ALERT_QUIET_MS`]: a note now, and a push once no lock is held
-    /// ([`Self::flush_pushes`]). It never changes a value on the phone.
-    fn alert(&self, key: &str, text: String) {
+    /// ([`Self::flush_pushes`]). `what` names the finding (setting, kind, value); with the phone it
+    /// is the alert's id. It never changes a value on the phone.
+    fn alert(&self, key: &str, what: &str, text: String) {
         let now = self.cfg.clock.unix_ms();
+        let id = alert_id(key, what);
         {
             let mut a = lock(&self.alerted);
-            let id = text.clone(); // names the phone by who(), never by its whole serial
             if a.get(&id)
                 .is_some_and(|t| now.saturating_sub(*t) < ALERT_QUIET_MS)
             {
                 return;
             }
-            a.insert(id, now);
-            a.retain(|_, t| now.saturating_sub(*t) < ALERT_QUIET_MS);
-            self.save_alerts(&a);
+            // held in memory now (no second copy before the flush); kept on disk only once sent
+            a.insert(id.clone(), now);
         }
         self.note(format!("stay-awake ALERT: {text}"));
-        lock(&self.outbox).push((who(key), text));
+        lock(&self.outbox).push((id, who(key), text));
     }
 
     /// Send the waiting pushes. Called at the end of each public entry point, after its locks are
-    /// dropped, so a slow push service never holds up `is_held`, the sweeper or a stop.
+    /// dropped, so a slow push service never holds up `is_held`, the sweeper or a stop. An alert
+    /// is kept quiet for the day only once it was pushed (or there is no push channel, so the log
+    /// line was all there is); a failed push may be tried again after [`ALERT_RETRY_MS`]. A daemon
+    /// that dies before the flush saved nothing, so the next one raises the alert again.
     fn flush_pushes(&self) {
         let items = std::mem::take(&mut *lock(&self.outbox));
         if items.is_empty() {
             return;
         }
-        let Some(n) = lock(&self.notifier).clone() else {
-            return;
-        };
-        for (phone, text) in items {
-            if let Err(e) = n.push(&phone, ALERT_TITLE, &text) {
-                self.note(format!("stay-awake: the alert push failed: {e}"));
+        let n = lock(&self.notifier).clone();
+        let mut failed = Vec::new();
+        for (id, phone, text) in items {
+            if let Some(n) = &n {
+                if let Err(e) = n.push(&phone, ALERT_TITLE, &text) {
+                    self.note(format!("stay-awake: the alert push failed: {e}"));
+                    failed.push(id);
+                }
             }
         }
+        let now = self.cfg.clock.unix_ms();
+        let mut a = lock(&self.alerted);
+        for id in failed {
+            // quiet for the retry time only: as if raised a day ago, less the retry time
+            a.insert(id, now.saturating_sub(ALERT_QUIET_MS - ALERT_RETRY_MS));
+        }
+        a.retain(|_, t| now.saturating_sub(*t) < ALERT_QUIET_MS);
+        self.save_alerts(&a);
     }
 
     /// A lease found a key already keeping the screen on.
@@ -427,6 +478,7 @@ impl SessionAwake {
         };
         self.alert(
             key,
+            &format!("{ns}/{k}|found|{before}"),
             format!(
                 "{ns}/{k} on {} was already {before} before this session's lease: {source}. It {}, \
                  which costs battery. Agentroid puts back what it found and does not change it; \
@@ -457,6 +509,7 @@ impl SessionAwake {
                         if stays_awake(ns, k, &now) {
                             self.alert(
                                 key,
+                                &format!("{ns}/{k}|left|{now}"),
                                 format!(
                                     "{ns}/{k} on {} is {now} after the session ({why}): it was \
                                      changed while Agentroid held it, so compare-and-swap left it \
@@ -475,6 +528,7 @@ impl SessionAwake {
                     let how = format!("{other:?}").to_lowercase();
                     self.alert(
                         key,
+                        &format!("{ns}/{k}|unrestored|{}", e.applied),
                         format!(
                             "{ns}/{k} on {} may still be {} ({why}): Agentroid could not put {} \
                              back ({}). The lease record stays, and the next contact with the \
@@ -519,6 +573,7 @@ impl SessionAwake {
             };
             self.alert(
                 &key,
+                &format!("{}/{}|leftover|{}", e.namespace, e.key, e.applied),
                 format!(
                     "{}/{} on {} was left at {} by an Agentroid daemon that stopped without putting \
                      {} back. {next}",
@@ -1442,5 +1497,99 @@ mod tests {
         r.phone.set("system", "screen_off_timeout", "3600000"); // changed while held
         a.leave(1);
         assert_eq!(*lock(&probe.1), 2);
+    }
+
+    #[test]
+    fn a_failed_push_is_tried_again_after_an_hour_not_silenced_for_a_day() {
+        /// A push service that is down: counts the tries.
+        struct Down(Mutex<usize>);
+        impl Notifier for Down {
+            fn push(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                *lock(&self.0) += 1;
+                Err("offline".into())
+            }
+        }
+        let r = rig("push-down");
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        let file = r.leases.with_file_name("awake-alerts.json");
+        let a = awake(&r);
+        a.set_alert_file(file.clone());
+        let down = Arc::new(Down(Mutex::new(0)));
+        a.set_notifier(down.clone());
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        a.leave(1);
+        assert_eq!(*lock(&down.0), 1);
+        assert!(a.take_notes().iter().any(|n| n.contains("push failed")));
+        // within the hour: not tried again
+        r.clock.advance(30 * 60 * 1000);
+        a.touch(2, PHONE, ADB, DeviceMode::Full);
+        a.leave(2);
+        assert_eq!(*lock(&down.0), 1);
+        // after the hour: tried again, and a restarted daemon agrees (the file says retry, not a day)
+        r.clock.advance(31 * 60 * 1000);
+        let b = awake(&r);
+        b.set_alert_file(file);
+        let up = with_pushes(&b);
+        b.touch(1, PHONE, ADB, DeviceMode::Full);
+        assert_eq!(lock(&up.0).len(), 1, "a restart after the hour sends it");
+    }
+
+    #[test]
+    fn an_alert_raised_but_not_yet_sent_is_not_kept_quiet_on_disk() {
+        let r = rig("unsent");
+        let file = r.leases.with_file_name("awake-alerts.json");
+        let a = awake(&r);
+        a.set_alert_file(file.clone());
+        // raised, as a crash would leave it: queued, never flushed
+        a.alert(
+            PHONE,
+            "global/stay_on_while_plugged_in|found|15",
+            "text".into(),
+        );
+        assert!(!file.exists(), "nothing on disk before the flush");
+        drop(a);
+        let b = awake(&r);
+        b.set_alert_file(file);
+        b.alert(
+            PHONE,
+            "global/stay_on_while_plugged_in|found|15",
+            "text".into(),
+        );
+        assert_eq!(
+            alerts(&b.take_notes()).len(),
+            1,
+            "the next daemon raises it again"
+        );
+    }
+
+    #[test]
+    fn alert_ids_tell_phones_apart_and_hold_no_serial() {
+        let what = "global/stay_on_while_plugged_in|found|15";
+        assert_ne!(alert_id("AAAA1234", what), alert_id("BBBB1234", what));
+        assert_eq!(alert_id("AAAA1234", what), alert_id("AAAA1234", what));
+        let s = alert_id(S24, what);
+        assert!(!s.contains(S24) && s.ends_with(what), "{s}");
+        // the same finding at session end and at idle is one alert
+        let r = rig("one-id");
+        let a = awake(&r);
+        let p = with_pushes(&a);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        a.leave(1);
+        a.touch(2, PHONE, ADB, DeviceMode::Full);
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        r.clock.advance(61_000);
+        a.sweep_idle();
+        // the second lease found 15 already set (a "found" alert); the idle restore's "left" is
+        // the same finding as the session-end one, so it is not raised again
+        let bodies: Vec<String> = lock(&p.0).iter().map(|x| x.2.clone()).collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|b| b.contains("after the session"))
+                .count(),
+            1,
+            "{bodies:?}"
+        );
     }
 }
