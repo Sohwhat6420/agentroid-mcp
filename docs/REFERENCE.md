@@ -8,7 +8,7 @@ Contents: [The parts](#the-parts) · [What it does](#what-it-does) · [Safety mo
 
 | | What it is | Evidence today |
 | --- | --- | --- |
-| **1. An agent drives a phone** | Claude Code reads the screen as a numbered UI tree and taps, types and scrolls on an emulator or an allowed phone, through 27 MCP tools. | Works. Exercised on an Android 13 emulator and on one physical phone (Xiaomi POCO X6 Pro, Android 15, HyperOS 2.0). See [Demo](#demo). |
+| **1. An agent drives a phone** | Claude Code reads the screen as a numbered UI tree and taps, types and scrolls on an emulator or an allowed phone, through 27 MCP tools. | Works. Driven on a physical phone (Xiaomi POCO X6 Pro, Android 15, HyperOS 2.0) and on an Android 13 emulator; a second physical phone (Samsung Galaxy S24 Ultra, Android 17) is connected read-only. See [Demo](#demo). |
 | **2. A benchmark score card** | The same loop run against AndroidWorld's 116 tasks on an emulator, scored by AndroidWorld itself. | **In progress.** Measured so far (11 Nov 2026): 16 of 20 passed on a 20-task pilot with every safety refusal kept (no stand-in approver). A partial full run that has reached 16 of the 116 tasks passed 6 with the emulator-only stand-in approver, or 5 counting only tasks that needed no approval; the guard asked for approval once. See [Benchmark in progress](BENCHMARK.md#benchmark-in-progress). An earlier run with a different policy passed 61 of the 116 tasks (52.6%); its result files are not in this repository, so treat it as unverified. |
 | **3. The connection keeper** | An Android module (`android/keeper`) that turns Wireless debugging back on after a Wi-Fi drop, a crash or a reboot, so the adb link to the phone returns with no tap. | Measured on one phone: after Wi-Fi was switched off for 10 s, the adb link was back 12 to 13 s later in 3 of 3 rounds, with no tap; it also came back after a process crash and after a cold boot, before the first unlock. This is not yet tested against a real router outage. The standalone build is documented in [apps/keeper](../apps/keeper) (no Gradle, 40 logic tests in CI). Limits in [The connection keeper](CONNECTION-KEEPER.md). |
 | **4. The phone helps the laptop** | Sharing local AI work between laptop and phone: one model split across both, or the phone running speech and vision while the laptop answers. | **PENDING.** Designed, not built or measured. It is listed because it is part of the project; no number is claimed. |
@@ -70,7 +70,7 @@ The short version is in the [README](../README.md#install-and-quick-start). The 
 - `curl` on `PATH` (Windows 10 and 11 include it), used by the approval channel.
 - The `claude` command-line tool, to register the MCP server.
 - An MCP client. The commands below use Claude Code, the only client tested.
-- An Android emulator, or a physical phone whose hardware serial you allow (see the note after the commands). The helper app, if you build it, targets Android 10 (API 29) and later. The lowest Android version for the adb-only path has not been established; it was run on Android 13 (emulator) and Android 15 (phone).
+- An Android emulator, or a physical phone whose hardware serial you allow (see the note after the commands). The helper app, if you build it, targets Android 10 (API 29) and later. The lowest Android version for the adb-only path has not been established; it was run on Android 13 (emulator), Android 15 (POCO X6 Pro) and, for reads only, Android 17 (Galaxy S24 Ultra).
 
 **Install and run** (PowerShell, from the repository root)
 
@@ -79,11 +79,15 @@ git clone https://github.com/Sohwhat6420/agentroid-mcp.git
 cd agentroid-mcp
 cargo build --release --workspace
 
-# Start an emulator or connect a phone, then check that adb lists it as "device".
+# Connect a phone (or start an emulator), then check that adb lists it as "device".
 adb devices -l
 
-# Start the daemon. It has no console window, so the command returns at once.
-.\target\release\bridged.exe --adb auto --allow-emulators
+# Read the phone's hardware serial: nothing is driven until you name it.
+$serial = (adb shell getprop ro.serialno).Trim()
+
+# Start the daemon for that phone. It has no console window, so the command returns at once.
+# For an emulator, use --allow-emulators in place of --allow-serial $serial.
+.\target\release\bridged.exe --adb auto --allow-serial $serial
 
 # Check that it started: the log should end with a "listening on" line.
 Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 5
@@ -91,7 +95,7 @@ Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 5
 # Install the MCP server and register it with Claude Code.
 cd apps\mcp
 npm ci
-claude mcp add agentroid -- node --experimental-strip-types "<full path to>\agentroid\apps\mcp\src\sdk-wiring.ts"
+claude mcp add --scope user agentroid -- node --experimental-strip-types "$PWD\src\sdk-wiring.ts"
 ```
 
 To stop the daemon: `.\target\release\bridged.exe --stop`.
@@ -156,4 +160,4 @@ Agentroid is a preview, released for trial and demo. The Cargo workspace and the
 - The helper's build scripts are not portable yet, and the Gradle build has been run only once, by hand. The connection keeper's standalone build is in [apps/keeper](../apps/keeper).
 - `pixel_probe` and `look`'s `element` and `ocr` options are not implemented.
 
-*Tested on.* So far the live transport has been exercised on an Android 13 emulator (x86_64, Google APIs) and one physical phone, a Xiaomi POCO X6 Pro running Android 15 and HyperOS 2.0. The only MCP client tried is Claude Code.
+*Tested on.* So far the live transport has been exercised on two physical phones and an emulator. A Xiaomi POCO X6 Pro running Android 15 and HyperOS 2.0 is driven end to end over wireless adb. A Samsung Galaxy S24 Ultra (SM-S928B) running Android 17 is connected and read only (read 14 Nov 2026): it is the owner's personal phone, and his build hard-codes it as a protected, read-only device. The emulator is Android 13 (x86_64, Google APIs). The only MCP client tried is Claude Code.

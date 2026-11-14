@@ -1,48 +1,61 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/media/hero-dark.svg">
-  <img src="docs/media/hero-light.svg" width="100%" alt="Agentroid: the most phone control for the fewest tokens. 27 tools in under 5,000 tokens, and no model calls of its own. One real screen, a Xiaomi POCO X6 Pro home screen, shown four ways in turn: the raw uiautomator dump is 30,910 characters, Agentroid's full ui_tree listing is 2,550, the digest an agent gets by default is 453, and a since= diff when nothing changed is 65.">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/banner-dark.svg">
+  <img src="docs/media/banner-light.svg" width="100%" alt="Agentroid: give your AI agent a real Android phone. A real screenshot of a Xiaomi POCO X6 Pro home screen, shown on a phone on a desk (the phone body and the desk are a generated picture), sits beside an example: you ask the AI to open Claude on the phone; it looks at the screen, taps the Claude app, then asks only for what changed. One look costs up to 50 times fewer tokens than Android's raw screen description: 229 tokens for the short answer and 1,241 for the full list, against 11,565, measured on one real home screen.">
 </picture>
 
 # Agentroid
 
-**The most phone control for the fewest tokens.** Agentroid is an MCP server (the Model Context Protocol is how tools plug into AI agents such as Claude Code) that lets an agent read and drive an Android phone or emulator over adb. Everything the agent reads stays in its context window, so a smaller screen means a cheaper step and room for a longer task. On a real home screen the raw dump is 30,910 characters; Agentroid's full listing of it is 2,550, and by default the agent gets a digest of the first 400 characters plus a one-line note on how to ask for more. All 27 tools fit in under 5,000 tokens.
+**An AI agent drives your real Android phone, and each look at the screen costs it [9 to 50 times fewer tokens](#what-one-look-costs) than Android's raw screen text.**
 
-> **Preview 0.1.0.** It works and is tested, but it is not 1.0. In this build the daemon runs on Windows only, and out of the box it drives emulators, not physical phones. See [Status](#status).
+Agentroid is an MCP server (MCP is the plug-in standard AI agents use for tools). It lets an agent such as Claude Code see the screen, tap, type, swipe and open apps on a phone you own. It hands the agent a short text list in place of a screenshot or Android's raw screen description, so a long task fits before the AI runs out of room.
 
-## Context budget
+[![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-167C4A?labelColor=0A1410)](LICENSE)
+[![Status: preview 0.1.0](https://img.shields.io/badge/status-preview%200.1.0-167C4A?labelColor=0A1410)](#status-and-limits)
+[![MCP server](https://img.shields.io/badge/MCP-server-167C4A?labelColor=0A1410)](#how-it-works)
+[![Runs on Windows 11](https://img.shields.io/badge/runs%20on-Windows%2011-167C4A?labelColor=0A1410)](#quick-start)
+[![Tested on a POCO X6 Pro, Android 15](https://img.shields.io/badge/tested%20on-POCO%20X6%20Pro%20%C2%B7%20Android%2015-167C4A?labelColor=0A1410)](#works-on)
 
-Every figure below comes from a test, a script or a recording in this repository. Screens are measured in characters and the tool list in tokens. These are sizes of one screen and of the tool list, not tokens per task: the [AndroidWorld benchmark](docs/BENCHMARK.md) in progress measures task success, not tokens.
+[Quick start](#quick-start) · [What one look costs](#what-one-look-costs) · [Works on](#works-on) · [How it works](#how-it-works) · [Safety](#safety) · [Docs](#docs)
 
-| What | Measured | Where it is checked |
-| --- | --- | --- |
-| Tools | **27** (8 in the `minimal` profile) | [`apps/mcp/src/tools.ts`](apps/mcp/src/tools.ts), [`budget.test.ts`](apps/mcp/test/budget.test.ts) |
-| The whole tool list | **under 5,000 tokens** | [`budget.test.ts`](apps/mcp/test/budget.test.ts) fails above it (today: 4,996, estimated as characters ÷ 3.2; this counts the tool list, not the server's 3,487-character instructions text) |
-| The `minimal` tool list | **under 1,500 tokens** | same test (today: 1,497 on the same estimate) |
-| A screen, by default | **400 characters at most**, plus a one-line note saying how to ask for more | `TEXT_LIMIT` in [`server-core.ts`](apps/mcp/src/server-core.ts), tested in [`server.test.ts`](apps/mcp/test/server.test.ts) ("response levels") |
-| A screen diff, `ui_tree since=` | **7.2%** of a full read, for a one-row scroll of a generated 30-row list | [`crates/core/src/refs.rs`](crates/core/src/refs.rs), `a_since_diff_of_a_one_row_scroll_…` (the test fails above 30%) |
-| Stable refs | **100%** kept across 200 generated re-layouts of a test list (3,078 of 3,078 checks) | [`crates/core/src/refs.rs`](crates/core/src/refs.rs), `the_same_row_keeps_its_ref_across_200_…` (the test fails below 95%) |
-| Model tokens the server spends per call | **0**: it makes no model calls | every receipt reports `model_calls: 0`, `tokens_in: 0`, `tokens_out: 0` ([`receipt.ts`](apps/mcp/src/receipt.ts)) |
-| Taps in one call | **6**, as one `job_start` | recorded on a phone: [the clip below](#real-output) |
+<!-- DEMO SLOT. When docs/media/demo-poco.gif exists, point this image at it and rewrite the alt text and the caption below to match that recording. -->
+<p align="center">
+  <img src="docs/media/demo-3.gif" width="760" alt="A real recording. Left: the Calculator app on a Xiaomi POCO X6 Pro. Right: the calls sent to Agentroid. One call carries six taps; the phone shows 9 x 8 + 7 = 79 and the call returns one 'done' row per tap.">
+</p>
 
-**How to reproduce.** Run `npm test` in `apps/mcp`; the budget test prints `budget: full 4996 tok (27 tools), minimal 1497 tok (8 tools)`. A script for the exact count from Anthropic's `count_tokens` endpoint is written (`npm run budget:ci`, needs an API key) but does not run in CI yet. Run `cargo test -p agentroid-core --lib refs::tests -- --nocapture`; it prints `stable refs: kept 3078 of 3078 = 100.0%` and `since diff: 430 of 5953 chars = 7.2%`.
+<p align="center"><sub>Real recording, POCO X6 Pro: one call, six taps; 49 s on the phone, shown at 4×. A script sent the calls, not Claude Code.</sub></p>
 
-## How it saves tokens
+## What one look costs
 
-- **A digest by default.** Every read answers at level `digest` unless the agent asks for more: the text is cut at 400 characters and ends with a note that names the next level up, `default` (4,000 characters) or `full` (everything). The agent pays for detail only when it needs it.
-- **Diffs with `since=`.** Each tree names its snapshot (`s4`). `ui_tree(since="s4")` returns only the lines that were added (`+`), changed (`~`) or removed (`-`). An element that only moved on screen is left out, so a scroll costs a few lines, not a new screen.
-- **Stable refs.** Each tappable line ends in a ref such as `r2bb170`, a hash of what the element is (class, id, label, its row in a list), never of where it sits (the content-identity scheme MobileMCP uses, plus the row's first label so repeated list rows keep theirs). After a scroll the agent taps the same ref instead of reading the screen again to find the new index.
-- **Batched steps.** `job_start` runs a list of steps, or a YAML flow, on the daemon. Six taps cost one call and one reply rather than six model round trips.
-- **No model calls in the server.** The calling agent is the brain. The MCP server and the Rust daemon make no model calls and need no model API key.
-- **A small tool list, and a smaller one on request.** Start the server with `AGENTROID_PROFILE=minimal` for 8 tools (`list_devices`, `look`, `ui_tree`, `tap`, `type_text`, `key`, `getprop`, `doctor`) in under 1,500 tokens.
+An AI pays for everything it reads, in tokens, and everything it reads stays in its memory for the rest of the task. So the size of one look at the screen decides both the bill and how many steps fit.
 
-## Real output
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/tokens-dark.svg">
+  <img src="docs/media/tokens-light.svg" width="100%" alt="Two charts for one real phone screen. First, the tokens one look costs: Android's raw screen description 11,565; a screenshot 3,867; Agentroid's full list 1,241; Agentroid's short answer, the default, 229; Agentroid's 'what changed?' when nothing had, 35. Second, how many looks fit in a 200,000-token context window: 17 with the raw description, 51 with screenshots, 161 with Agentroid's full list, 873 with Agentroid's short answer.">
+</picture>
 
-One real screen: the home screen of a Xiaomi POCO X6 Pro (Android 15, HyperOS 2.0), recorded with `uiautomator dump` on 20 Oct 2026 ([the dump](crates/core/tests/redteam/recorded/poco-launcher-2026-10-20.xml)). The text below is what Agentroid's own parser and listing code produce from it; to fit side by side, long lines are wrapped at 40 characters (the digest's continuation lines are indented two spaces).
+| What the AI is shown | Tokens | Looks that fit in 200,000 tokens | 1,000 looks cost |
+| --- | ---: | ---: | ---: |
+| Android's raw screen description (`uiautomator dump`, the XML Android hands any app that asks what is on screen) | 11,565 | 17 | USD 46.26 |
+| A screenshot of the phone (1220×2712 PNG) | 3,867 | 51 | USD 15.47 |
+| **Agentroid, the full list** (every element; tappable ones get a short id) | **1,241** | **161** | **USD 4.96** |
+| **Agentroid, the short answer** (the default) | **229** | **873** | **USD 0.92** |
+| **Agentroid, "what changed?"** when nothing had | **35** | a follow-up, not a first look | |
+
+- **Measured:** the token column. The home screen of a Xiaomi POCO X6 Pro as recorded on 20 Oct 2026 (the screenshot row is the same phone's home screen on 14 Nov 2026), counted on 14 Nov 2026 with Anthropic's token counter for Claude Opus 5.5. The raw counts and how to repeat them: [docs/media/src/token-counts.json](docs/media/src/token-counts.json).
+- **Arithmetic from those counts:** about 50× (11,565 ÷ 229) and about 9× (11,565 ÷ 1,241), the looks that fit (200,000 ÷ tokens, rounded down) and the cost (USD 4 per million input tokens, the Claude Opus 5.5 list price).
+- **The catch:** these are sizes of one screen, not a benchmark of whole tasks. On this screen the short answer holds only the clock widget, so an AI looking for an app icon asks for the full list: 1,241 tokens, still about 9× smaller than the raw description. A task benchmark on AndroidWorld is in progress: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+<details>
+<summary>See the actual text the AI gets for that screen</summary>
+
+<br>
+
+The text below is what Agentroid's own code produces from [the recorded screen](crates/core/tests/redteam/recorded/poco-launcher-2026-10-20.xml). To fit side by side, long lines are wrapped at 40 characters.
 
 <table>
 <tr>
-<th width="50%">What the agent gets by default<br><code>ui_tree</code>, level <code>digest</code>: <b>453 characters</b></th>
-<th width="50%">What it would read without Agentroid<br>the raw dump: <b>30,910 characters</b></th>
+<th width="50%">Agentroid's short answer: 453 characters, 229 tokens</th>
+<th width="50%">Android's raw description: 30,910 characters, 11,565 tokens</th>
 </tr>
 <tr>
 <td valign="top">
@@ -90,8 +103,7 @@ uncher" content-desc="" checkable="false
 </tr>
 </table>
 
-<details>
-<summary>The full <code>ui_tree</code> listing of the same screen: 2,550 characters, 33 elements</summary>
+The full list of the same screen (2,550 characters, 1,241 tokens). Each line is one thing on the screen; a line that can be tapped ends in a short id such as `r352116`:
 
 ```text
 [0] ScreenView "Clock / 1:07 / Tuesday, 20 Oct" [label from child] id=workspace scrollable @(610,1332) rccbccd
@@ -129,74 +141,213 @@ uncher" content-desc="" checkable="false
 [32] TextView "Camera" clickable,long-clickable @(1039,2472) r22466f
 ```
 
+Print the three texts and their character counts yourself:
+
+```powershell
+cargo run -p agentroid-core --example readme_tree_sizes
+```
+
 </details>
 
-| The same screen as | Characters | Share of the raw dump |
-| --- | ---: | ---: |
-| Raw `uiautomator dump` | 30,910 | 100% |
-| `ui_tree`, level `full` | 2,550 | 8.2% |
-| `ui_tree`, `interactive_only` | 2,310 | 7.5% |
-| `ui_tree`, level `digest` (the default) | 453 | 1.5% |
-| `ui_tree since=`, read again with nothing changed | 65 | 0.2% |
+## Works on
 
-Reproduce: `cargo run -p agentroid-core --example readme_tree_sizes` ([source](crates/core/examples/readme_tree_sizes.rs)). The counts are for the listing alone, without the one-line header the daemon puts above it. The digest is 400 characters of listing plus the 53-character note. On this screen those 400 characters hold only the clock widget, not the app icons, so an agent looking for Settings would ask for level `default` and get the whole 2,550-character listing; that is still 8.2% of the raw dump.
+| | Tested with | What happened |
+| --- | --- | --- |
+| **Real phone** | Xiaomi POCO X6 Pro, Android 15 (HyperOS 2.0) | Driven end to end, regularly, over wireless adb. The recordings on this page are this phone. |
+| **Real phone** | Samsung Galaxy S24 Ultra (SM-S928B), Android 17 | Connected and read. Kept read-only on purpose: it is the owner's personal phone, so his build hard-codes it as a protected device that answers reads only. |
+| **Emulator** | Android 13 emulator | Works. |
+| **AI agent** | Claude Code | The only MCP client tried so far. |
 
-![The phone's Calculator on the left and the MCP calls on the right: one job_start call with six tap steps. The phone shows 9 x 8 + 7 = 79 and the call returns one done row per step.](docs/media/demo-3.gif)
+A phone is never driven until you name it. You allow each phone by its serial number, and emulators with a separate switch.
 
-*Six taps in one call: `job_start` in sync mode runs six steps on the phone and returns one row per step plus a receipt. The run took 49 s on the phone, most of it reading the screen between taps; the clip plays at 4x. A short script acted as the MCP client for this recording, so Claude Code was not in the loop.*
+## Quick start
 
-## Install and quick start
+**You need** Windows 11 (**Windows only for now**; Windows 10 should work but has not been tried), [adb](https://developer.android.com/tools/releases/platform-tools) (Android's debugging bridge, part of Android's platform-tools), a recent stable [Rust](https://rustup.rs) with the Visual Studio C++ Build Tools, [Node.js](https://nodejs.org) 22.6 or later, and [Claude Code](https://claude.com/claude-code). Run everything below in PowerShell.
 
-**You need:** Windows 10 or 11 (the daemon uses a named pipe and refuses to start elsewhere), `adb` from the Android platform-tools, a recent stable Rust toolchain (built with 1.99.0) with the Visual Studio C++ Build Tools, Node.js 22.6 or later, and Claude Code. Full requirements and troubleshooting are in [docs/REFERENCE.md](docs/REFERENCE.md#setup-notes).
-
-From the repository root, in PowerShell:
+**1. Get the code and build it**
 
 ```powershell
 git clone https://github.com/Sohwhat6420/agentroid-mcp.git
-cd agentroid-mcp
-cargo build --release --workspace
-
-# Start an emulator, then check that adb lists it as "device".
-adb devices -l
-
-# Start the daemon. It has no console window, so the command returns at once.
-.\target\release\bridged.exe --adb auto --allow-emulators
-
-# Install the MCP server and register it with Claude Code.
-cd apps\mcp
-npm ci
-claude mcp add agentroid -- node --experimental-strip-types "<full path to>\agentroid-mcp\apps\mcp\src\sdk-wiring.ts"
 ```
 
-Then ask your agent something like: *"Use Agentroid to look at the screen and tell me what is on it."*
+```powershell
+cd agentroid-mcp
+```
 
-- **A physical phone** is driven only once you name it: start the daemon with `--allow-serial <serial>` (the serial is `adb shell getprop ro.serialno`).
-- **The smaller tool list:** set `AGENTROID_PROFILE=minimal` in the server's environment.
-- **Stop the daemon** with `.\target\release\bridged.exe --stop`. If it does not start, the log is at `%LOCALAPPDATA%\agentroid\bridged.log`.
+```powershell
+cargo build --release --workspace
+```
 
-Use it on devices you own or are allowed to test. A screen guard in the daemon refuses the payments, factory resets and credential entry it recognises; its known misses are published in [docs/SAFETY.md](docs/SAFETY.md).
+The first build compiles every dependency, so it is the slow step. Keep this PowerShell window open: steps 2 to 4 use it.
 
-## Status
+**2. Connect your phone and read its serial number**
 
-Agentroid is a preview (0.1.0), released for trial and demo; nothing is published to crates.io or npm.
+Turn on USB debugging in the phone's Developer options, plug it in (or connect over wireless debugging) and accept the prompt on the phone.
 
-- **Tested on** an Android 13 emulator and one physical phone (Xiaomi POCO X6 Pro, Android 15, HyperOS 2.0), with Claude Code as the only MCP client tried.
-- **Windows only** for the daemon in this build. A Linux listener is written but not yet built or tested.
-- **Text, not pictures:** `screenshot` and `look` do not send image bytes to the agent in this build.
+```powershell
+adb devices -l
+```
+
+```powershell
+$serial = (adb shell getprop ro.serialno).Trim()
+```
+
+With several devices connected, disconnect the others for this step.
+
+**3. Start Agentroid for that phone**
+
+```powershell
+.\target\release\bridged.exe --adb auto --allow-serial $serial
+```
+
+The daemon has no window, so the command returns at once. Read the last line of its log:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 1
+```
+
+It should say:
+
+```text
+bridged 0.1.0 listening on \\.\pipe\agentroid
+```
+
+If no new `listening on` line appears, open "when it does not start" under step 5.
+
+**4. Add it to Claude Code**
+
+```powershell
+cd apps\mcp
+```
+
+```powershell
+npm ci
+```
+
+```powershell
+claude mcp add --scope user agentroid -- node --experimental-strip-types "$PWD\src\sdk-wiring.ts"
+```
+
+Check that Claude Code can reach it. The list should show `agentroid` as connected:
+
+```powershell
+claude mcp list
+```
+
+**5. Ask your agent**
+
+```text
+Use Agentroid to list the connected devices, look at the screen and tell me what is on it.
+```
+
+<details>
+<summary>Using an emulator, a smaller tool list, other MCP clients, stopping it, and when it does not start</summary>
+
+<br>
+
+**An emulator instead of a phone.** Start the emulator, then start the daemon with the emulator switch:
+
+```powershell
+.\target\release\bridged.exe --adb auto --allow-emulators
+```
+
+**A smaller tool list.** The AI loads the tool list once at the start: all 27 tools cost 4,635 tokens. The `minimal` profile keeps 8 of them for 1,331 tokens. Use this line in place of the one in step 4:
+
+```powershell
+claude mcp add --scope user agentroid -e AGENTROID_PROFILE=minimal -- node --experimental-strip-types "$PWD\src\sdk-wiring.ts"
+```
+
+**Other MCP clients (not tried yet).** Claude Code is the only client tested. A client that reads the usual `mcpServers` JSON should take this entry, with the path changed to where you cloned the repository:
+
+```json
+{
+  "mcpServers": {
+    "agentroid": {
+      "command": "node",
+      "args": ["--experimental-strip-types", "C:\\code\\agentroid-mcp\\apps\\mcp\\src\\sdk-wiring.ts"]
+    }
+  }
+}
+```
+
+**Stop the daemon** (from the repository root):
+
+```powershell
+.\target\release\bridged.exe --stop
+```
+
+**If it does not start.** The daemon has no console, so a mistyped switch makes it exit at once and leaves nothing in the log. If no new `listening on` line appears, check each switch against the list at the top of [`crates/bridged/src/main.rs`](crates/bridged/src/main.rs). The log shows what earlier starts wrote:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 20
+```
+
+Full requirements, wireless debugging notes and troubleshooting: [docs/REFERENCE.md](docs/REFERENCE.md#setup-notes).
+
+</details>
+
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/how-dark.svg">
+  <img src="docs/media/how-light.svg" width="100%" alt="Three parts in a row. Your AI agent (Claude Code, on your PC) asks Agentroid to look, tap or type. Agentroid, an MCP server and a small daemon on your PC, checks each action and makes no AI calls of its own, then drives your Android phone over adb, by USB or Wi-Fi. Coming back, the phone's raw screen description is 11,565 tokens; Agentroid hands the AI a short list of 229 tokens.">
+</picture>
+
+Agentroid is an MCP server (MCP is the plug-in standard AI agents such as Claude Code use for tools) plus a small daemon on your PC that talks to the phone over adb. Your agent stays the brain. Agentroid is its eyes and hands, and it keeps what the agent reads small in five ways:
+
+- **A short answer first.** A look returns the first 400 characters of the screen list and a one-line note on how to ask for more (the `digest` level). The agent pays for detail only when it needs it.
+- **"What changed?" instead of a second look.** After the first look the agent can ask only for the lines that were added, changed or removed (`since=`). When nothing changed, that answer is 35 tokens.
+- **Names that survive a scroll.** Each tappable thing gets a short id such as `r352116` that stays the same when the screen scrolls or re-lays out (a stable ref), so the agent does not have to look again to find it.
+- **Several steps in one call.** A list of steps runs on your PC as one job (`job_start`). The recording at the top is six taps for one call and one reply.
+- **No AI inside.** Agentroid makes 0 model calls and needs no API key of its own. Every reply carries a receipt that says so.
+
+<details>
+<summary>One more recording: look, tap four times, look again</summary>
+
+<br>
+
+<p align="center">
+  <img src="docs/media/demo-1.gif" width="760" alt="A real recording. Left: the phone's Calculator. Right: the calls: look, then four taps, then look again. The display goes from 0 to 7 x 6 = 42.">
+</p>
+
+<p align="center"><sub>Played at 1.5× speed. A short script sent the calls, not Claude Code.</sub></p>
+
+</details>
+
+## Safety
+
+An agent with a phone in its hands needs limits that it cannot talk its way past, so the checks live in the daemon and not in a prompt. Nothing is driven unless you allowed that phone by serial number. Every action is checked against what is on the screen at that moment: payments, banking apps, factory resets and typing into password or one-time-code fields are refused, and sending, deleting, installing and permission dialogs are refused unless you approve them from another device (an optional approval channel). There is no free shell: the only shell commands that run are read-only diagnostics from a fixed list, and anything else is refused. Every decision goes into a hash-chained log, which shows if anyone edits it afterwards. The guard is plain rules, so it has blind spots: what it catches, what it misses and the red-team results are published in [docs/SAFETY.md](docs/SAFETY.md). Use it on phones you own or are allowed to test.
+
+<p align="center">
+  <img src="docs/media/demo-2.gif" width="760" alt="A real recording of three diagnostic calls. Reading the battery state runs. Clearing an app's data and changing a setting are each refused with a reason before anything reaches the phone.">
+</p>
+
+<p align="center"><sub>A read-only check runs; two commands that would change the phone are refused before they reach it. Paced for reading.</sub></p>
+
+## Status and limits
+
+Agentroid is a preview (0.1.0). It works and is tested, but it is not 1.0.
+
+- **Windows only** for the daemon in this build, tested on Windows 11. A Linux listener is written but not built or tested.
+- **Build it from source.** Nothing is published to crates.io or npm yet.
+- **Every allowed phone gets full access.** Per-device modes (read-only, helper) exist in the daemon but cannot be set from configuration yet.
+- **Text, not pictures.** The agent reads the screen as a text list. `screenshot` and `look` do not send image bytes to the agent in this build.
 - **Not implemented yet:** `pixel_probe`, and `look`'s `element` and `ocr` options. `set_value` sets text fields only.
-- **The AndroidWorld benchmark** is in progress: [docs/BENCHMARK.md](docs/BENCHMARK.md) shows what has been measured so far.
+- **One AI client tried:** Claude Code.
+- **No task benchmark yet.** The AndroidWorld runs so far are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
-## More
+## How it was built
 
-- [docs/REFERENCE.md](docs/REFERENCE.md): every feature, the full setup notes, troubleshooting and the full project status.
-- [docs/SAFETY.md](docs/SAFETY.md): how the daemon's screen guard decides, and its published red-team results.
+[Ethan Soh](https://github.com/Sohwhat6420) directs the design and testing; AI coding agents wrote most of the code under his direction.
+
+## Docs
+
+- [docs/REFERENCE.md](docs/REFERENCE.md): every feature, the full setup notes and troubleshooting.
+- [docs/SAFETY.md](docs/SAFETY.md): how the screen guard decides, and its published red-team results.
 - [docs/BENCHMARK.md](docs/BENCHMARK.md): the AndroidWorld runs so far.
 - [docs/CONNECTION-KEEPER.md](docs/CONNECTION-KEEPER.md): the Android module that brings wireless adb back after a Wi-Fi drop or a reboot.
-- [docs/media/src](docs/media/src): the script that draws the card at the top of this page and the social banner from the measured output.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+- [docs/media/src](docs/media/src): the scripts that draw the pictures on this page from the measured figures, and the raw token counts. The banner's phone body and desk are a generated picture; the screen in it is a real screenshot.
+- [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## Licence
 
