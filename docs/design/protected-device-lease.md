@@ -94,10 +94,15 @@ The checks run in this order, and the first one that refuses ends the call:
      shell run code from), anything under `/proc` (round 4f: a process's or a thread's view of
      `/`, `/proc/<any>/root`, `cwd` and `task/<any>/root`, and its open files, `/proc/<any>/fd/<n>`,
      are other spellings of real paths, so none is let through instead of each being resolved),
-     or onto the dump helper's path. The path is normalised first (`\` becomes `/`; empty, `.` and
-     `..` segments are resolved), so `/sdcard/../data/local/tmp/x` and
-     `/proc/self/root/data/local/tmp/x` are caught. Core checks the phone path; the adb guard checks both sides again. Pulls are reads and
-     are not refused.
+     anything under `/dev/fd`, `/dev/stdin`, `/dev/stdout` or `/dev/stderr` (round 4g: AOSP's
+     init.rc links `/dev/fd` to `/proc/self/fd`), or onto the dump helper's path. A phone path
+     that does not start with `/` is refused too (round 4g: adbd opens it against its working
+     folder, `/`, so `data/local/tmp/x` lands in `/data/local/tmp`), and so is any path with a
+     `..` segment: `..` is not resolved as text, because that is unsound across links
+     (`/dev/fd/../root/...` is `/proc/self/root/...` on the phone). Otherwise the path is
+     normalised first (`\` becomes `/`, empty and `.` segments are dropped, any case), so
+     `/DATA//local/./tmp/x` and `/proc/self/root/data/local/tmp/x` are caught. Core checks the
+     phone path; the adb guard checks both sides again. Pulls are reads and are not refused.
 3. **The daemon lease.** The caller must hold the daemon's device lease on the protected phone
    (`lease.acquire`). The protected lease's holder is **the caller's own** daemon lease (its
    holder name and epoch): `device.call` and the devtools calls name their connection, and a job
@@ -466,7 +471,12 @@ These are not fixed by this design, and are recorded so nobody relies on them:
   next open it looks exactly like a crash's leftover record, so it is adopted. Every adoption
   appends an `audit:repaired_head` record naming the adopted record's seq and hash, and
   `agentroid audit verify` lists them: that record is the evidence to check. (Refusing to open
-  instead is the other choice; the owner may take it.)
+  instead is the other choice; the owner may take it.) If the repair record's own line cannot be
+  written, that open fails with an error naming the adopted record, but the head file and the
+  anchor are already up to it, so the next open finds the log whole and appends no repair
+  record: the failed open's error is then the only trace.
+- **One daemon per state folder.** Two daemons on one state folder (one audit log, head file and
+  anchor) race each other's appends and head repairs; nothing here locks the folder. Run one.
 
 ## Holder and job
 
@@ -518,7 +528,10 @@ The log itself (`crates/core/src/audit.rs`), round 4e:
   (a crash between the head's rename and the anchor's write, round 4f), is adopted. A chained
   `audit:repaired_head` record is appended at once, naming what was behind and the seq and hash
   of the adopted record, and it brings the head file and the anchor up past it; a log whose repair
-  record cannot be written is not opened. `agentroid audit verify` lists every repair. An anchor
+  record cannot be written is not opened. The head file and the anchor are written up to the
+  adopted record before the repair record (round 4g), so a repair record whose own anchor write
+  fails leaves the anchor alone one behind, which the next open repairs again, never an anchor two
+  behind that is refused for good. `agentroid audit verify` lists every repair. An anchor
   ahead of the head is refused (this write order cannot leave one), and so is anything else that
   disagrees with the head, as before.
 - The head file is written beside itself and renamed over the old one. On Windows that rename can

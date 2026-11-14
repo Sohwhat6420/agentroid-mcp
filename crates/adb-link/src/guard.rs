@@ -104,9 +104,11 @@ const CODE_SUFFIXES: [&str; 12] = [
     ".aab",
 ];
 
-/// A path as the phone resolves it, for the code-push rule: lower case, `\` as `/`, empty and `.`
-/// segments dropped, `..` taken off the segment before it. (`/proc` paths are not resolved here:
-/// [`code_push_refusal`] refuses every one, review round 4f, item 6.)
+/// A path as the phone spells it, for the code-push rule: lower case, `\` as `/`, empty and `.`
+/// segments dropped, `..` taken off the segment before it. (A remote path with a `..` segment is
+/// refused before this is used for it, so `..` is resolved here only for the laptop file's name;
+/// `/proc` and the `/dev/fd` aliases are not resolved either: [`code_push_refusal`] refuses every
+/// path under them.)
 fn normalise_phone_path(p: &str) -> String {
     let p = p.trim().to_lowercase().replace('\\', "/");
     let lead = if p.starts_with('/') { "/" } else { "" };
@@ -123,13 +125,26 @@ fn normalise_phone_path(p: &str) -> String {
     format!("{lead}{}", out.join("/"))
 }
 
+/// The `/dev` names that are links into `/proc/self/fd` (AOSP's init.rc links `/dev/fd` to
+/// `/proc/self/fd`; `stdin`, `stdout` and `stderr` are its first three): a push under any of
+/// them reaches a process's open files, as `/proc` does (review round 4g, M1).
+const DEV_FD_ALIASES: [&str; 4] = ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
+
 /// Why a push to the protected phone is refused as code, or `None`. `local` is the file sent and
 /// `remote` the path it lands at: a code file by name (either side, any case), anything into
 /// `/data/local/tmp` (where `app_process` and the shell run code from), anything under `/proc`
 /// (a process's or a thread's view of `/`, its open files: `/proc/<any>/root`, `cwd`, `fd/<n>`,
 /// `task/<any>/root`... are other spellings of real paths, so none is let through; review round
-/// 4f, item 6) or onto the dump helper's path. A fixed refusal: no lease or approval lifts it.
+/// 4f, item 6) or under the `/dev/fd` links ([`DEV_FD_ALIASES`]), or onto the dump helper's path.
+/// A remote path that does not start with `/` is refused too (adbd opens it against its working
+/// folder, `/`, so `data/local/tmp/x` lands in `/data/local/tmp`), and so is one with a `..`
+/// segment: resolving `..` as text is unsound across links (`/dev/fd/../root/...` is
+/// `/proc/self/root/...` on the phone), so it is not resolved at all (review round 4g, M1). A
+/// fixed refusal: no lease or approval lifts it.
 pub fn code_push_refusal(local: &str, remote: &str) -> Option<String> {
+    let spelt = remote.trim().replace('\\', "/");
+    let relative = !spelt.starts_with('/');
+    let dotdot = spelt.split('/').any(|seg| seg == "..");
     let r = normalise_phone_path(remote);
     let named_code = [local, remote].iter().any(|p| {
         let n = normalise_phone_path(p);
@@ -138,8 +153,11 @@ pub fn code_push_refusal(local: &str, remote: &str) -> Option<String> {
     });
     let tmp = r == "/data/local/tmp" || r.starts_with("/data/local/tmp/");
     let proc = r == "/proc" || r.starts_with("/proc/");
-    (named_code || tmp || proc || r == DUMP_HELPER_REMOTE).then(|| {
-        "code is never pushed to the protected phone (a .dex, .apk, .jar, .so or similar, or anything into /data/local/tmp or under /proc), lease or not".to_string()
+    let dev_fd = DEV_FD_ALIASES
+        .iter()
+        .any(|d| r == *d || r.strip_prefix(d).is_some_and(|rest| rest.starts_with('/')));
+    (named_code || tmp || proc || dev_fd || relative || dotdot || r == DUMP_HELPER_REMOTE).then(|| {
+        "code is never pushed to the protected phone (a .dex, .apk, .jar, .so or similar, anything into /data/local/tmp or under /proc or /dev/fd, and any phone path that is relative or has a `..` in it), lease or not".to_string()
     })
 }
 
@@ -2649,6 +2667,25 @@ mod tests {
             ("C:/outbox/a", "/proc/self/rootx/data/local/tmp/x"),
             ("C:/outbox/a", "/proc/self/task/1/rootx/data/local/tmp/x"),
             ("C:/outbox/a", "/proc/self/tasks/1/root/data/local/tmp/x"),
+            // review round 4g, M1: a relative path lands under adbd's working folder, `/`
+            ("C:/outbox/note.txt", "data/local/tmp/x"),
+            ("C:/outbox/note.txt", "sdcard/Download/note.txt"),
+            ("C:/outbox/note.txt", "./data/local/tmp/x"),
+            ("C:/outbox/note.txt", ""),
+            // a `..` segment is refused outright, wherever it leads
+            ("C:/outbox/note.txt", "/dev/fd/../root/data/local/tmp/x"),
+            (
+                "C:/outbox/note.txt",
+                "/sdcard/Download/../Download/note.txt",
+            ),
+            ("C:/outbox/note.txt", "\\sdcard\\..\\sdcard\\note.txt"),
+            // the /dev links into /proc/self/fd, and anything under them
+            ("C:/outbox/note.txt", "/dev/fd"),
+            ("C:/outbox/note.txt", "/dev/fd/3"),
+            ("C:/outbox/note.txt", "/DEV/FD/0/x"),
+            ("C:/outbox/note.txt", "/dev//./stdin"),
+            ("C:/outbox/note.txt", "/dev/stdout"),
+            ("C:/outbox/note.txt", "/dev/stderr/x"),
             ("C:/outbox/note.txt", DUMP_HELPER_REMOTE),
             ("C:\\outbox\\a.DeX", "/sdcard/a"),
         ] {
@@ -2667,6 +2704,12 @@ mod tests {
             ("C:/outbox/a", "/sdcard/proc/self/root/data/local/tmp/x"),
             ("C:/outbox/a", "/sdcard/proc/self/fd/3"),
             ("C:/outbox/a", "/procx/self/fd/3"),
+            ("C:/outbox/a", "/dev/fdx/3"),
+            ("C:/outbox/a", "/dev/stdinx"),
+            ("C:/outbox/a", "/sdcard/dev/fd/3"),
+            ("C:/outbox/a", "/sdcard/a..b/c..txt"),
+            ("C:/outbox/a", "/sdcard/./Download/a"),
+            ("C:/outbox/../outbox/a", "/sdcard/a"),
         ] {
             assert!(
                 code_push_refusal(local, remote).is_none(),

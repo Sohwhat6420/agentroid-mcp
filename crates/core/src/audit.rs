@@ -645,6 +645,14 @@ struct Faults {
     sync: bool,
     /// Taking a failed append's line out again fails.
     undo: bool,
+    /// The anchor write after a record fails.
+    anchor: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Faults a unit test injects into the appends an open makes itself (the repair record).
+    static OPEN_FAULTS: std::cell::Cell<Faults> = std::cell::Cell::new(Faults::default());
 }
 
 impl fmt::Debug for AuditLog {
@@ -754,9 +762,21 @@ impl AuditLog {
             anchor_failures: 0,
             poisoned: None,
             #[cfg(test)]
-            faults: Faults::default(),
+            faults: OPEN_FAULTS.with(std::cell::Cell::get),
         };
         if let Some((seq, hash, what)) = repaired {
+            // the head file and the anchor go up to the adopted record first, so a repair record
+            // that then fails leaves a log the next open finds whole, or (its anchor write
+            // failed) with the anchor alone one behind, which it repairs again; never an anchor
+            // two behind, refused for good (review round 4g, L1)
+            write_head(&head_path(path), seq, &hash)?;
+            if let Some(a) = &log.options.anchor {
+                match write_head(&a.path, seq, &hash) {
+                    Err(e) if a.required => return Err(e),
+                    Err(_) => log.anchor_failures += 1,
+                    Ok(()) => {}
+                }
+            }
             // chained like every record, so the adoption is in the log for good; a log whose
             // repair cannot be written is not opened (review round 4f, item 2)
             log.append(&Entry {
@@ -943,7 +963,16 @@ impl AuditLog {
         self.part_records += 1;
         self.part_first_ts.get_or_insert(ts_ms);
         if let Some(a) = &self.options.anchor {
-            if let Err(err) = write_head(&a.path, r.seq, &r.hash) {
+            let written = write_head(&a.path, r.seq, &r.hash);
+            #[cfg(test)]
+            let written = if self.faults.anchor {
+                Err(io::Error::other(
+                    "injected: the anchor could not be written",
+                ))
+            } else {
+                written
+            };
+            if let Err(err) = written {
                 self.anchor_failures += 1;
                 if a.required {
                     return Err(io::Error::new(
@@ -1472,6 +1501,7 @@ mod tests {
         log.faults = Faults {
             sync: true,
             undo: true,
+            ..Faults::default()
         };
         let err = log.append(&entry(1, "blocked")).unwrap_err();
         assert!(!record_written(&err), "{err}");
@@ -1671,6 +1701,77 @@ mod tests {
             AuditLog::open_with(&p, opts()).is_err(),
             "an anchor two behind"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review round 4g, L1: a repair record that cannot be written leaves a log the next open
+    /// can take. Its anchor write fails: the head file and the anchor were brought up to the
+    /// adopted record first, so the anchor is one behind the repair record, and the next open
+    /// repairs that too. Its line fails: the log is whole at the adopted record, and opens.
+    #[test]
+    fn a_repair_record_that_fails_leaves_a_log_the_next_open_takes() {
+        let d = tmp("repair-fails");
+        let p = d.join("audit.jsonl");
+        let head = head_path(&p);
+        let anchor = d.join("anchor.head");
+        let opts = || Options {
+            rotation: None,
+            anchor: Some(Anchor {
+                path: anchor.clone(),
+                required: true,
+            }),
+        };
+        let behind = |n: u32| {
+            // the head file and the anchor one record behind the log's last record
+            let mut log = AuditLog::open_with(&p, opts()).unwrap();
+            log.append(&entry(n, "allowed")).unwrap();
+            let before = std::fs::read_to_string(&head).unwrap();
+            log.append(&entry(n + 1, "allowed")).unwrap();
+            drop(log);
+            std::fs::write(&head, &before).unwrap();
+            std::fs::write(&anchor, &before).unwrap();
+        };
+        let set = |f: Faults| OPEN_FAULTS.with(|c| c.set(f));
+        // 1. the repair record's anchor write fails
+        behind(0);
+        set(Faults {
+            anchor: true,
+            ..Faults::default()
+        });
+        let err = AuditLog::open_with(&p, opts()).unwrap_err();
+        set(Faults::default());
+        assert!(record_written(&err), "{err}");
+        assert_eq!(
+            read_head(&anchor).unwrap().unwrap().0,
+            2,
+            "up to the adopted record"
+        );
+        let log = AuditLog::open_with(&p, opts()).expect("the anchor one behind is repaired");
+        assert_eq!(
+            log.head().0,
+            4,
+            "the first repair record stays, then a second"
+        );
+        drop(log);
+        let c = verify_chain(&p, Some(&anchor)).unwrap();
+        assert_eq!(c.all.repairs.len(), 2, "{:?}", c.all.repairs);
+        assert!(
+            c.all.repairs[1].starts_with("seq 4: the anchor: "),
+            "{:?}",
+            c.all.repairs
+        );
+        // 2. the repair record's line fails (and is taken out)
+        behind(4);
+        set(Faults {
+            sync: true,
+            ..Faults::default()
+        });
+        assert!(AuditLog::open_with(&p, opts()).is_err());
+        set(Faults::default());
+        let log = AuditLog::open_with(&p, opts()).expect("whole at the adopted record");
+        assert_eq!(log.head().0, 6);
+        drop(log);
+        assert!(verify_chain(&p, Some(&anchor)).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 

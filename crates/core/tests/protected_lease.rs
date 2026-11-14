@@ -643,10 +643,16 @@ fn settle_on_the_protected_phone_is_an_ordinary_settle() {
 #[test]
 fn files_go_under_the_lease_but_code_shell_and_link_segments_never_do() {
     let mut r = rig("paths");
-    // code, or anything into /data/local/tmp or under /proc, is refused before any ask, in any
-    // spelling
+    // code, or anything into /data/local/tmp or under /proc or /dev/fd, or a relative path or
+    // one with `..` in it, is refused before any ask, in any spelling (rounds 4f and 4g)
     for p in [
         "/proc/self/fd/3",
+        "/dev/fd/3",
+        "/dev/stdin",
+        "/dev/fd/../root/data/local/tmp/x",
+        "data/local/tmp/notes.txt",
+        "sdcard/Download/notes.txt",
+        "/sdcard/Download/../Download/notes.txt",
         "/data/local/tmp/agentroid-dump.dex",
         "/data/local/tmp",
         "/data/local/tmp/notes.txt",
@@ -2607,9 +2613,13 @@ fn a_close_written_ahead_without_its_anchor_refuses_the_next_call() {
     assert!(r.core.protected_mut().unwrap().close_epoch(1).is_some());
     r.core.protected_audit_closes("lease.release");
     r.core.protected_audit_closes("lease.release");
+    let sent = r.sent().len();
     let e = refused(r.call(&at(100.0, 300.0)));
     assert!(matches!(e, Refusal::Audit { .. }), "{e:?}");
     assert!(e.to_string().contains("is in the audit log"), "{e}");
+    // refused before any ask: the refusal is the kept close's, not an ask record's own anchor
+    // failure (review round 4g, L2)
+    assert_eq!(r.sent().len(), sent, "no push went out: {:?}", r.sent());
 }
 
 /// An overnight lease from `start` that ends on a stale presence file 16 min on: the ask after
