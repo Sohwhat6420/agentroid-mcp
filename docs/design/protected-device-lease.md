@@ -459,7 +459,8 @@ These are not fixed by this design, and are recorded so nobody relies on them:
   them 12 hours by default; a self-hosted server sets its own `cache-duration`). A Deny tapped
   longer ago than that while the daemon was down is not seen. A Deny applied before the restart
   is kept in the holds file, and its hold with it, so this only affects a Deny the daemon never
-  saw.
+  saw. On a self-hosted server, set `cache-duration` to 24 hours or more, so that a daemon down
+  overnight still reads the evening's Denies in the morning; on ntfy.sh the 12 hours stand.
 - **A touch on a dark screen.** A `tap`, `long_press` or `swipe` on a screen that is off or dozing
   goes on to the usual guards without a PIN check, because there is no screen to read. Between
   the wakefulness read and the touch, the screen can come on (the owner picks the phone up, or the
