@@ -7,8 +7,6 @@
 
 **The most phone control for the fewest tokens.** Agentroid is an MCP server (the Model Context Protocol is how tools plug into AI agents such as Claude Code) that lets an agent read and drive an Android phone or emulator over adb. Everything the agent reads stays in its context window, so a smaller screen means a cheaper step and room for a longer task. On a real home screen the raw dump is 30,910 characters; Agentroid's full listing of it is 2,550, and by default the agent gets a digest of the first 400 characters plus a one-line note on how to ask for more. All 27 tools fit in under 5,000 tokens.
 
-![Status: preview](docs/media/badge-preview.svg) ![Benchmark: in progress](docs/media/badge-benchmark.svg)
-
 > **Preview 0.1.0.** It works and is tested, but it is not 1.0. In this build the daemon runs on Windows only, and out of the box it drives emulators, not physical phones. See [Status](#status).
 
 ## Context budget
