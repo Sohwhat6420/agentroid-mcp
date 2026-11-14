@@ -607,7 +607,9 @@ impl<R: Runner> Transport for AdbTransport<R> {
 pub fn screen_lock_for_adb(lease_dir: std::path::PathBuf, adb: &Path) -> ScreenLock {
     use agentroid_adb_link::guard::GuardedRunner;
     use agentroid_adb_link::runner::AdbRunner;
-    let read_runner = GuardedRunner::new(AdbRunner::new(adb));
+    // the one reader that may read the protected phone's call state (and keeps only the parsed
+    // state): see adb-link's S24_CALL_STATE_READ
+    let read_runner = GuardedRunner::with_s24_call_state(AdbRunner::new(adb));
     let probe_runner = GuardedRunner::new(AdbRunner::new(adb));
     let origin = Instant::now();
     ScreenLock::new(

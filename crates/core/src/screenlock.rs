@@ -124,7 +124,7 @@ impl std::fmt::Debug for MonoClock {
 pub enum Admitted {
     /// Emulators are not locked.
     Emulator,
-    /// A live `ask-screen` lease, with the minutes left.
+    /// A live `ask-screen` lease, with the ms left on it (on the wall clock).
     Lease(u64),
     /// Not in use at the time of the call.
     Free(String),
@@ -151,7 +151,7 @@ pub struct ScreenLock {
 
 /// The key a phone's burst is kept under: its hardware serial, unless that is missing or a junk
 /// serial many phones share (then its adb serial).
-fn phone_key(hw_serial: &str, adb_serial: &str) -> String {
+pub(crate) fn phone_key(hw_serial: &str, adb_serial: &str) -> String {
     if hw_serial.is_empty() || is_generic_serial(hw_serial) {
         adb_serial
     } else {
@@ -296,7 +296,7 @@ impl ScreenLock {
             // past it (the caller records no burst for a call a lease let through)
             self.ours.remove(&key);
             self.verdicts.remove(&key);
-            return Ok(Admitted::Lease((lease_until - t).div_ceil(60_000)));
+            return Ok(Admitted::Lease(lease_until - t));
         }
         if t < denied_until {
             return Err(format!(
@@ -623,13 +623,13 @@ mod tests {
         save_memory(&r.dir, "hw1", &m).unwrap();
         assert_eq!(
             r.lock.admit("192.0.2.9:5555", "HW1"),
-            Ok(Admitted::Lease(2))
+            Ok(Admitted::Lease(90_000))
         );
         // keyed by the adb serial (ask-screen given --device ip:port, serial unreadable)
         save_memory(&r.dir, "192.0.2.10:5555", &m).unwrap();
         assert_eq!(
             r.lock.admit("192.0.2.10:5555", "HW9"),
-            Ok(Admitted::Lease(2))
+            Ok(Admitted::Lease(90_000))
         );
         // the lease runs out: in use again
         r.at(T0 + 90_001);
@@ -966,7 +966,7 @@ mod tests {
         save_memory(&r.dir, "hw1", &m).unwrap();
         r.at(T0 + 59_000);
         r.set(Some(awake("com.whatsapp", true, 59_000)));
-        assert_eq!(r.lock.admit("s1", "HW1"), Ok(Admitted::Lease(1)));
+        assert_eq!(r.lock.admit("s1", "HW1"), Ok(Admitted::Lease(1_000)));
         r.at(T0 + 120_000);
         r.set(Some(awake("com.whatsapp", true, 120_000)));
         let e = r.lock.admit("s1", "HW1").unwrap_err();
@@ -1025,7 +1025,7 @@ mod tests {
         r.set(Some(awake("com.anthropic.claude", true, 1_000)));
         assert_eq!(
             r.lock.admit("0123456789ABCDEF", "0123456789ABCDEF"),
-            Ok(Admitted::Lease(2))
+            Ok(Admitted::Lease(90_000))
         );
     }
 

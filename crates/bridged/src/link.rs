@@ -28,7 +28,6 @@
 
 use crate::proto::*;
 use crate::registry::Registry;
-use agentroid_core::screenlock::FREE_SEGMENT_MAX_S;
 use agentroid_segments::{
     build, sign_with, Phase, SafeClasses, Segment, SegmentRequest, Step, Supervisor,
 };
@@ -638,21 +637,19 @@ impl crate::server::Daemon {
                     let id = p.segment_id.clone();
                     // the screen lock, before anything is built, signed or sent: a segment
                     // changes the screen like any tap, and it is checked only this once
-                    let ticket = self
+                    let adm = self
                         .backend()
                         .lock_admit_segment(&d.serial, p.steps.len(), p.expires_in_s)
                         .map_err(|e| {
                             RpcError::new(REFUSED, e.to_string())
                                 .with_data(json!({"rule": "screen_lock"}))
                         })?;
-                    if ticket.is_some() {
-                        // let through because the phone is not in use now: a short life only
-                        p.expires_in_s = Some(
-                            p.expires_in_s
-                                .unwrap_or(FREE_SEGMENT_MAX_S)
-                                .min(FREE_SEGMENT_MAX_S),
-                        );
+                    if let Some(max) = adm.max_life_s {
+                        // let through for a short while only (the phone is not in use now, or
+                        // the lease ends soon): no longer a life than that
+                        p.expires_in_s = Some(p.expires_in_s.unwrap_or(DEFAULT_SEGMENT_S).min(max));
                     }
+                    let ticket = adm.ticket;
                     let r = link.segment(&key, epoch, p);
                     // the phone's answer is in (or the segment may be running): the end of the
                     // agent's own action, stamped now, before the daemon's lock is taken again.
@@ -661,14 +658,21 @@ impl crate::server::Daemon {
                     match ticket {
                         Some(mut t) if r.is_ok() || link.segment_is_running(&key, &id) => {
                             t.finished();
-                            self.backend().lock_done(t)
+                            self.backend().lock_done_segment(t, &id)
                         }
                         cancelled => drop(cancelled),
                     }
                     to_value(&r?)
                 } else {
                     let p: LinkSegmentReportParams = parse_params(params)?;
-                    to_value(&link.segment_report(&key, epoch, &p.segment_id)?)
+                    let clock = self.backend().lock_clock();
+                    let r = link.segment_report(&key, epoch, &p.segment_id)?;
+                    // the phone has a report: the segment has ended, and its end (stamped now,
+                    // before the daemon's lock is taken again) is the agent's own activity
+                    let at = clock.map(|c| c.now());
+                    self.backend()
+                        .lock_segment_reported(&d.serial, &p.segment_id, at);
+                    to_value(&r)
                 }
             }
             other => Err(RpcError::new(

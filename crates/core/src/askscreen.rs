@@ -951,7 +951,10 @@ pub fn command(args: &[String]) -> (String, i32) {
         },
         None => None,
     };
-    let runner = agentroid_adb_link::guard::GuardedRunner::new(AdbRunner::new(&p.adb));
+    // the one reader that may read the protected phone's call state (and keeps only the parsed
+    // state): see adb-link's S24_CALL_STATE_READ
+    let runner =
+        agentroid_adb_link::guard::GuardedRunner::with_s24_call_state(AdbRunner::new(&p.adb));
     let Some(signals) = read_signals(&runner, &p.ask.device) else {
         let out = serde_json::json!({
             "decision": "denied", "interim": true,
@@ -1694,6 +1697,69 @@ mod tests {
                 .all(|c| c == "getprop ro.serialno" || c == "dumpsys power"),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn the_call_state_reader_reads_the_protected_phones_call_state_and_keeps_only_that() {
+        use agentroid_adb_link::guard::{GuardedRunner, S24_SERIAL};
+        // a raw registry dump carries more than the call state (numbers, cell data): none of it
+        // may come out of the reader
+        struct Hw(Arc<Mutex<Vec<String>>>, &'static str);
+        impl Runner for Hw {
+            fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
+                let cmd = a.last().cloned().unwrap_or_default();
+                self.0.lock().unwrap().push(cmd.clone());
+                let stdout = if cmd == "getprop ro.serialno" {
+                    format!("{S24_SERIAL}\n")
+                } else if cmd == "dumpsys power" {
+                    POWER_DOZING.to_string()
+                } else if cmd == "dumpsys telephony.registry" {
+                    format!(
+                        "last known state:\n  Phone Id=0\n    mCallState={}\n    mCallIncomingNumber=RAW-DUMP-MARKER\n",
+                        self.1
+                    )
+                } else {
+                    String::new()
+                };
+                Ok(RunOutput {
+                    code: Some(0),
+                    stdout,
+                    stderr: String::new(),
+                })
+            }
+        }
+        // asleep with no call: not in use, so no push
+        let log = Arc::new(Mutex::new(vec![]));
+        let g = GuardedRunner::with_s24_call_state(Hw(log.clone(), "0"));
+        let s = read_signals(&g, "192.0.2.10:5555").unwrap();
+        assert_eq!(s.in_call, Some(false));
+        assert!(matches!(judge(&s, 60_000, &[]), Use::Free(_)), "{s:?}");
+        let out = format!("{s:?} {}", signals_json(&s));
+        assert!(!out.contains("RAW-DUMP-MARKER"), "{out}");
+        let sent = log.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|c| c == "dumpsys telephony.registry"),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().all(|c| c == "getprop ro.serialno"
+                || c == "dumpsys power"
+                || c == "dumpsys telephony.registry"),
+            "{sent:?}"
+        );
+        // ringing: in use
+        let g = GuardedRunner::with_s24_call_state(Hw(Arc::new(Mutex::new(vec![])), "1"));
+        let s = read_signals(&g, "192.0.2.10:5555").unwrap();
+        assert_eq!(s.in_call, Some(true));
+        assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
+        // the positive control: through the plain guarded runner the call state stays unknown,
+        // so the same asleep phone is in use, and the read never reached it
+        let log = Arc::new(Mutex::new(vec![]));
+        let g = GuardedRunner::new(Hw(log.clone(), "0"));
+        let s = read_signals(&g, "192.0.2.10:5555").unwrap();
+        assert_eq!(s.in_call, None);
+        assert!(matches!(judge(&s, 60_000, &[]), Use::InUse(_)));
+        assert!(!log.lock().unwrap().iter().any(|c| c.contains("telephony")));
     }
 
     fn ask() -> Ask {

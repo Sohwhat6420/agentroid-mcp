@@ -1009,8 +1009,8 @@ async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_i
     assert_eq!(r["error"]["data"]["rule"], "screen_lock", "{r}");
     assert!(p.st().segments_seen.is_empty(), "nothing reached the phone");
     // the segment goes, with its life cut to the free limit
-    let before = mono();
     let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-free", "run_id": "run-a", "steps": r1_steps() })).await;
+    let accepted = mono();
     assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
     assert_eq!(p.st().segments_seen.len(), 1);
     {
@@ -1025,11 +1025,32 @@ async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_i
         let max = agentroid_core::screenlock::FREE_SEGMENT_MAX_S as i64;
         assert!(expires <= now_s + max + 1, "expires {expires}, now {now_s}");
     }
-    // its own steps woke the phone and opened an app: the segment's answer continues the burst
-    // (past the 1 s the lock keeps a verdict, so only the recorded answer can let it through)
+    // the review's probe E: its own steps woke the phone, opened an app and touched it 500 ms
+    // after the phone took it (past the 0.3 s the lock allows). Before its report that touch reads as anyone's: refused, nothing
+    // sent (past the 1 s the lock keeps a verdict)
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     *phone_state.lock().unwrap() = busy;
-    *touched.lock().unwrap() = Some(before);
+    *touched.lock().unwrap() = Some(accepted + 500);
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-early", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(code(&r), REFUSED, "{r}");
+    assert_eq!(p.st().segments_seen.len(), 1);
+    // its report comes in: the segment has ended, and its end continues the burst
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let step = |id: &str, ms: u64| json!({"id": id, "status": "done", "post_verified": true, "decision": "allowed", "ts_ms": now_ms + ms, "ms": 5});
+        let report = json!({"v": 1, "t": "segment_report", "segment_id": "seg-free", "run_id": "run-a", "device": POCO_SERIAL, "epoch": epoch, "outcome": "completed", "steps": [step("s1", 1), step("s2", 20), step("s3", 40)]});
+        p.st().canned.insert("report-seg-free".into(), report);
+    }
+    let rep = a
+        .ok(
+            "link.segment_report",
+            json!({ "device": POCO_SERIAL, "segment_id": "seg-free" }),
+        )
+        .await;
+    assert_eq!(rep["outcome"].as_str(), Some("completed"), "{rep}");
     let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-burst", "run_id": "run-a", "steps": r1_steps() })).await;
     assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
     assert_eq!(p.st().segments_seen.len(), 2);

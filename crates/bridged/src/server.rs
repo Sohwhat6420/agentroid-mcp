@@ -10,9 +10,11 @@ use crate::runner::engine::Driver;
 use agentroid_adb_link::runner::Clock;
 use agentroid_core::fileguard::FileOp;
 use agentroid_core::gate::{self, Call, DeviceMode};
+use agentroid_core::screenlock::MonoClock;
 use agentroid_core::settle::{Settle, SettleOpts};
 use agentroid_core::transport::{
-    Core, CoreError, DeviceInfo, HealthHint, LockTicket, Outcome, Transport, TransportError,
+    Core, CoreError, DeviceInfo, HealthHint, LockTicket, Outcome, SegmentAdmission, Transport,
+    TransportError,
 };
 use agentroid_core::tree::Bounds;
 use serde::de::DeserializeOwned;
@@ -133,19 +135,29 @@ pub trait DeviceBackend: Send {
     /// the audit log holds every refused command. Default: not recorded.
     fn shell_refused(&mut self, _serial: &str, _line: &str, _reason: &str) {}
     /// Core's screen lock alone, for a link segment of `steps` steps asking to live `expires_s`
-    /// seconds (core does not send segments itself). `Ok(Some(ticket))`: the phone was let through
-    /// because it is not in use now, so the segment is held to the short limits
-    /// ([`agentroid_core::screenlock::FREE_SEGMENT_MAX_S`]); stamp the ticket finished and give it
-    /// to [`DeviceBackend::lock_done`] once the work has run, or drop it if it never ran.
-    /// Default: no lock, so nothing is refused.
+    /// seconds (core does not send segments itself; see [`Core::lock_admit_segment`]). Give the
+    /// segment no longer a life than `max_life_s`. A ticket: the phone was let through because it
+    /// is not in use now; stamp the ticket finished and give it to
+    /// [`DeviceBackend::lock_done_segment`] once the phone has taken the segment, or drop it if it
+    /// never ran. Default: no lock, so nothing is refused.
     fn lock_admit_segment(
         &mut self,
         _serial: &str,
         _steps: usize,
         _expires_s: Option<u64>,
-    ) -> Result<Option<LockTicket>, CoreError> {
-        Ok(None)
+    ) -> Result<SegmentAdmission, CoreError> {
+        Ok(SegmentAdmission::default())
     }
+    /// [`DeviceBackend::lock_done`] for a link segment the phone has taken. Default: none.
+    fn lock_done_segment(&mut self, _ticket: LockTicket, _segment_id: &str) {}
+    /// The lock's monotonic clock, to stamp a segment's report before the daemon's lock is taken
+    /// again. Default: no lock.
+    fn lock_clock(&mut self) -> Option<MonoClock> {
+        None
+    }
+    /// The report of a segment let through by [`DeviceBackend::lock_admit_segment`] came in at
+    /// `at` (see [`Core::lock_segment_reported`]). Default: none.
+    fn lock_segment_reported(&mut self, _serial: &str, _segment_id: &str, _at: Option<u64>) {}
     /// The work `ticket` names ([`DeviceBackend::lock_admit_segment`], or a shell line through
     /// [`DeviceBackend::shell_gate`]) has run: its end is the agent's own activity. Default: none.
     fn lock_done(&mut self, _ticket: LockTicket) {}
@@ -252,8 +264,17 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
         serial: &str,
         steps: usize,
         expires_s: Option<u64>,
-    ) -> Result<Option<LockTicket>, CoreError> {
+    ) -> Result<SegmentAdmission, CoreError> {
         self.core.lock_admit_segment(Some(serial), steps, expires_s)
+    }
+    fn lock_done_segment(&mut self, ticket: LockTicket, segment_id: &str) {
+        self.core.lock_done_segment(ticket, segment_id);
+    }
+    fn lock_clock(&mut self) -> Option<MonoClock> {
+        self.core.lock_clock()
+    }
+    fn lock_segment_reported(&mut self, serial: &str, segment_id: &str, at: Option<u64>) {
+        self.core.lock_segment_reported(serial, segment_id, at);
     }
     fn lock_done(&mut self, ticket: LockTicket) {
         self.core.lock_done(ticket);
