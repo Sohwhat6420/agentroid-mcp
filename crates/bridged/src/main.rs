@@ -516,6 +516,32 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
                     }
                 ),
             );
+            // alerts when a screen-keeping value stays behind: bridged.log always, a push when the
+            // MCP server's ntfy topic file exists (its path is logged, never its topic)
+            if let Some(a) = daemon.awake() {
+                match bridged::awake::alert_topic_file() {
+                    Some(p) => {
+                        log(
+                            &args.state_dir,
+                            &format!(
+                                "stay-awake alerts: bridged.log and a push (topic file {})",
+                                p.display()
+                            ),
+                        );
+                        a.set_notifier(std::sync::Arc::new(bridged::awake::NtfyNotifier {
+                            topic_file: p,
+                            base: "https://ntfy.sh".to_string(),
+                        }));
+                    }
+                    None => log(
+                        &args.state_dir,
+                        "stay-awake alerts: bridged.log only (no ntfy topic file, or AGENTROID_AWAKE_ALERTS=0)",
+                    ),
+                }
+                // a push can take seconds: off the start-up path
+                let a = a.clone();
+                std::thread::spawn(move || a.leftover_check());
+            }
         } else {
             log(
                 &args.state_dir,
