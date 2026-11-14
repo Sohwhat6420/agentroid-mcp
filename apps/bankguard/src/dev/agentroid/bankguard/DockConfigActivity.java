@@ -34,12 +34,12 @@ import java.util.Set;
  * reconfigured, by an empty dock's tap, and from the app's own screen.
  */
 public final class DockConfigActivity extends Activity {
-    private static final int BG = 0xFF0E0E10, SURFACE = 0xFF1B1B1D, RED = 0xFFCD3733, INK = 0xFFF4F4F5, DIM = 0xFF9A9AA0;
+    private static final int BG = 0xFF0E0E10, SURFACE = 0xFF1B1B1D, DOCK = 0xFF2C2C2E, RED = 0xFFCD3733, INK = 0xFFF4F4F5, DIM = 0xFF9A9AA0;
 
     private int id = AppWidgetManager.INVALID_APPWIDGET_ID;
     private final List<String> chosen = new ArrayList<String>();
     private final List<String[]> apps = new ArrayList<String[]>(); // {label, package}
-    private boolean mono = true;
+    private boolean mono = false;
     private Typeface dots;
     private LinearLayout preview;
     private TextView monoBtn, colourBtn, count;
@@ -98,8 +98,8 @@ public final class DockConfigActivity extends Activity {
         preview = new LinearLayout(this);
         preview.setOrientation(LinearLayout.HORIZONTAL);
         preview.setGravity(Gravity.CENTER);
-        preview.setBackground(pill(SURFACE));
-        preview.setPadding(dp(8), dp(8), dp(8), dp(8));
+        preview.setBackground(pill(DOCK));
+        preview.setPadding(dp(14), dp(12), dp(14), dp(12));
         preview.setContentDescription("Dock preview");
         root.addView(preview, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
 

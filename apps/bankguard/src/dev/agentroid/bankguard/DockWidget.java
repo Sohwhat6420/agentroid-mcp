@@ -9,12 +9,14 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
+import android.graphics.Shader;
 import android.graphics.drawable.AdaptiveIconDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
@@ -57,7 +59,7 @@ public final class DockWidget extends AppWidgetProvider {
     static String keyStyle(int id) { return "dock." + id + ".mono"; }
 
     static List<String> apps(Context c, int id) { return DockLogic.parse(prefs(c).getString(keyApps(id), null)); }
-    static boolean mono(Context c, int id) { return prefs(c).getBoolean(keyStyle(id), true); }
+    static boolean mono(Context c, int id) { return prefs(c).getBoolean(keyStyle(id), false); }
     static boolean configured(Context c, int id) { return prefs(c).contains(keyApps(id)); }
 
     static void save(Context c, int id, List<String> apps, boolean mono) {
@@ -116,7 +118,8 @@ public final class DockWidget extends AppWidgetProvider {
 
     /**
      * One button, drawn once. Mono: the app's themed (monochrome) icon in white on a dark circle, the Nothing look;
-     * an app with no monochrome icon gets its own icon in greyscale. Colour: the app's own icon.
+     * an app with no monochrome icon gets its own icon in greyscale. Colour (the default, as on the owner's dock):
+     * the app's own icon as a circle.
      */
     static Bitmap icon(Context c, String pkg, boolean mono, int px) {
         Bitmap b = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
@@ -125,8 +128,22 @@ public final class DockWidget extends AppWidgetProvider {
         try { d = c.getPackageManager().getApplicationIcon(pkg).mutate(); }
         catch (Throwable t) { d = c.getDrawable(android.R.drawable.sym_def_app_icon); }
         if (!mono) {
-            d.setBounds(0, 0, px, px);
-            d.draw(cv);
+            // Colour: every icon a full circle, whatever shape the launcher uses. An adaptive icon is drawn full
+            // size (its art then fills the circle); a legacy icon sits at 72% on a white circle, the way One UI
+            // and Pixel wrap them. The circle is painted through a shader, so its edge is anti-aliased.
+            Bitmap art = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
+            Canvas ac = new Canvas(art);
+            if (d instanceof AdaptiveIconDrawable) {
+                d.setBounds(0, 0, px, px);
+            } else {
+                ac.drawColor(0xFFFFFFFF);
+                int in = Math.round(px * 0.14f);
+                d.setBounds(in, in, px - in, px - in);
+            }
+            d.draw(ac);
+            Paint round = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+            round.setShader(new BitmapShader(art, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP));
+            cv.drawCircle(px / 2f, px / 2f, px / 2f, round);
             return b;
         }
         Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);

@@ -1,21 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- App dock: a pill of up to six app buttons. Each slot is one ImageView with a launch PendingIntent; the icons are
-     drawn once when the owner changes the list (DockWidget), never on a timer. -->
+     drawn once when the owner changes the list (DockWidget), never on a timer. The pill is 60 dp tall with 36 dp
+     icons, as on the owner's S24 (170 px and 100 px at 2.8125 px/dp), centred in whatever cell the launcher gives. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/w_root"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="@drawable/w_pill">
+    android:layout_height="match_parent">
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_height="60dp"
+        android:layout_gravity="center_vertical"
+        android:background="@drawable/w_pill_dock"
         android:orientation="horizontal"
         android:gravity="center"
-        android:paddingStart="8dp"
-        android:paddingEnd="8dp"
-        android:paddingTop="8dp"
-        android:paddingBottom="8dp">
+        android:paddingStart="14dp"
+        android:paddingEnd="14dp"
+        android:paddingTop="9dp"
+        android:paddingBottom="9dp">
 
         <ImageView android:id="@+id/dock_s0" android:layout_width="0dp" android:layout_height="match_parent"
             android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter" android:visibility="gone" />

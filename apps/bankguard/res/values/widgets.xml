@@ -4,10 +4,14 @@
 <resources>
     <color name="w_surface">#FF1B1B1D</color>
     <color name="w_slot">#FF2A2A2E</color>
+    <color name="w_dock">#FF2C2C2E</color>
     <color name="w_red">#FFCD3733</color>
     <color name="w_ink">#FFF4F4F5</color>
     <color name="w_ink_dim">#FF9A9AA0</color>
 
+    <string name="clock_greeting_label">Dot clock: hello</string>
+    <string name="clock_greeting_desc">HELLO! over a large dot-matrix time and the date, straight on the wallpaper. No alarms, no wakeups.</string>
+    <string name="clock_greeting_text">HELLO!</string>
     <string name="clock_row_label">Dot clock: time, date, day</string>
     <string name="clock_row_desc">Time in a pill, the date in a red circle and the day beside it. Ticks inside the home screen: no alarms, no wakeups.</string>
     <string name="clock_large_label">Dot clock: large</string>

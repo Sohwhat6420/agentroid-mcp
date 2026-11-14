@@ -102,6 +102,15 @@
         <!-- Home-screen widgets. Exported: the launcher's AppWidget service sends them APPWIDGET_UPDATE. None has a
              timer (updatePeriodMillis 0) and none sets an alarm: the clocks are TextClocks, ticking in the launcher. -->
         <receiver
+            android:name=".ClockWidget$Greeting"
+            android:label="@string/clock_greeting_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/clock_greeting_info" />
+        </receiver>
+        <receiver
             android:name=".ClockWidget$Row"
             android:label="@string/clock_row_label"
             android:exported="true">

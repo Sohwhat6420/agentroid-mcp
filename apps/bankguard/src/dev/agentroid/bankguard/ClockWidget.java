@@ -29,6 +29,11 @@ public abstract class ClockWidget extends AppWidgetProvider {
         }
     }
 
+    /** HELLO! / 06:47 / SAT, 14 NOV, on the wallpaper: the owner's own clock. */
+    public static final class Greeting extends ClockWidget {
+        @Override int layout() { return R.layout.widget_clock_greeting; }
+    }
+
     /** [ 06:27 ] ( 14 ) ( SAT ) */
     public static final class Row extends ClockWidget {
         @Override int layout() { return R.layout.widget_clock_row; }
