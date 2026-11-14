@@ -23,6 +23,21 @@
 //! * **Never.** Other `read_only` devices and `helper` devices (care refuses every lease scope
 //!   there); lock, PIN, password or keyguard settings (only the two keys above are ever written);
 //!   emulators (so benchmark runs stay as measured). `AGENTROID_NO_STAY_AWAKE=1` turns it all off.
+//! * **Alerts when a value stays behind (14 Nov 2026).** A phone kept awake after nobody works it
+//!   costs battery, so each of these raises an alert, at most once a day each (remembered across
+//!   restarts in `awake-alerts.json` in the state folder): a `stay-awake ALERT` line in
+//!   `bridged.log`, and a push when a channel is set ([`SessionAwake::set_notifier`]; the daemon uses
+//!   the MCP server's ntfy topic file, `%USERPROFILE%\.agentroid\ntfy-topic.txt`, when it exists).
+//!   Pushes go out after the locks are dropped, so a slow push service holds nothing up.
+//!   (1) A session's lease finds a key already keeping the screen on ([`stays_awake`]: any
+//!   `stay_on_while_plugged_in` bit, or a `screen_off_timeout` longer than any menu choice), whether
+//!   set by something else or left by an earlier Agentroid session whose record was lost.
+//!   (2) A restore leaves such a value in place: changed while held (compare-and-swap leaves it), or
+//!   not put back (phone unreachable). (3) At start, records of a daemon that stopped without putting
+//!   its values back ([`SessionAwake::leftover_check`]). An alert never changes a value: what was
+//!   found is put back as found, and turning it off is the owner's call. Alerts name the protected
+//!   phone by its role and any other phone by the last four characters of its serial, never a
+//!   whole serial. `AGENTROID_AWAKE_ALERTS=0` keeps them to the log.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,7 +48,8 @@ use std::time::Duration;
 use agentroid_adb_link::guard::GuardedRunner;
 use agentroid_core::gate::{is_s24, DeviceMode};
 use care::clock::CareClock;
-use care::leases::LeaseStore;
+use care::heat::Notifier;
+use care::leases::{LeaseEntry, LeaseStore};
 use care::phone::AdbPhone;
 use care::pid::PidProbe;
 use care::settings::{LeaseManager, Owner, RestoreStatus, ScopeReq};
@@ -57,6 +73,210 @@ pub fn bundle() -> [(&'static str, &'static str, String); 2] {
         ),
         ("global", "stay_on_while_plugged_in", "7".to_string()),
     ]
+}
+
+/// The longest screen timeout a phone's own menu offers: 10 min on One UI, 30 min on stock Android
+/// (Pixel). Agentroid's own working timeout is also 30 min, so a found 30 min is not counted (it may
+/// be the owner's menu choice); a longer one was set by a tool.
+pub const LONG_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+/// How long one alert stays quiet before it may be raised again, across daemon restarts too.
+pub const ALERT_QUIET_MS: u64 = 24 * 60 * 60 * 1000;
+/// After a failed push, how long before the same alert may be tried again.
+pub const ALERT_RETRY_MS: u64 = 60 * 60 * 1000;
+
+/// An alert's id: the phone (as a stable 64-bit FNV-1a hash, so no serial is stored) and the
+/// finding (setting, kind, value). Wording and the session-end reason are not part of it.
+fn alert_id(key: &str, what: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}|{what}")
+}
+
+/// `std::fs::rename`, tried again after 20, 50 and 100 ms when it is refused (Windows: a scanner
+/// or indexer holding the target).
+fn rename_retrying(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let mut last = None;
+    for wait in [0u64, 20, 50, 100] {
+        if wait > 0 {
+            std::thread::sleep(Duration::from_millis(wait));
+        }
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32))) =>
+            {
+                last = Some(e)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename refused")))
+}
+
+/// Whether this value of one of the two keys keeps a screen on: any `stay_on_while_plugged_in` bit
+/// (1 AC, 2 USB, 4 wireless, 8 dock), or a `screen_off_timeout` above [`LONG_TIMEOUT_MS`]. Any other
+/// key, and a value that is not a number, is not counted.
+pub fn stays_awake(ns: &str, key: &str, value: &str) -> bool {
+    let n = value.trim().parse::<u64>();
+    match (ns, key) {
+        ("global", "stay_on_while_plugged_in") => n.is_ok_and(|v| v != 0),
+        ("system", "screen_off_timeout") => n.is_ok_and(|v| v > LONG_TIMEOUT_MS),
+        _ => false,
+    }
+}
+
+/// One of the two stay-awake keys.
+fn is_awake_key(ns: &str, key: &str) -> bool {
+    matches!(
+        (ns, key),
+        ("global", "stay_on_while_plugged_in") | ("system", "screen_off_timeout")
+    )
+}
+
+/// How an alert names a phone. Alerts go to a push service, so no serial goes in whole: the
+/// protected phone by role, any other by the last four characters of its serial.
+fn who(key: &str) -> String {
+    if is_s24(key) {
+        return "the protected phone".to_string();
+    }
+    let tail: String = {
+        let c: Vec<char> = key.chars().collect();
+        c[c.len().saturating_sub(4)..].iter().collect()
+    };
+    format!("the phone ending {tail}")
+}
+
+/// What the value does, for an alert.
+fn effect(key: &str) -> &'static str {
+    if key == "stay_on_while_plugged_in" {
+        "keeps the screen on while charging"
+    } else {
+        "keeps the screen on far longer than any menu choice"
+    }
+}
+
+/// The alert push's title.
+pub const ALERT_TITLE: &str = "Agentroid: a phone screen is kept awake";
+
+/// The push channel the MCP server's job pushes use: `POST <base>/<topic>` with a Title header (the
+/// daemon passes `https://ntfy.sh`, as the MCP server does; `--ntfy-base` is not used here). The
+/// topic is read from its key file at push time, held to the MCP server's rule (16 to 64 of
+/// `A-Z a-z 0-9 _ -`) and never logged; curl gets the whole request on stdin (`--config -`, after
+/// `-q` so no `.curlrc` adds options), so the topic is not on its command line either. Windows'
+/// own `curl.exe` is used when present. No console window.
+pub struct NtfyNotifier {
+    pub topic_file: PathBuf,
+    /// `https://ntfy.sh` or a self-hosted server.
+    pub base: String,
+}
+
+/// One value inside a double-quoted curl config string.
+fn curl_quote(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            c if c.is_control() => o.push(' '),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+impl NtfyNotifier {
+    /// The topic in the key file, if it holds exactly one plausible ntfy topic.
+    fn topic(&self) -> Result<String, String> {
+        let t = std::fs::read_to_string(&self.topic_file)
+            .map_err(|e| format!("the topic file could not be read ({:?})", e.kind()))?;
+        let t = t.trim();
+        let ok = (16..=64).contains(&t.len())
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if ok {
+            Ok(t.to_string())
+        } else {
+            Err("the topic file does not hold one ntfy topic".to_string())
+        }
+    }
+
+    /// The curl config for one push (the topic is inside; never log it).
+    fn request(&self, topic: &str, title: &str, body: &str) -> String {
+        format!(
+            "url = \"{}/{}\"\nheader = \"Title: {}\"\nheader = \"Tags: battery\"\ndata-raw = \"{}\"\nsilent\nshow-error\nfail\nmax-time = 15\n",
+            self.base.trim_end_matches('/'),
+            topic,
+            curl_quote(title),
+            curl_quote(body)
+        )
+    }
+}
+
+impl Notifier for NtfyNotifier {
+    fn push(&self, _phone: &str, title: &str, body: &str) -> Result<(), String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let topic = self.topic()?;
+        let req = self.request(&topic, title, body);
+        let mut cmd = Command::new(curl_exe());
+        cmd.args(["-q", "--config", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("curl did not start ({:?})", e.kind()))?;
+        let wrote = match child.stdin.take() {
+            Some(mut s) => s.write_all(req.as_bytes()).is_ok(),
+            None => false,
+        }; // stdin is closed here, so curl reads the whole config
+        let st = child
+            .wait()
+            .map_err(|e| format!("curl did not finish ({:?})", e.kind()))?;
+        match (wrote, st.success()) {
+            (true, true) => Ok(()),
+            (false, _) => Err("the request could not be handed to curl".to_string()),
+            (true, false) => Err(format!(
+                "the push was not accepted (curl exit {:?})",
+                st.code()
+            )),
+        }
+    }
+}
+
+/// `%SystemRoot%\System32\curl.exe` when it exists (a program search would look in the daemon's
+/// own folder first), else `curl` from the path.
+fn curl_exe() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("curl.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("curl"))
+}
+
+/// The alert channel's key file: the MCP server's `%USERPROFILE%\.agentroid\ntfy-topic.txt`, when it
+/// exists and `AGENTROID_AWAKE_ALERTS` is not `0`.
+pub fn alert_topic_file() -> Option<PathBuf> {
+    if std::env::var_os("AGENTROID_AWAKE_ALERTS").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("HOME"))?;
+    let p = PathBuf::from(home)
+        .join(".agentroid")
+        .join("ntfy-topic.txt");
+    p.is_file().then_some(p)
 }
 
 /// What stay-awake needs: adb (put behind the command guard here) and the shared lease store.
@@ -92,6 +312,14 @@ pub struct SessionAwake {
     /// The worker's queue and thread, once [`Self::start_worker`] ran.
     queue: Mutex<Option<mpsc::Sender<Op>>>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Alert -> when it was last raised (unix ms), so each stays quiet for [`ALERT_QUIET_MS`].
+    alerted: Mutex<HashMap<String, u64>>,
+    /// Where `alerted` is kept across restarts ([`Self::set_alert_file`]); memory only without it.
+    alert_file: Mutex<Option<PathBuf>>,
+    /// Where alerts are pushed, besides `bridged.log`.
+    notifier: Mutex<Option<Arc<dyn Notifier + Send + Sync>>>,
+    /// Pushes waiting until no lock is held (a push can take seconds): (alert id, phone, text).
+    outbox: Mutex<Vec<(String, String, String)>>,
 }
 
 /// One queued piece of work for the worker, in arrival order.
@@ -135,7 +363,229 @@ impl SessionAwake {
             notes: Mutex::new(Vec::new()),
             queue: Mutex::new(None),
             worker: Mutex::new(None),
+            alerted: Mutex::new(HashMap::new()),
+            alert_file: Mutex::new(None),
+            notifier: Mutex::new(None),
+            outbox: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Push alerts here too (the daemon: [`NtfyNotifier`]; tests: a recorder).
+    pub fn set_notifier(&self, n: Arc<dyn Notifier + Send + Sync>) {
+        *lock(&self.notifier) = Some(n);
+    }
+
+    /// Keep the alerts raised in the last [`ALERT_QUIET_MS`] in this file (JSON, alert -> unix ms),
+    /// so a daemon restart does not raise them again. An unreadable file counts as empty.
+    pub fn set_alert_file(&self, p: PathBuf) {
+        let now = self.cfg.clock.unix_ms();
+        let kept: HashMap<String, u64> = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let mut a = lock(&self.alerted);
+        for (k, t) in kept {
+            if now.saturating_sub(t) < ALERT_QUIET_MS {
+                let e = a.entry(k).or_insert(t);
+                *e = (*e).max(t);
+            }
+        }
+        *lock(&self.alert_file) = Some(p);
+    }
+
+    /// Write `alerted` to the alert file, if one is set: a temporary file, then a rename, retried
+    /// briefly while Windows refuses it (a scanner holding the target); the temporary file never
+    /// stays behind.
+    fn save_alerts(&self, a: &HashMap<String, u64>) {
+        let Some(p) = lock(&self.alert_file).clone() else {
+            return;
+        };
+        let tmp = p.with_extension("json.tmp");
+        let r = serde_json::to_string(a)
+            .map_err(|e| e.to_string())
+            .and_then(|s| std::fs::write(&tmp, s).map_err(|e| e.to_string()))
+            .and_then(|()| rename_retrying(&tmp, &p).map_err(|e| e.to_string()));
+        if let Err(e) = r {
+            let _ = std::fs::remove_file(&tmp);
+            self.note(format!("stay-awake: the alert file was not saved: {e}"));
+        }
+    }
+
+    /// One alert per finding per [`ALERT_QUIET_MS`]: a note now, and a push once no lock is held
+    /// ([`Self::flush_pushes`]). `what` names the finding (setting, kind, value); with the phone it
+    /// is the alert's id. It never changes a value on the phone.
+    fn alert(&self, key: &str, what: &str, text: String) {
+        let now = self.cfg.clock.unix_ms();
+        let id = alert_id(key, what);
+        {
+            let mut a = lock(&self.alerted);
+            if a.get(&id)
+                .is_some_and(|t| now.saturating_sub(*t) < ALERT_QUIET_MS)
+            {
+                return;
+            }
+            // held in memory now (no second copy before the flush); kept on disk only once sent
+            a.insert(id.clone(), now);
+        }
+        self.note(format!("stay-awake ALERT: {text}"));
+        lock(&self.outbox).push((id, who(key), text));
+    }
+
+    /// Send the waiting pushes. Called at the end of each public entry point, after its locks are
+    /// dropped, so a slow push service never holds up `is_held`, the sweeper or a stop. An alert
+    /// is kept quiet for the day only once it was pushed (or there is no push channel, so the log
+    /// line was all there is); a failed push may be tried again after [`ALERT_RETRY_MS`]. A daemon
+    /// that dies before the flush saved nothing, so the next one raises the alert again.
+    fn flush_pushes(&self) {
+        let items = std::mem::take(&mut *lock(&self.outbox));
+        if items.is_empty() {
+            return;
+        }
+        let n = lock(&self.notifier).clone();
+        let mut failed = Vec::new();
+        for (id, phone, text) in items {
+            if let Some(n) = &n {
+                if let Err(e) = n.push(&phone, ALERT_TITLE, &text) {
+                    self.note(format!("stay-awake: the alert push failed: {e}"));
+                    failed.push(id);
+                }
+            }
+        }
+        let now = self.cfg.clock.unix_ms();
+        let mut a = lock(&self.alerted);
+        for id in failed {
+            // quiet for the retry time only: as if raised a day ago, less the retry time
+            a.insert(id, now.saturating_sub(ALERT_QUIET_MS - ALERT_RETRY_MS));
+        }
+        a.retain(|_, t| now.saturating_sub(*t) < ALERT_QUIET_MS);
+        self.save_alerts(&a);
+    }
+
+    /// A lease found a key already keeping the screen on.
+    fn found_on(&self, key: &str, ns: &str, k: &str, before: &str, applied: &str) {
+        if !stays_awake(ns, k, before) {
+            return;
+        }
+        let source = if before == applied {
+            "the value Agentroid itself writes, so an earlier Agentroid session probably left it \
+             behind without a record"
+                .to_string()
+        } else {
+            format!(
+                "not a value Agentroid writes (it writes {applied}), so something else set it, such \
+                 as the phone's Developer options > Stay awake or another adb tool"
+            )
+        };
+        self.alert(
+            key,
+            &format!("{ns}/{k}|found|{before}"),
+            format!(
+                "{ns}/{k} on {} was already {before} before this session's lease: {source}. It {}, \
+                 which costs battery. Agentroid puts back what it found and does not change it; \
+                 turning it off is the owner's call.",
+                who(key),
+                effect(k)
+            ),
+        );
+    }
+
+    /// Restores that left a screen-keeping value in place.
+    fn check_restores(
+        &self,
+        key: &str,
+        phone: &AdbPhone<'_, DynRunner>,
+        rs: &[(LeaseEntry, RestoreStatus)],
+        why: &str,
+    ) {
+        for (e, st) in rs {
+            let (ns, k) = (e.namespace.as_str(), e.key.as_str());
+            if !is_awake_key(ns, k) {
+                continue;
+            }
+            match st {
+                RestoreStatus::Restored | RestoreStatus::Deleted | RestoreStatus::Reset => {}
+                RestoreStatus::Left => {
+                    if let Ok(Some(now)) = phone.settings_get(ns, k) {
+                        if stays_awake(ns, k, &now) {
+                            self.alert(
+                                key,
+                                &format!("{ns}/{k}|left|{now}"),
+                                format!(
+                                    "{ns}/{k} on {} is {now} after the session ({why}): it was \
+                                     changed while Agentroid held it, so compare-and-swap left it \
+                                     rather than putting {} back. It {}, which costs battery; \
+                                     turning it off is the owner's call.",
+                                    who(key),
+                                    e.before,
+                                    effect(k)
+                                ),
+                            );
+                        }
+                    }
+                }
+                other => {
+                    // the value is Agentroid's own lease: worth an alert whatever it is
+                    let how = format!("{other:?}").to_lowercase();
+                    self.alert(
+                        key,
+                        &format!("{ns}/{k}|unrestored|{}", e.applied),
+                        format!(
+                            "{ns}/{k} on {} may still be {} ({why}): Agentroid could not put {} \
+                             back ({}). The lease record stays, and the next contact with the \
+                             phone tries again.",
+                            who(key),
+                            e.applied,
+                            e.before,
+                            how
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Daemon start: stay-awake records of a daemon that stopped without putting its values back
+    /// (killed, crashed, power cut). They are restored on the phone's next contact; until then the
+    /// phone may still be kept awake, so each is an alert.
+    pub fn leftover_check(&self) {
+        let entries = match lock(&self.mgr).store.entries() {
+            Ok(e) => e,
+            Err(e) => {
+                self.note(format!(
+                    "stay-awake: the leftover check could not read the lease store: {e}"
+                ));
+                return;
+            }
+        };
+        for e in entries {
+            if e.job_id != AWAKE_JOB
+                || self.cfg.pids.alive(e.owner_pid)
+                || !is_awake_key(&e.namespace, &e.key)
+            {
+                continue;
+            }
+            let key = e.ident().to_string();
+            let next = if is_s24(&key) && !self.cfg.s24 {
+                "This daemon has the protected phone's stay-awake off (AGENTROID_NO_S24_AWAKE=1), \
+                 so it will not put it back; turning it off is the owner's call."
+            } else {
+                "It is put back the next time a session reaches that phone."
+            };
+            self.alert(
+                &key,
+                &format!("{}/{}|leftover|{}", e.namespace, e.key, e.applied),
+                format!(
+                    "{}/{} on {} was left at {} by an Agentroid daemon that stopped without putting \
+                     {} back. {next}",
+                    e.namespace,
+                    e.key,
+                    who(&key),
+                    e.applied,
+                    e.before
+                ),
+            );
+        }
+        self.flush_pushes();
     }
 
     /// Start the one worker thread that runs queued holds and restores in order. It holds only a
@@ -214,6 +664,11 @@ impl SessionAwake {
 
     /// A session's call reached a phone. `key` is the device key (hardware serial), `serial` the adb serial.
     pub fn touch(&self, conn: u64, key: &str, serial: &str, mode: DeviceMode) {
+        self.touch_locked(conn, key, serial, mode);
+        self.flush_pushes();
+    }
+
+    fn touch_locked(&self, conn: u64, key: &str, serial: &str, mode: DeviceMode) {
         let wanted = match mode {
             DeviceMode::Full => true,
             DeviceMode::ReadOnly => self.covers_s24(key, serial),
@@ -241,10 +696,18 @@ impl SessionAwake {
         let mut mgr = lock(&self.mgr);
         if lock(&self.swept).insert(key.to_string()) {
             match mgr.on_reconnect(&phone, mode) {
-                Ok(r) if !r.restored.is_empty() => self.note(format!(
-                    "stay-awake: restored {} leftover lease(s) on {key} from a daemon that stopped",
-                    r.restored.len()
-                )),
+                Ok(r) if !r.restored.is_empty() => {
+                    self.note(format!(
+                        "stay-awake: restored {} leftover lease(s) on {key} from a daemon that stopped",
+                        r.restored.len()
+                    ));
+                    self.check_restores(
+                        key,
+                        &phone,
+                        &r.restored,
+                        "leftover from a daemon that stopped",
+                    );
+                }
                 Ok(_) => {}
                 Err(e) => self.note(format!(
                     "stay-awake: leftover-lease check on {key} failed: {e}"
@@ -255,7 +718,10 @@ impl SessionAwake {
         let mut done = Vec::new();
         for (ns, k, v) in bundle() {
             match mgr.apply(&phone, mode, &owner, ns, k, &v, ScopeReq::Session) {
-                Ok(c) => done.push(format!("{ns}/{k} {} -> {}", c.before, c.applied)),
+                Ok(c) => {
+                    self.found_on(key, ns, k, &c.before, &c.applied);
+                    done.push(format!("{ns}/{k} {} -> {}", c.before, c.applied));
+                }
                 Err(e) => self.note(format!("stay-awake: {ns}/{k} on {key} not leased: {e}")),
             }
         }
@@ -282,6 +748,7 @@ impl SessionAwake {
                     "stay-awake off on {key} ({why}): {}",
                     what.join(", ")
                 ));
+                self.check_restores(key, &phone, &rs, why);
             }
             Err(e) => self.note(format!("stay-awake: restore on {key} ({why}) failed: {e}")),
         }
@@ -289,40 +756,49 @@ impl SessionAwake {
 
     /// A connection ended: phones no other session is using get their values back.
     pub fn leave(&self, conn: u64) {
-        let mut devs = lock(&self.devs);
-        for (key, d) in devs.iter_mut() {
-            if d.conns.remove(&conn).is_some() && d.conns.is_empty() && d.held {
-                self.restore(key, d, "session ended");
-                d.held = false;
+        {
+            let mut devs = lock(&self.devs);
+            for (key, d) in devs.iter_mut() {
+                if d.conns.remove(&conn).is_some() && d.conns.is_empty() && d.held {
+                    self.restore(key, d, "session ended");
+                    d.held = false;
+                }
             }
         }
+        self.flush_pushes();
     }
 
     /// Drop sessions idle for `idle_ms`; phones left with none get their values back.
     pub fn sweep_idle(&self) {
         let now = self.cfg.clock.unix_ms();
         let idle = self.cfg.idle_ms;
-        let mut devs = lock(&self.devs);
-        for (key, d) in devs.iter_mut() {
-            d.conns.retain(|_, last| now.saturating_sub(*last) < idle);
-            if d.conns.is_empty() && d.held {
-                self.restore(key, d, "idle");
-                d.held = false;
+        {
+            let mut devs = lock(&self.devs);
+            for (key, d) in devs.iter_mut() {
+                d.conns.retain(|_, last| now.saturating_sub(*last) < idle);
+                if d.conns.is_empty() && d.held {
+                    self.restore(key, d, "idle");
+                    d.held = false;
+                }
             }
         }
+        self.flush_pushes();
     }
 
     /// The daemon is stopping: what is queued runs first, then every phone gets its values back.
     pub fn shutdown(&self) {
         self.stop_worker();
-        let mut devs = lock(&self.devs);
-        for (key, d) in devs.iter_mut() {
-            d.conns.clear();
-            if d.held {
-                self.restore(key, d, "daemon stopping");
-                d.held = false;
+        {
+            let mut devs = lock(&self.devs);
+            for (key, d) in devs.iter_mut() {
+                d.conns.clear();
+                if d.held {
+                    self.restore(key, d, "daemon stopping");
+                    d.held = false;
+                }
             }
         }
+        self.flush_pushes();
     }
 
     /// Whether a phone is held awake now (tests, `devices.list`).
@@ -706,5 +1182,414 @@ mod tests {
         assert_eq!(values(&r), held_values());
         a.leave_later(4);
         assert_eq!(values(&r), original());
+    }
+
+    // ---- alerts when a screen-keeping value stays behind (14 Nov 2026) ----
+
+    /// Records pushes instead of sending them.
+    #[derive(Default)]
+    struct Pushes(Mutex<Vec<(String, String, String)>>);
+
+    impl Notifier for Pushes {
+        fn push(&self, phone: &str, title: &str, body: &str) -> Result<(), String> {
+            lock(&self.0).push((phone.into(), title.into(), body.into()));
+            Ok(())
+        }
+    }
+
+    fn with_pushes(a: &SessionAwake) -> Arc<Pushes> {
+        let p = Arc::new(Pushes::default());
+        a.set_notifier(p.clone());
+        p
+    }
+
+    fn alerts(notes: &[String]) -> Vec<&String> {
+        notes
+            .iter()
+            .filter(|n| n.starts_with("stay-awake ALERT"))
+            .collect()
+    }
+
+    #[test]
+    fn stays_awake_counts_only_screen_keeping_values_of_the_two_keys() {
+        for v in ["1", "2", "3", "7", "8", "15"] {
+            assert!(stays_awake("global", "stay_on_while_plugged_in", v), "{v}");
+        }
+        for v in ["0", " 0 ", "", "null", "-1", "on"] {
+            assert!(
+                !stays_awake("global", "stay_on_while_plugged_in", v),
+                "{v:?}"
+            );
+        }
+        assert!(!stays_awake("system", "screen_off_timeout", "30000"));
+        assert!(!stays_awake("system", "screen_off_timeout", "600000"));
+        let working = THRESHOLDS.working_screen_timeout_ms.to_string();
+        assert!(
+            !stays_awake("system", "screen_off_timeout", &working),
+            "30 min is a menu choice on stock Android"
+        );
+        assert!(!stays_awake("system", "screen_off_timeout", "1800000"));
+        assert!(stays_awake("system", "screen_off_timeout", "1800001"));
+        assert!(stays_awake("system", "screen_off_timeout", "2147483647"));
+        // the namespace must match too, and no other key counts
+        assert!(!stays_awake("system", "stay_on_while_plugged_in", "15"));
+        assert!(!stays_awake("global", "screen_off_timeout", &working));
+        assert!(!stays_awake("system", "screen_brightness", "255"));
+    }
+
+    #[test]
+    fn a_value_found_on_before_the_lease_alerts_once_and_is_put_back_as_found() {
+        let r = rig("found-on");
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        let a = awake(&r);
+        let p = with_pushes(&a);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        a.leave(1);
+        assert_eq!(
+            r.phone.get("global", "stay_on_while_plugged_in").as_deref(),
+            Some("15"),
+            "put back as found, never turned off by the alert"
+        );
+        let notes = a.take_notes();
+        let al = alerts(&notes);
+        assert_eq!(al.len(), 1, "{notes:?}");
+        assert!(al[0].contains("was already 15") && al[0].contains("not a value Agentroid writes"));
+        let pushed = lock(&p.0).clone();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].0, "the phone ending ST01", "never a whole serial");
+        assert!(!pushed[0].2.contains(PHONE), "{}", pushed[0].2);
+        assert_eq!(pushed[0].1, ALERT_TITLE);
+        assert!(pushed[0].2.contains("while charging"), "{}", pushed[0].2);
+        // the same finding again: no second alert this run
+        a.touch(2, PHONE, ADB, DeviceMode::Full);
+        a.leave(2);
+        assert!(alerts(&a.take_notes()).is_empty());
+        assert_eq!(lock(&p.0).len(), 1);
+    }
+
+    #[test]
+    fn our_own_value_found_before_the_lease_is_called_ours() {
+        let r = rig("found-ours");
+        r.phone.set("global", "stay_on_while_plugged_in", "7");
+        let a = awake(&r);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        let notes = a.take_notes();
+        let al = alerts(&notes);
+        assert_eq!(al.len(), 1, "{notes:?}");
+        assert!(al[0].contains("Agentroid itself writes"), "{}", al[0]);
+    }
+
+    #[test]
+    fn ordinary_values_raise_no_alert() {
+        let r = rig("quiet");
+        let a = awake(&r);
+        let p = with_pushes(&a);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        a.leave(1);
+        a.touch(2, PHONE, ADB, DeviceMode::Full);
+        r.clock.advance(61_000);
+        a.sweep_idle();
+        a.leftover_check();
+        assert!(alerts(&a.take_notes()).is_empty());
+        assert!(lock(&p.0).is_empty());
+        assert_eq!(values(&r), original());
+    }
+
+    #[test]
+    fn a_value_changed_while_held_is_left_and_alerted() {
+        let r = rig("left");
+        let a = awake(&r);
+        let p = with_pushes(&a);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        r.phone.set("global", "stay_on_while_plugged_in", "15"); // someone else, mid-session
+        a.leave(1);
+        assert_eq!(
+            r.phone.get("global", "stay_on_while_plugged_in").as_deref(),
+            Some("15"),
+            "compare-and-swap leaves it"
+        );
+        let notes = a.take_notes();
+        let al = alerts(&notes);
+        assert_eq!(al.len(), 1, "{notes:?}");
+        assert!(
+            al[0].contains("is 15 after the session (session ended)"),
+            "{}",
+            al[0]
+        );
+        assert_eq!(lock(&p.0).len(), 1);
+    }
+
+    #[test]
+    fn records_of_a_daemon_that_stopped_alert_at_start() {
+        let r = rig("leftover");
+        let a = awake(&r);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        drop(a); // killed: its records stay, their owner pid is dead
+        r.pids.kill(std::process::id());
+        let b = awake(&r);
+        let p = with_pushes(&b);
+        b.leftover_check();
+        let notes = b.take_notes();
+        let al = alerts(&notes);
+        assert_eq!(al.len(), 2, "both keys: {notes:?}");
+        assert!(al.iter().all(|n| n.contains("stopped without putting")));
+        assert_eq!(lock(&p.0).len(), 2);
+        // once per run, and nothing on the phone changed because of it
+        b.leftover_check();
+        assert_eq!(lock(&p.0).len(), 2);
+        assert_eq!(values(&r), held_values());
+    }
+
+    #[test]
+    fn the_protected_phone_is_named_not_numbered_and_only_its_two_keys_are_read() {
+        let r = rig_of("s24-alert", S24);
+        let a = awake(&r);
+        let p = with_pushes(&a);
+        a.touch(1, S24, ADB, DeviceMode::ReadOnly);
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        a.leave(1);
+        let pushed = lock(&p.0).clone();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        let (phone, _, body) = &pushed[0];
+        assert_eq!(phone, "the protected phone");
+        assert!(body.contains("the protected phone"), "{body}");
+        assert!(!body.contains(S24) && !phone.contains(S24));
+        for n in alerts(&a.take_notes()) {
+            assert!(!n.contains(S24), "{n}");
+        }
+        only_screen_key_lines(&r);
+    }
+
+    #[test]
+    fn the_ntfy_request_keeps_its_strings_inside_their_quotes() {
+        let n = NtfyNotifier {
+            topic_file: PathBuf::from("unused"),
+            base: "https://ntfy.example/".into(),
+        };
+        let req = n.request(
+            "topic-1",
+            ALERT_TITLE,
+            "a \"b\"\\c\nurl = \"https://evil.example\"",
+        );
+        let lines: Vec<&str> = req.lines().collect();
+        assert_eq!(lines[0], "url = \"https://ntfy.example/topic-1\"");
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("url")).count(),
+            1,
+            "a body cannot add a url line: {req}"
+        );
+        assert!(
+            req.contains("data-raw = \"a \\\"b\\\"\\\\c\\nurl = \\\"https://evil.example\\\"\""),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn an_unusable_topic_file_sends_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-awake-topic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = NtfyNotifier {
+            topic_file: dir.join("none.txt"),
+            base: "https://ntfy.example".into(),
+        };
+        assert!(missing.topic().is_err());
+        let bad = dir.join("bad.txt");
+        std::fs::write(&bad, "two words\n").unwrap();
+        let n = NtfyNotifier {
+            topic_file: bad,
+            base: "https://ntfy.example".into(),
+        };
+        let e = n.push("p", "t", "b").unwrap_err();
+        assert!(!e.contains("two words"), "the topic is never echoed: {e}");
+        let good = dir.join("good.txt");
+        std::fs::write(&good, " abc_DEF-123-xyz_456 \r\n").unwrap();
+        let g = NtfyNotifier {
+            topic_file: good,
+            base: "https://ntfy.example".into(),
+        };
+        assert_eq!(g.topic().unwrap(), "abc_DEF-123-xyz_456");
+        // the MCP server's rule: 16 to 64 characters, so a short guessable topic is refused
+        let short = dir.join("short.txt");
+        std::fs::write(&short, "abcDEF123").unwrap();
+        let s = NtfyNotifier {
+            topic_file: short,
+            base: "https://ntfy.example".into(),
+        };
+        assert!(s.topic().is_err());
+        let long = dir.join("long.txt");
+        std::fs::write(&long, "a".repeat(65)).unwrap();
+        let l = NtfyNotifier {
+            topic_file: long,
+            base: "https://ntfy.example".into(),
+        };
+        assert!(l.topic().is_err());
+    }
+
+    #[test]
+    fn alerts_name_phones_without_a_whole_serial() {
+        assert_eq!(who("AWAKETEST01"), "the phone ending ST01");
+        assert_eq!(who("ab"), "the phone ending ab");
+        assert_eq!(who(S24), "the protected phone");
+        assert_eq!(
+            who(&format!("{S24}._adb-tls-connect._tcp")),
+            "the protected phone"
+        );
+    }
+
+    #[test]
+    fn an_alert_stays_quiet_for_a_day_across_restarts_then_comes_back() {
+        let r = rig("quiet-day");
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        let file = r.leases.with_file_name("awake-alerts.json");
+        let a = awake(&r);
+        a.set_alert_file(file.clone());
+        let p = with_pushes(&a);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        a.leave(1);
+        assert_eq!(lock(&p.0).len(), 1);
+        assert!(file.is_file(), "the alert is remembered on disk");
+        // a restarted daemon an hour later: quiet
+        drop(a);
+        r.clock.advance(60 * 60 * 1000);
+        let b = awake(&r);
+        b.set_alert_file(file.clone());
+        let q = with_pushes(&b);
+        b.touch(1, PHONE, ADB, DeviceMode::Full);
+        b.leave(1);
+        assert!(lock(&q.0).is_empty(), "within the day");
+        assert!(alerts(&b.take_notes()).is_empty());
+        // a day after the first: it comes back once
+        r.clock.advance(ALERT_QUIET_MS);
+        b.touch(2, PHONE, ADB, DeviceMode::Full);
+        b.leave(2);
+        assert_eq!(lock(&q.0).len(), 1);
+        // an unreadable file counts as empty, and nothing panics
+        std::fs::write(&file, "not json").unwrap();
+        let c = awake(&r);
+        c.set_alert_file(file);
+        let s = with_pushes(&c);
+        c.touch(1, PHONE, ADB, DeviceMode::Full);
+        assert_eq!(lock(&s.0).len(), 1);
+    }
+
+    #[test]
+    fn a_push_never_runs_while_a_lock_is_held() {
+        /// Fails the test if `is_held` (the devices lock) or the manager lock cannot be taken
+        /// while a push runs.
+        struct Probe(std::sync::Weak<SessionAwake>, Mutex<usize>);
+        impl Notifier for Probe {
+            fn push(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                let a = self.0.upgrade().expect("alive");
+                assert!(a.devs.try_lock().is_ok(), "devices lock held during a push");
+                assert!(a.mgr.try_lock().is_ok(), "manager lock held during a push");
+                *lock(&self.1) += 1;
+                Ok(())
+            }
+        }
+        let r = rig("no-lock-push");
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        let a = Arc::new(awake(&r));
+        let probe = Arc::new(Probe(Arc::downgrade(&a), Mutex::new(0)));
+        a.set_notifier(probe.clone());
+        a.touch(1, PHONE, ADB, DeviceMode::Full); // found on
+        r.phone.set("system", "screen_off_timeout", "3600000"); // changed while held
+        a.leave(1);
+        assert_eq!(*lock(&probe.1), 2);
+    }
+
+    #[test]
+    fn a_failed_push_is_tried_again_after_an_hour_not_silenced_for_a_day() {
+        /// A push service that is down: counts the tries.
+        struct Down(Mutex<usize>);
+        impl Notifier for Down {
+            fn push(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                *lock(&self.0) += 1;
+                Err("offline".into())
+            }
+        }
+        let r = rig("push-down");
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        let file = r.leases.with_file_name("awake-alerts.json");
+        let a = awake(&r);
+        a.set_alert_file(file.clone());
+        let down = Arc::new(Down(Mutex::new(0)));
+        a.set_notifier(down.clone());
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        a.leave(1);
+        assert_eq!(*lock(&down.0), 1);
+        assert!(a.take_notes().iter().any(|n| n.contains("push failed")));
+        // within the hour: not tried again
+        r.clock.advance(30 * 60 * 1000);
+        a.touch(2, PHONE, ADB, DeviceMode::Full);
+        a.leave(2);
+        assert_eq!(*lock(&down.0), 1);
+        // after the hour: tried again, and a restarted daemon agrees (the file says retry, not a day)
+        r.clock.advance(31 * 60 * 1000);
+        let b = awake(&r);
+        b.set_alert_file(file);
+        let up = with_pushes(&b);
+        b.touch(1, PHONE, ADB, DeviceMode::Full);
+        assert_eq!(lock(&up.0).len(), 1, "a restart after the hour sends it");
+    }
+
+    #[test]
+    fn an_alert_raised_but_not_yet_sent_is_not_kept_quiet_on_disk() {
+        let r = rig("unsent");
+        let file = r.leases.with_file_name("awake-alerts.json");
+        let a = awake(&r);
+        a.set_alert_file(file.clone());
+        // raised, as a crash would leave it: queued, never flushed
+        a.alert(
+            PHONE,
+            "global/stay_on_while_plugged_in|found|15",
+            "text".into(),
+        );
+        assert!(!file.exists(), "nothing on disk before the flush");
+        drop(a);
+        let b = awake(&r);
+        b.set_alert_file(file);
+        b.alert(
+            PHONE,
+            "global/stay_on_while_plugged_in|found|15",
+            "text".into(),
+        );
+        assert_eq!(
+            alerts(&b.take_notes()).len(),
+            1,
+            "the next daemon raises it again"
+        );
+    }
+
+    #[test]
+    fn alert_ids_tell_phones_apart_and_hold_no_serial() {
+        let what = "global/stay_on_while_plugged_in|found|15";
+        assert_ne!(alert_id("AAAA1234", what), alert_id("BBBB1234", what));
+        assert_eq!(alert_id("AAAA1234", what), alert_id("AAAA1234", what));
+        let s = alert_id(S24, what);
+        assert!(!s.contains(S24) && s.ends_with(what), "{s}");
+        // the same finding at session end and at idle is one alert
+        let r = rig("one-id");
+        let a = awake(&r);
+        let p = with_pushes(&a);
+        a.touch(1, PHONE, ADB, DeviceMode::Full);
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        a.leave(1);
+        a.touch(2, PHONE, ADB, DeviceMode::Full);
+        r.phone.set("global", "stay_on_while_plugged_in", "15");
+        r.clock.advance(61_000);
+        a.sweep_idle();
+        // the second lease found 15 already set (a "found" alert); the idle restore's "left" is
+        // the same finding as the session-end one, so it is not raised again
+        let bodies: Vec<String> = lock(&p.0).iter().map(|x| x.2.clone()).collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|b| b.contains("after the session"))
+                .count(),
+            1,
+            "{bodies:?}"
+        );
     }
 }
