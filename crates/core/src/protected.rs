@@ -673,8 +673,7 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
         Some(n @ 1..=HOLDS_VERSION) => n,
         _ => return Err("the holds file has another version".into()),
     };
-    let mut out = Holds::default();
-    out.seen = match v.get("seen_denies") {
+    let seen = match v.get("seen_denies") {
         None if version == 1 => vec![],
         Some(serde_json::Value::Array(a)) => a
             .iter()
@@ -682,6 +681,10 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| "the holds file's seen Deny events are malformed".to_string())?,
         _ => return Err("the holds file's seen Deny events are malformed".into()),
+    };
+    let mut out = Holds {
+        seen,
+        ..Holds::default()
     };
     if version >= 3 {
         let bad = || "the holds file's pushes or pending ask are malformed".to_string();

@@ -20,6 +20,10 @@ The owner's rulings for this design, word for word (14 Nov 2026):
 
 > "Overnight still skips it (Recommended)"
 
+And on what one Allow covers (14 Nov 2026, round 4b):
+
+> "Allow covers pulls; links still ask (Recommended)"
+
 So the earlier content rules (protected apps, their web hosts and file paths, the keyguard, the
 notification shade, Recents, notification history, and the heads-up check) are gone. The approval
 push, the engineering around it (holds, one ask per phone, the audit log), the fixed refusals that
@@ -133,9 +137,15 @@ The checks run in this order, and the first one that refuses ends the call:
    its tree cannot be read, a tap, long press or swipe goes on to the usual guards; only a screen
    that is on (or whose state cannot be read) and cannot be read is refused (`protected:screen`).
    Overnight, with the screen off, `key wake` and then a swipe go.
-7. **The usual guards.** The screen guard (D3) and the file guard run as on any phone. An action
-   the screen guard would ask about is asked as usual under a daytime lease. Under an overnight
-   lease it is refused, because nobody is awake to answer.
+7. **The usual guards.** The screen guard (D3) and the file guard run as on any phone, with one
+   exception (the owner's ruling, round 4b): under an Allowed daytime lease, the file guard's ask
+   for a **pull** (another app's `Android/data`, `obb` or `media` folder, WhatsApp's media folder
+   and `pull_new` included) is covered by that Allow. It goes with no other ask and is audited as
+   `lease:covered`, its reason naming the file guard's rule and "covered by lease REF". Anything
+   else the screen guard or the file guard would ask about (a `wa.me` link or another
+   message-sending link, for one) is asked as usual under a daytime lease. Under an overnight
+   lease all of it, pulls included, is refused, because nobody is awake to answer. A pull the
+   file guard blocks (outside shared storage) stays blocked under any lease.
 
 ### The holder's name in the push
 
@@ -237,6 +247,17 @@ Allow again for the screen lock. So:
 - **An overnight lease never skips it.** Overnight the owner allowed nothing, so the screen lock's
   own check runs on every acting call: the moment the owner picks the phone up (in use: a focused
   app, the keyboard, a recent touch), the agent stops.
+
+What one Allow covers, and what it does not:
+
+| Ask or check | Allowed daytime lease | Overnight lease | No lease |
+| --- | --- | --- | --- |
+| The protected lease itself, for every call for N min | covered | opens with a Deny-only notice | asked |
+| The screen lock's in-use check | covered (an `ask-screen` No still refuses) | runs on every acting call | the lease is asked first |
+| The file guard's ask for a pull (`Android/data`, `obb`, `media`, `pull_new`) | covered, audited `lease:covered` | refused | the lease is asked first |
+| The screen guard's ask (a `wa.me` link or another message-sending link) | asked separately | refused | the lease is asked first |
+| A pull the file guard blocks (outside shared storage) | blocked | blocked | blocked |
+| A push of code (rule `code`), raw shell, link segments, `unlock` | refused | refused | refused |
 
 The reverse does not hold: an `ask-screen` Yes does not open the protected lease. `ask-screen`'s
 answer is an unsigned file on the laptop, so any local process could write it. The protected

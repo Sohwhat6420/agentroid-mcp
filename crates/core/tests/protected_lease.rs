@@ -679,19 +679,17 @@ fn files_go_under_the_lease_but_code_shell_and_link_segments_never_do() {
             .file_gate(Some(PROT), op, p)
             .unwrap_or_else(|e| panic!("{p}: {e:?}"));
     }
-    // an app's private folder is asked about by the usual file guard, as on any phone
-    let e = r
-        .core
+    // the file guard's ask for an app's folder is covered by the Allow (the owner's ruling,
+    // 14 Nov 2026: "Allow covers pulls; links still ask")
+    let sent = r.sent().len();
+    r.core
         .file_gate(
             Some(PROT),
             FileOp::Pull,
             "/sdcard/Android/media/com.whatsapp/a",
         )
-        .unwrap_err();
-    assert!(
-        matches!(e, CoreError::Refused(Refusal::Screen { .. })),
-        "{e:?}"
-    );
+        .expect("covered by the lease");
+    assert_eq!(r.sent().len(), sent, "no other ask");
     // under the lease too, code never goes
     assert!(matches!(
         r.core
@@ -2222,4 +2220,126 @@ fn after_an_allowed_lease_an_overnight_lease_carries_on_the_agents_own_burst() {
             assert_eq!(r.book.active().unwrap().granted, Granted::Overnight);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// round 4b: the owner's ruling, 14 Nov 2026: "Allow covers pulls; links still ask (Recommended)"
+// ---------------------------------------------------------------------------------------------
+
+const MEDIA: &str = "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/a.jpg";
+
+fn pull(r: &mut Rig, p: &str) -> Result<(), CoreError> {
+    r.core.file_gate(Some(PROT), FileOp::Pull, p)
+}
+
+fn wa_me() -> Call {
+    Call::OpenUrl {
+        uri: "https://wa.me/15550000".into(),
+        package: None,
+    }
+}
+
+#[test]
+fn an_allowed_daytime_lease_covers_pulls_but_a_message_link_still_asks() {
+    let mut r = rig("r4b-day");
+    let log = r.audit();
+    // no lease: the pull asks for the lease, and nothing else
+    assert!(matches!(
+        pull(&mut r, MEDIA),
+        Err(CoreError::Refused(Refusal::LeasePending { .. }))
+    ));
+    assert_eq!(r.sent().len(), 1);
+    let ask = r.sent()[0].clone();
+    r.answer("allow", &ask.id, r.now());
+    pull(&mut r, "/sdcard/Download/a.txt").expect("the lease opens on Allow");
+    let before = r.sent().len();
+    // under the Allowed daytime lease: WhatsApp's media folder, pull_new's folder listing and
+    // another app's Android/data go with no other ask, each audited as covered by the lease
+    for p in [
+        MEDIA,
+        "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/",
+        "/sdcard/Android/data/com.whatsapp/files/x",
+    ] {
+        pull(&mut r, p).unwrap_or_else(|e| panic!("{p}: {e:?}"));
+    }
+    assert_eq!(r.sent().len(), before, "no other ask");
+    let covered = reasons(&log, "lease:covered");
+    assert_eq!(covered.len(), 3, "{:?}", audit_rules(&log));
+    let lease_ref = agentroid_core::protected::reference(&ask.id);
+    for why in &covered {
+        assert!(
+            why.contains(&format!("covered by lease {lease_ref}")),
+            "{why}"
+        );
+        assert!(why.contains("file:app_external_data"), "{why}");
+    }
+    // outside shared storage is still blocked, and code still never goes
+    assert!(matches!(
+        pull(&mut r, "/data/data/com.whatsapp/databases/msgstore.db"),
+        Err(CoreError::Refused(Refusal::Screen { .. }))
+    ));
+    assert!(matches!(
+        r.core
+            .file_gate(Some(PROT), FileOp::Push, "/sdcard/Download/app.apk"),
+        Err(CoreError::Refused(Refusal::Protected { rule: "code", .. }))
+    ));
+    // a wa.me link still asks the owner separately (the rig's channel gives no answer)
+    let e = refused(r.call(&wa_me()));
+    assert!(
+        matches!(
+            e,
+            Refusal::Screen {
+                verdict: "asked",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(r.sent().len(), before + 1, "the link was asked about");
+    assert_eq!(
+        reasons(&log, "lease:covered").len(),
+        3,
+        "a link is never covered"
+    );
+}
+
+#[test]
+fn once_the_lease_has_ended_a_pull_asks_for_a_new_one() {
+    let mut r = rig("r4b-ended");
+    let log = r.audit();
+    r.open_lease();
+    pull(&mut r, MEDIA).expect("covered");
+    // the lease runs out: the same pull is not covered, it asks for a new lease
+    r.wall.advance(31 * MIN);
+    assert!(matches!(
+        pull(&mut r, MEDIA),
+        Err(CoreError::Refused(Refusal::LeasePending { .. }))
+    ));
+    assert_eq!(reasons(&log, "lease:covered").len(), 1);
+}
+
+#[test]
+fn an_overnight_lease_covers_no_pull_and_no_link() {
+    let mut r = rig("r4b-night");
+    let log = r.audit();
+    r.presence("asleep", r.now());
+    pull(&mut r, "/sdcard/Download/a.txt").expect("an overnight lease, shared storage");
+    assert_eq!(r.book.active().unwrap().granted, Granted::Overnight);
+    let before = r.sent().len();
+    let e = pull(&mut r, MEDIA).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            CoreError::Refused(Refusal::Screen {
+                verdict: "asked",
+                ..
+            })
+        ),
+        "{e:?}"
+    );
+    assert!(e.to_string().contains("overnight"), "{e}");
+    let e = refused(r.call(&wa_me()));
+    assert!(matches!(e, Refusal::Screen { .. }), "{e:?}");
+    assert_eq!(r.sent().len(), before, "nothing is asked overnight");
+    assert!(reasons(&log, "lease:covered").is_empty());
 }

@@ -380,6 +380,9 @@ pub struct Core<T: Transport, C: Clock> {
     protected: Option<Protected>,
     /// This call runs under an overnight lease: no `asked` verdict goes to the owner.
     prot_overnight: bool,
+    /// This call runs under an Allowed daytime lease on the protected phone (its reference): the
+    /// file guard's ask for a pull is covered by that Allow (the owner's ruling, 14 Nov 2026).
+    prot_lease: Option<String>,
     /// This call is on the protected phone (the tool's name): its touches get the PIN check.
     prot_active: Option<&'static str>,
     /// The protected phone's PIN facts as the check before the call found them.
@@ -459,6 +462,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             lock_tails: HashMap::new(),
             protected: None,
             prot_overnight: false,
+            prot_lease: None,
             prot_active: None,
             prot_facts: None,
             prot_xml: None,
@@ -527,6 +531,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         };
         let lease = p.admit(d, tool, self.approver.as_mut(), self.audit.as_mut())?;
         self.prot_overnight = lease.granted == Granted::Overnight;
+        self.prot_lease = (!self.prot_overnight).then(|| protected::reference(&lease.id));
         if call.is_none_or(Call::is_acting) {
             if self.prot_overnight {
                 // overnight the owner allowed nothing: the screen lock's own check stands, so the
@@ -944,6 +949,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// phone-hands' `_pick`, followed by the gate.
     fn pick(&mut self, serial: Option<&str>, call: &Call) -> Result<DeviceInfo, CoreError> {
         self.prot_overnight = false;
+        self.prot_lease = None;
         let info = self.find(serial, call.name())?;
         if self.protected_route(&info, call) {
             self.pick_protected(&info, call.name(), Some(call))?;
@@ -981,6 +987,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         path: Option<&str>,
     ) -> Result<DeviceInfo, CoreError> {
         self.prot_overnight = false;
+        self.prot_lease = None;
         let info = self.find(serial, tool)?;
         if self.protected.is_some() && Self::is_protected(&info) {
             let refusal = if tool == "shell" {
@@ -1214,6 +1221,21 @@ impl<T: Transport, C: Clock> Core<T, C> {
         let device = device_name(d);
         let (rule, reason) = match gate::check_decision(tool, &decision) {
             Ok(()) => (decision.rule.clone(), decision.reason.clone()),
+            // the owner's ruling, 14 Nov 2026: "Allow covers pulls; links still ask
+            // (Recommended)". Under an Allowed daytime lease the file guard's ask for a pull
+            // (another app's Android/data, obb or media folder, `pull_new` included) is covered
+            // by that Allow, and audited as such. Pushes, links and overnight leases are unchanged.
+            Err(Refusal::Screen {
+                verdict: "asked", ..
+            }) if tool == "pull" && self.prot_lease.is_some() => (
+                "lease:covered".to_string(),
+                format!(
+                    "{} ({}), covered by lease {}",
+                    decision.reason,
+                    decision.rule,
+                    self.prot_lease.as_deref().unwrap_or_default()
+                ),
+            ),
             Err(Refusal::Screen {
                 verdict: "asked", ..
             }) => match self.approve(&device, tool, &decision, "") {
