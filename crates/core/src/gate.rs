@@ -323,6 +323,25 @@ pub enum Refusal {
     Audit { tool: &'static str, why: String },
     /// The screen lock (`screenlock.rs`): the phone is in use and `ask-screen` gave no lease.
     ScreenLock { tool: &'static str, why: String },
+    /// The protected phone has no open lease, and one was asked for on the owner's phone (or the
+    /// ask is still waiting). Nothing was sent; retry once the owner has tapped Allow. `reference`
+    /// is a short, non-secret handle on the ask: the request id itself never goes to the agent, so
+    /// it cannot forge `allow <id>`.
+    LeasePending {
+        tool: &'static str,
+        reference: String,
+    },
+    /// The protected phone has no open lease and none could be opened (denied, held after a Deny,
+    /// no channel, no daemon lease, the clock or the presence file could not be trusted).
+    LeaseRefused { tool: &'static str, why: String },
+    /// A fixed protection of the protected phone that no lease lifts (Gmail and WhatsApp, the
+    /// keyguard and notification previews, the owner's PIN, a path naming the protected apps, an unknown
+    /// screen). `rule` is `app`, `preview`, `pin`, `unlock`, `path` or `screen`.
+    Protected {
+        tool: &'static str,
+        rule: &'static str,
+        why: String,
+    },
 }
 
 impl Refusal {
@@ -330,11 +349,12 @@ impl Refusal {
     pub fn verdict(&self) -> &'static str {
         match self {
             Refusal::Screen { verdict, .. } => verdict,
+            Refusal::LeasePending { .. } => "asked",
             _ => "blocked",
         }
     }
     /// The rule family that refused: `s24`, `allowlist`, `read_only`, `helper`, `screen:<kind>`, `audit`,
-    /// `screen_lock`.
+    /// `screen_lock`, `lease:pending`, `lease:refused`, `protected:<rule>`.
     pub fn rule(&self) -> String {
         match self {
             Refusal::S24 { .. } => "s24".into(),
@@ -344,6 +364,9 @@ impl Refusal {
             Refusal::Screen { kind, .. } => format!("screen:{kind}"),
             Refusal::Audit { .. } => "audit".into(),
             Refusal::ScreenLock { .. } => "screen_lock".into(),
+            Refusal::LeasePending { .. } => "lease:pending".into(),
+            Refusal::LeaseRefused { .. } => "lease:refused".into(),
+            Refusal::Protected { rule, .. } => format!("protected:{rule}"),
         }
     }
 }
@@ -392,6 +415,9 @@ impl fmt::Display for Refusal {
             Refusal::ReadOnly { tool } => write!(f, "{tool} refused: this device is read_only, so it only answers reads"),
             Refusal::NeedsAdbShell { tool } => write!(f, "{tool} refused: this device is in helper mode and {tool} needs adb shell"),
             Refusal::ScreenLock { tool, why } => write!(f, "{tool} refused by the screen lock, nothing was sent: {why}"),
+            Refusal::LeasePending { tool, reference } => write!(f, "{tool} refused, nothing was sent: a lease on the protected phone is pending (ask {reference}); the owner must tap Allow on their phone, then retry"),
+            Refusal::LeaseRefused { tool, why } => write!(f, "{tool} refused, nothing was sent: the protected phone has no open lease ({why})"),
+            Refusal::Protected { tool, why, .. } => write!(f, "{tool} refused on the protected phone, nothing was sent: {why}. A lease never lifts this."),
         }
     }
 }
@@ -406,10 +432,48 @@ pub struct Subject<'a> {
     pub allowed: bool,
 }
 
+/// Is this call one of the protected phone's approved reads (a `getprop` whose shell form is an entry
+/// of `S24_READS`)? Those need no lease.
+pub fn is_ruled_read(call: &Call) -> bool {
+    matches!(call, Call::Getprop { key } if S24_READS.contains(&format!("shell getprop {key}").as_str()))
+}
+
+/// The protected phone under a lease (`crate::protected`): the mode the owner configured for it
+/// (`full` unless the owner set another) decides first, so `read_only` and `helper` win over any lease;
+/// then `unlock`, which is never sent to it (the owner's PIN is never used). The allowlist does not apply:
+/// the lease is the protected phone's only way in, and it is never on the allowlist.
+pub fn check_leased(configured: DeviceMode, call: &Call) -> Result<(), Refusal> {
+    if call.is_acting() {
+        match configured {
+            DeviceMode::Full => {}
+            DeviceMode::ReadOnly => return Err(Refusal::ReadOnly { tool: call.name() }),
+            DeviceMode::Helper if call.has_helper_route() => {}
+            DeviceMode::Helper => return Err(Refusal::NeedsAdbShell { tool: call.name() }),
+        }
+    }
+    if matches!(call, Call::Unlock) {
+        return Err(Refusal::Protected {
+            tool: "unlock",
+            rule: "unlock",
+            why: "unlock is never used on the protected phone (its PIN is never typed)".into(),
+        });
+    }
+    Ok(())
+}
+
+/// [`check_leased`] for a raw adb action (`shell`, `push`, `pull`): only a `full` protected phone.
+pub fn check_leased_raw(configured: DeviceMode, tool: &'static str) -> Result<(), Refusal> {
+    match configured {
+        DeviceMode::Full => Ok(()),
+        DeviceMode::ReadOnly => Err(Refusal::ReadOnly { tool }),
+        DeviceMode::Helper => Err(Refusal::NeedsAdbShell { tool }),
+    }
+}
+
 /// The gate. Order: S24, allowlist, then the mode.
 pub fn check(subject: &Subject<'_>, mode: DeviceMode, call: &Call) -> Result<(), Refusal> {
     if is_s24(subject.serial) || is_s24(subject.hw_serial) {
-        let ruled_read = matches!(call, Call::Getprop { key } if S24_READS.contains(&format!("shell getprop {key}").as_str()));
+        let ruled_read = is_ruled_read(call);
         if !ruled_read {
             return Err(Refusal::S24 { tool: call.name() });
         }

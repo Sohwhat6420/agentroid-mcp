@@ -1,0 +1,280 @@
+//! The protected-device lease book (`docs/design/protected-device-lease.md`).
+//!
+//! The protected phone ([`crate::guard::S24_SERIAL`]) is a target only while a lease is open on it.
+//! Core decides when one opens (an owner's Allow, or the overnight rule) and what it never allows;
+//! this book is the one piece of state both core and the adb guard read, so it sits in the lowest
+//! crate. It holds at most one lease, and nothing of it is written to disk: a daemon restart closes
+//! it.
+//!
+//! * **Bound to its holder.** A lease names the daemon lease ([`Holder`]: the holder's name and the
+//!   registry epoch) it was opened for. Core admits a call under it only for that same holder, and
+//!   the daemon closes it when that holder's connection goes ([`LeaseBook::close_epoch`]).
+//! * **Bound to the adb names core checked.** The guard lets a non-read command through to the
+//!   protected phone only when its `-s` selector is one core has [`LeaseBook::bind`]ed under the open
+//!   lease, so a phone core took for an ordinary device (its `ro.serialno` could not be read) is
+//!   never let through on the strength of a lease core never applied to it.
+//! * **Fail closed.** An unreadable wall clock, or a time past the end, is no lease.
+
+use std::sync::{Arc, Mutex};
+
+/// The default lease length (`--protected-lease-min`).
+pub const DEFAULT_MINUTES: u64 = 30;
+/// The longest lease (`--protected-lease-min` is clamped to `1..=MAX_MINUTES`).
+pub const MAX_MINUTES: u64 = 120;
+
+/// Clamp a lease length to `1..=MAX_MINUTES`.
+pub fn clamp_minutes(m: u64) -> u64 {
+    m.clamp(1, MAX_MINUTES)
+}
+
+/// Wall-clock time in Unix milliseconds (`None`: it could not be read). Leases use the wall clock
+/// because the push channel's answers are dated on it.
+pub trait WallClock: Send + Sync {
+    fn now_ms(&self) -> Option<u64>;
+}
+
+/// The system's wall clock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn now_ms(&self) -> Option<u64> {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        u64::try_from(d.as_millis()).ok()
+    }
+}
+
+/// A wall clock tests set by hand. `None` stands for an unreadable clock.
+#[derive(Debug, Default)]
+pub struct ManualClock(Mutex<Option<u64>>);
+
+impl ManualClock {
+    pub fn new(ms: u64) -> Self {
+        ManualClock(Mutex::new(Some(ms)))
+    }
+    pub fn set(&self, ms: Option<u64>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = ms;
+    }
+    pub fn advance(&self, ms: u64) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = g.as_mut() {
+            *t = t.saturating_add(ms);
+        }
+    }
+}
+
+impl WallClock for ManualClock {
+    fn now_ms(&self) -> Option<u64> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How a lease came to be open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Granted {
+    /// The owner tapped Allow on the lease push (request `request_id`).
+    Approved { request_id: String },
+    /// The overnight rule: a signed, fresh presence file said the owner is asleep.
+    Overnight,
+}
+
+impl Granted {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Granted::Approved { .. } => "approved",
+            Granted::Overnight => "overnight",
+        }
+    }
+}
+
+/// The daemon lease a protected-device lease belongs to: the holder's name and the registry epoch
+/// of that grant. A new grant of the phone (another connection, or the same one after a release)
+/// has a new epoch, so it never inherits the lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    pub name: String,
+    pub epoch: u64,
+}
+
+/// One open lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    /// The push request id behind it (an ask, or the overnight notice).
+    pub id: String,
+    pub holder: Holder,
+    /// The job it was opened for, when a job asked (the push and the audit log name it).
+    pub job: Option<String>,
+    pub opened_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub granted: Granted,
+    /// The adb serials core checked to be the protected phone and admitted under this lease.
+    pub bound: Vec<String>,
+}
+
+impl Lease {
+    /// Whole seconds left at `now_ms`.
+    pub fn seconds_left(&self, now_ms: u64) -> u64 {
+        self.expires_at_ms.saturating_sub(now_ms) / 1000
+    }
+}
+
+/// At most one lease, shared (`Arc`) by core and the adb guard.
+pub struct LeaseBook {
+    clock: Arc<dyn WallClock>,
+    open: Mutex<Option<Lease>>,
+}
+
+impl std::fmt::Debug for LeaseBook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseBook")
+            .field("open", &self.lock().as_ref().map(|l| l.id.clone()))
+            .finish()
+    }
+}
+
+impl LeaseBook {
+    pub fn new(clock: Arc<dyn WallClock>) -> Self {
+        LeaseBook {
+            clock,
+            open: Mutex::new(None),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Lease>> {
+        self.open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The wall clock, `None` when it cannot be read.
+    pub fn now_ms(&self) -> Option<u64> {
+        self.clock.now_ms()
+    }
+
+    /// Open `lease`, replacing any other. Returns it.
+    pub fn open(&self, lease: Lease) -> Lease {
+        *self.lock() = Some(lease.clone());
+        lease
+    }
+
+    /// The open lease, if the clock can be read and it has not run out. A lease that has run out is
+    /// dropped here.
+    pub fn active(&self) -> Option<Lease> {
+        let now = self.now_ms();
+        let mut g = self.lock();
+        match (now, g.as_ref()) {
+            (Some(t), Some(l)) if t < l.expires_at_ms => Some(l.clone()),
+            (Some(_), Some(_)) => {
+                *g = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Close the lease at once. Returns the one that was open.
+    pub fn close(&self) -> Option<Lease> {
+        self.lock().take()
+    }
+
+    /// Close the lease if it belongs to the daemon lease of `epoch` (its holder's connection went,
+    /// or it released the phone). Returns the one closed.
+    pub fn close_epoch(&self, epoch: u64) -> Option<Lease> {
+        let mut g = self.lock();
+        if g.as_ref().is_some_and(|l| l.holder.epoch == epoch) {
+            return g.take();
+        }
+        None
+    }
+
+    /// Name the job now running under the daemon lease of `epoch` (`None`: it ended) on the open
+    /// lease, when that lease is the epoch's.
+    pub fn set_job(&self, epoch: u64, job: Option<String>) {
+        let mut g = self.lock();
+        if let Some(l) = g.as_mut().filter(|l| l.holder.epoch == epoch) {
+            l.job = job;
+        }
+    }
+
+    /// Record that core admitted `adb_serial` (checked to be the protected phone) under the open
+    /// lease. Nothing happens without an active lease.
+    pub fn bind(&self, adb_serial: &str) {
+        if self.active().is_none() {
+            return;
+        }
+        let mut g = self.lock();
+        if let Some(l) = g.as_mut() {
+            let s = adb_serial.trim();
+            if !s.is_empty() && !l.bound.iter().any(|b| b.eq_ignore_ascii_case(s)) {
+                l.bound.push(s.to_string());
+            }
+        }
+    }
+
+    /// May the guard let a command for selector `adb_serial` through to the protected phone? Only
+    /// while a lease is active and core bound that very name under it.
+    pub fn admits(&self, adb_serial: &str) -> bool {
+        self.active().is_some_and(|l| {
+            l.bound
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case(adb_serial.trim()))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T0: u64 = 1_700_000_000_000;
+
+    fn lease(epoch: u64) -> Lease {
+        Lease {
+            id: "abcdefghijklmnopqrst".into(),
+            holder: Holder {
+                name: "lane".into(),
+                epoch,
+            },
+            job: None,
+            opened_at_ms: T0,
+            expires_at_ms: T0 + 60_000,
+            granted: Granted::Overnight,
+            bound: vec![],
+        }
+    }
+
+    #[test]
+    fn a_lease_lives_until_its_end_on_a_readable_clock() {
+        let clock = Arc::new(ManualClock::new(T0));
+        let book = LeaseBook::new(clock.clone());
+        assert!(book.active().is_none());
+        book.open(lease(7));
+        assert!(book.active().is_some());
+        clock.advance(59_999);
+        assert_eq!(book.active().map(|l| l.seconds_left(T0 + 59_999)), Some(0));
+        clock.set(None);
+        assert!(book.active().is_none(), "an unreadable clock is no lease");
+        clock.set(Some(T0 + 60_000));
+        assert!(book.active().is_none(), "the end is exclusive");
+        clock.set(Some(T0));
+        assert!(book.active().is_none(), "a lease that ran out was dropped");
+    }
+
+    #[test]
+    fn the_guard_admits_only_names_core_bound_under_the_lease() {
+        let clock = Arc::new(ManualClock::new(T0));
+        let book = LeaseBook::new(clock.clone());
+        book.bind("192.0.2.60:5555");
+        assert!(!book.admits("192.0.2.60:5555"), "no lease, nothing bound");
+        book.open(lease(7));
+        assert!(!book.admits("192.0.2.60:5555"), "open, but not bound");
+        book.bind("192.0.2.60:5555");
+        assert!(book.admits("192.0.2.60:5555"));
+        assert!(!book.admits("192.0.2.61:5555"));
+        assert!(book.close_epoch(8).is_none(), "another holder's epoch");
+        assert!(book.close_epoch(7).is_some());
+        assert!(!book.admits("192.0.2.60:5555"));
+        assert_eq!(clamp_minutes(0), 1);
+        assert_eq!(clamp_minutes(u64::MAX), MAX_MINUTES);
+    }
+}

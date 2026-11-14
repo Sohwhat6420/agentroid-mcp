@@ -38,6 +38,19 @@ pub const MAX_EARLY_MS: u64 = 60_000;
 /// How many inbound event ids and resolved request ids are remembered.
 pub const SEEN_MAX: usize = 500;
 
+/// What kind of push a [`Request`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Style {
+    /// One action that needs a yes (D3b): Allow and Deny.
+    #[default]
+    Action,
+    /// A protected-device lease ask: the `reason` is the whole question; Allow and Deny.
+    Lease,
+    /// Information only (an overnight lease was opened): the `reason` says what happened; Deny
+    /// only, which ends the lease.
+    Notice,
+}
+
 /// What the human is asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -51,11 +64,29 @@ pub struct Request {
     pub target: String,
     pub created_ms: u64,
     pub expires_ms: u64,
+    pub style: Style,
 }
 
 impl Request {
     /// The push text: what the agent wants to do, in one line, with no typed text.
     pub fn message(&self) -> String {
+        match self.style {
+            Style::Action => {}
+            Style::Lease => {
+                return format!(
+                    "{}\nAnswer within {} min; no answer = denied. Request {}",
+                    self.reason,
+                    (self.expires_ms.saturating_sub(self.created_ms)).div_ceil(60_000),
+                    self.id
+                )
+            }
+            Style::Notice => {
+                return format!(
+                    "{}\nTap Deny (or reply `deny {}`) to end it.",
+                    self.reason, self.id
+                )
+            }
+        }
         let mut m = format!(
             "{} on {}{}: {}",
             self.tool,
@@ -262,7 +293,87 @@ impl Approver {
             target: target.chars().take(120).collect(),
             created_ms: now_ms,
             expires_ms: now_ms + self.expiry_ms,
+            style: Style::Action,
         }
+    }
+
+    /// Send an ask WITHOUT waiting (the protected-device lease's background ask): the caller keeps
+    /// the request and calls [`Approver::check`] on later calls. `Err`: the channel cannot carry it.
+    pub fn send(&mut self, req: &Request) -> Result<(), String> {
+        self.channel.send(req)
+    }
+
+    /// One look at an ask sent with [`Approver::send`]: `Some` once it is answered (the same strict
+    /// grammar and one-shot rules as [`Approver::ask`]) or its window has closed at `now_ms`
+    /// (`Expired`; an answer found after that is not an answer); `None` while it is still open,
+    /// including when the channel cannot be read just now.
+    pub fn check(&mut self, req: &Request, now_ms: u64) -> Option<Outcome> {
+        if now_ms >= req.expires_ms || self.resolved_set.contains(&req.id) {
+            remember(&mut self.resolved, &mut self.resolved_set, &req.id);
+            return Some(Outcome::Expired);
+        }
+        let events = self.channel.poll(req).ok()?;
+        for ev in &events {
+            if let Some(a) = self.judge(req, ev) {
+                remember(&mut self.resolved, &mut self.resolved_set, &req.id);
+                return Some(match a {
+                    Answer::Allow => Outcome::Approved {
+                        event_id: ev.event_id.clone(),
+                    },
+                    Answer::Deny => Outcome::Denied {
+                        event_id: ev.event_id.clone(),
+                    },
+                });
+            }
+        }
+        None
+    }
+
+    /// Has a fresh, exact `deny <req.id>` arrived since the ask was made (even after it was
+    /// approved, or long after its window)? The open lease behind `req` ends on one. Each Deny
+    /// counts once (its event id is remembered), so a lease re-allowed after a Deny is not closed
+    /// again by the same Deny. `Err`: the channel could not be read, which the caller must not take
+    /// for "no deny".
+    pub fn poll_deny(&mut self, req: &Request) -> Result<bool, String> {
+        let events = self.channel.poll(req)?;
+        for ev in &events {
+            if ev.event_id.is_empty()
+                || ev.event_id.len() > 64
+                || self.seen_set.contains(&ev.event_id)
+            {
+                continue;
+            }
+            if ev.time_ms + MAX_EARLY_MS >= req.created_ms
+                && parse_answer(&ev.message) == Some((Answer::Deny, req.id.clone()))
+            {
+                remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The explicit re-allow after a Deny: a fresh `allow <req.id>` (an event id never applied
+    /// before) dated after `after_ms`, the time of the Deny. `req` is resolved already, so
+    /// [`Approver::check`] would ignore it; this is the one way back. `Some(event id)` on one.
+    pub fn reallowed(&mut self, req: &Request, after_ms: u64) -> Option<String> {
+        let events = self.channel.poll(req).ok()?;
+        for ev in &events {
+            if ev.event_id.is_empty()
+                || ev.event_id.len() > 64
+                || self.seen_set.contains(&ev.event_id)
+            {
+                continue;
+            }
+            // only the one event used is marked seen: others may answer other asks
+            if ev.time_ms > after_ms
+                && parse_answer(&ev.message) == Some((Answer::Allow, req.id.clone()))
+            {
+                remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
+                return Some(ev.event_id.clone());
+            }
+        }
+        None
     }
 
     /// Judge one inbound event against an open request: `Some(answer)` only for a fresh event that
@@ -476,6 +587,10 @@ pub struct NtfyConfig {
     /// deny-all`), so a short topic name such as `alerts` is safe. Only with `token_file` set, and
     /// never for ntfy.sh, where anyone may read an unreserved topic.
     pub login_topics: bool,
+    /// The answers must come on their own topic (`inbound_topic_file` set, naming a topic other than
+    /// the outbound one). Set when the protected-device lease is on: a process that can read the
+    /// outbound push (and so the request id) cannot then post `allow <id>` to the same topic.
+    pub require_separate_inbound: bool,
 }
 
 impl NtfyConfig {
@@ -489,6 +604,7 @@ impl NtfyConfig {
             tap_token_file: None,
             tap_base: None,
             login_topics: false,
+            require_separate_inbound: false,
         }
     }
 }
@@ -519,6 +635,11 @@ impl<H: Http> NtfyChannel<H> {
             Some(p) => read_topic_for(p, login)?,
             None => out.clone(),
         };
+        if self.cfg.require_separate_inbound && inb == out {
+            return Err(
+                "the answers must come on their own topic (--approval-inbound-file naming a topic other than the outbound one)".into(),
+            );
+        }
         Ok((out, inb))
     }
 
@@ -571,13 +692,19 @@ impl<H: Http> NtfyChannel<H> {
             }
             b
         };
+        // a notice (an overnight lease was opened) offers only Deny, which ends it
+        let actions = if req.style == Style::Notice {
+            vec![button("Deny", "deny")]
+        } else {
+            vec![button("Allow", "allow"), button("Deny", "deny")]
+        };
         serde_json::json!({
             "topic": topic,
             "title": self.cfg.title,
             "message": req.message(),
             "priority": 4,
             "tags": ["lock"],
-            "actions": [button("Allow", "allow"), button("Deny", "deny")]
+            "actions": actions
         })
         .to_string()
     }
@@ -1256,6 +1383,132 @@ mod tests {
         assert_eq!(events[0].time_ms, 1_700_000_007_000);
         assert!(ch.http.gets[0].starts_with(&format!("https://ntfy.sh/{topic}/json?poll=1&since=")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_lease_channel_refuses_answers_on_the_outbound_topic() {
+        let d = tmp("ntfy-separate");
+        let out = d.join("out.key");
+        let inb = d.join("in.key");
+        std::fs::write(&out, "agentroid-outbound-0123456789abcdef\n").unwrap();
+        std::fs::write(&inb, "agentroid-outbound-0123456789abcdef\n").unwrap();
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut a, 1_700_000_000_000);
+        let rec = || RecHttp {
+            posts: vec![],
+            gets: vec![],
+            reply: String::new(),
+        };
+        let mut cfg = NtfyConfig::new(&out);
+        cfg.require_separate_inbound = true;
+        // no inbound file: the answers would come on the outbound topic
+        let mut ch = NtfyChannel::new(cfg.clone(), rec());
+        assert!(ch.send(&r).unwrap_err().contains("own topic"));
+        assert!(ch.poll(&r).is_err());
+        assert!(ch.http.posts.is_empty() && ch.http.gets.is_empty());
+        // an inbound file naming the same topic
+        cfg.inbound_topic_file = Some(inb.clone());
+        let mut ch = NtfyChannel::new(cfg.clone(), rec());
+        assert!(ch.send(&r).is_err());
+        // a topic of its own
+        std::fs::write(&inb, "agentroid-inbound-fedcba9876543210xx\n").unwrap();
+        let mut ch = NtfyChannel::new(cfg, rec());
+        assert!(ch.send(&r).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_notice_offers_only_deny_and_a_lease_ask_counts_minutes() {
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let mut r = req(&mut a, 1_700_000_000_000);
+        r.style = Style::Notice;
+        r.reason = "A lease opened".into();
+        let ch = NtfyChannel::new(
+            NtfyConfig::new("unused"),
+            RecHttp {
+                posts: vec![],
+                gets: vec![],
+                reply: String::new(),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
+        let acts = v["actions"].as_array().unwrap();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0]["body"], format!("deny {}", r.id));
+        r.style = Style::Lease;
+        r.expires_ms = r.created_ms + 600_000;
+        assert!(r.message().contains("within 10 min"));
+    }
+
+    #[test]
+    fn a_background_ask_is_checked_without_waiting_and_a_deny_poll_error_is_an_error() {
+        let ch = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Inbound>::new()));
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Shared(
+            std::sync::Arc<std::sync::Mutex<Vec<Inbound>>>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        );
+        impl Channel for Shared {
+            fn name(&self) -> &'static str {
+                "shared"
+            }
+            fn send(&mut self, _: &Request) -> Result<(), String> {
+                Ok(())
+            }
+            fn poll(&mut self, _: &Request) -> Result<Vec<Inbound>, String> {
+                if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("network down".into());
+                }
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+        let mut a = Approver::new(Box::new(Shared(ch.clone(), fail.clone())));
+        let t0 = 1_700_000_000_000u64;
+        let r = req(&mut a, t0);
+        a.send(&r).unwrap();
+        assert_eq!(a.check(&r, t0 + 1), None, "open, no answer");
+        let ev = |id: &str, at: u64, msg: String| Inbound {
+            event_id: id.into(),
+            time_ms: at,
+            message: msg,
+        };
+        ch.lock()
+            .unwrap()
+            .push(ev("e1", t0 + 5, format!("allow {}", r.id)));
+        assert!(matches!(
+            a.check(&r, t0 + 6),
+            Some(Outcome::Approved { .. })
+        ));
+        assert_eq!(a.poll_deny(&r), Ok(false));
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            a.poll_deny(&r).is_err(),
+            "an unreadable channel is not 'no deny'"
+        );
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        ch.lock()
+            .unwrap()
+            .push(ev("e2", t0 + 50, format!("deny {}", r.id)));
+        assert_eq!(a.poll_deny(&r), Ok(true));
+        assert_eq!(a.poll_deny(&r), Ok(false), "a Deny counts once");
+        // re-allow: only a fresh allow dated after the deny
+        assert_eq!(a.reallowed(&r, t0 + 50), None, "the old allow was used");
+        ch.lock()
+            .unwrap()
+            .push(ev("e3", t0 + 40, format!("allow {}", r.id)));
+        assert_eq!(a.reallowed(&r, t0 + 50), None, "dated before the deny");
+        ch.lock()
+            .unwrap()
+            .push(ev("e4", t0 + 60, format!("allow {}", r.id)));
+        assert_eq!(a.reallowed(&r, t0 + 50).as_deref(), Some("e4"));
+        assert_eq!(a.reallowed(&r, t0 + 50), None, "one shot");
+        // a checked ask whose window has closed is expired, whatever arrives later
+        let r2 = req(&mut a, t0);
+        ch.lock()
+            .unwrap()
+            .push(ev("e5", t0 + 10, format!("allow {}", r2.id)));
+        assert_eq!(a.check(&r2, r2.expires_ms), Some(Outcome::Expired));
+        assert_eq!(a.check(&r2, t0 + 11), Some(Outcome::Expired), "resolved");
     }
 
     #[test]

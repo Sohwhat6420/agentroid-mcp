@@ -10,6 +10,7 @@ use crate::audit::{AuditLog, Entry};
 use crate::fileguard::{self, FileOp};
 use crate::frame::{Frame, FrameError, Shot};
 use crate::gate::{self, Call, DeviceMode, Refusal, Subject, Target};
+use crate::protected::{self, Protected, ScreenFacts};
 use crate::require::{read_require, RequireOpts, Required};
 use crate::screenguard::{self, Decision, Screen, Touch};
 use crate::screenlock::{
@@ -21,6 +22,7 @@ use crate::settle::{settle, Settle, SettleOpts, TreeSource};
 use crate::shell;
 use crate::shellguard;
 use crate::tree::parse;
+use agentroid_adb_link::lease::Granted;
 use agentroid_adb_link::runner::Clock;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -266,6 +268,33 @@ impl<T: Transport> TreeSource for LiveSource<'_, T> {
     }
 }
 
+/// A [`TreeSource`] for the protected phone: each tree is checked, and the first refused one ends
+/// the reads (the settle then returns the refusal, never the tree).
+struct ProtectedSource<S: TreeSource> {
+    inner: S,
+    refused: Option<(&'static str, String)>,
+}
+
+impl<S: TreeSource> TreeSource for ProtectedSource<S> {
+    fn dump(&mut self) -> Result<String, String> {
+        if self.refused.is_some() {
+            return Err("the protected phone's screen may not be read now".into());
+        }
+        let xml = self.inner.dump()?;
+        let verdict = match protected::screen_facts(&xml) {
+            Ok(f) => protected::read_refusal(&f),
+            Err(why) => Some(("screen", why)),
+        };
+        match verdict {
+            None => Ok(xml),
+            Some(r) => {
+                self.refused = Some(r);
+                Err("the protected phone's screen may not be read now".into())
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeviceState {
     shot: Option<Shot>,
@@ -325,6 +354,11 @@ fn device_name(d: &DeviceInfo) -> String {
     }
 }
 
+/// The protected lease book's wall clock (`u64::MAX` when it cannot be read: no time is left).
+fn p_now(p: Option<&Protected>) -> u64 {
+    p.and_then(|p| p.book().now_ms()).unwrap_or(u64::MAX)
+}
+
 fn matches_adb_serial(entry: &str, adb_serial: &str) -> bool {
     let (entry, adb) = (entry.to_ascii_lowercase(), adb_serial.to_ascii_lowercase());
     if entry.ends_with('-') {
@@ -368,6 +402,16 @@ pub struct Core<T: Transport, C: Clock> {
     /// (the serial they were named with, segment id): the phone, and the latest monotonic time
     /// their report may date the agent's own activity at (admission + [`FREE_SEGMENT_MAX_S`]).
     lock_tails: HashMap<(String, String), (String, String, u64)>,
+    /// The protected-device lease (`crate::protected`); `None`: off, and the protected phone
+    /// answers only the ruled reads.
+    protected: Option<Protected>,
+    /// This call runs under an overnight lease: no `asked` verdict goes to the owner.
+    prot_overnight: bool,
+    /// This call is on the protected phone (the tool's name): every tree it reads is checked
+    /// before it is stored or shown.
+    prot_active: Option<&'static str>,
+    /// The protected phone's screen as the check before the call found it.
+    prot_facts: Option<ScreenFacts>,
 }
 
 /// How many link segments may wait for their report at once (the oldest goes first).
@@ -439,6 +483,151 @@ impl<T: Transport, C: Clock> Core<T, C> {
             lock_tickets: 0,
             lock_lease_ms: None,
             lock_tails: HashMap::new(),
+            protected: None,
+            prot_overnight: false,
+            prot_active: None,
+            prot_facts: None,
+        }
+    }
+
+    /// Turn the protected-device lease on (`--protected-lease`): calls on the protected phone then
+    /// run under a lease the owner allowed (or the overnight rule opened).
+    pub fn set_protected(&mut self, p: Protected) {
+        self.protected = Some(p);
+    }
+
+    pub fn protected(&self) -> Option<&Protected> {
+        self.protected.as_ref()
+    }
+
+    pub fn protected_mut(&mut self) -> Option<&mut Protected> {
+        self.protected.as_mut()
+    }
+
+    /// Is `d` the protected phone (by its adb or hardware serial)?
+    fn is_protected(d: &DeviceInfo) -> bool {
+        gate::is_s24(&d.serial) || gate::is_s24(&d.hw_serial)
+    }
+
+    /// The protected phone with the lease on, for a call that is not a ruled read.
+    fn protected_route(&self, d: &DeviceInfo, call: &Call) -> bool {
+        self.protected.is_some() && Self::is_protected(d) && !gate::is_ruled_read(call)
+    }
+
+    /// The lease's half of the gate, for the protected phone: the configured mode first (so
+    /// `read_only` and `helper` win, and nothing is asked for a call they refuse), then a launch
+    /// of a protected app (refused before anything is asked), then the lease itself. One lease
+    /// satisfies the screen lock as well, so the owner never allows the same work twice.
+    fn pick_protected(
+        &mut self,
+        d: &DeviceInfo,
+        tool: &'static str,
+        call: Option<&Call>,
+    ) -> Result<(), CoreError> {
+        let r = self.pick_protected_inner(d, tool, call);
+        if r.is_err() {
+            self.pending = Some((device_name(d), String::new()));
+        }
+        r
+    }
+
+    fn pick_protected_inner(
+        &mut self,
+        d: &DeviceInfo,
+        tool: &'static str,
+        call: Option<&Call>,
+    ) -> Result<(), CoreError> {
+        let configured = self.configured_mode(d);
+        match call {
+            Some(c) => gate::check_leased(configured, c)?,
+            None => gate::check_leased_raw(configured, tool)?,
+        }
+        if let Some((rule, why)) = call.and_then(protected::launch_refusal) {
+            return Err(Refusal::Protected { tool, rule, why }.into());
+        }
+        let Some(p) = self.protected.as_mut() else {
+            return Err(Refusal::S24 { tool }.into());
+        };
+        let lease = p.admit(d, tool, self.approver.as_mut(), self.audit.as_mut())?;
+        self.prot_overnight = lease.granted == Granted::Overnight;
+        if call.is_none_or(Call::is_acting) {
+            let phone = phone_key(&d.hw_serial, &d.serial);
+            self.lock_running
+                .retain(|_, (_, s, h)| phone_key(h, s) != phone);
+            self.lock_tails
+                .retain(|_, (s, h, _)| phone_key(h, s) != phone);
+            let now = p_now(self.protected.as_ref());
+            self.lock_lease_ms = Some(lease.expires_at_ms.saturating_sub(now));
+        }
+        Ok(())
+    }
+
+    /// Refuse `xml` (a tree read on the protected phone) when it shows what is never shown.
+    fn protected_xml(&self, tool: &'static str, xml: &str) -> Result<(), CoreError> {
+        let f = protected::screen_facts(xml).map_err(|why| Refusal::Protected {
+            tool,
+            rule: "screen",
+            why,
+        })?;
+        match protected::read_refusal(&f) {
+            Some((rule, why)) => Err(Refusal::Protected { tool, rule, why }.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The protected phone's screen check before `call` is sent (reads included): a fresh tree,
+    /// never the cached one. Exit keys go without a read.
+    fn protected_pre(&mut self, d: &DeviceInfo, call: &Call) -> Result<(), CoreError> {
+        self.prot_facts = None;
+        if let Call::Key { name } = call {
+            if protected::exit_key(name) {
+                return Ok(());
+            }
+        }
+        let tool = call.name();
+        let xml = self
+            .transport
+            .tree_xml(&d.serial, self.backend)
+            .map_err(|e| Refusal::Protected {
+                tool,
+                rule: "screen",
+                why: format!(
+                    "the screen could not be read ({}), so nothing was sent",
+                    e.0.chars().take(120).collect::<String>()
+                ),
+            })?;
+        let f = protected::screen_facts(&xml).map_err(|why| Refusal::Protected {
+            tool,
+            rule: "screen",
+            why,
+        })?;
+        if let Some((rule, why)) = protected::screen_refusal(&f, call, None) {
+            return Err(Refusal::Protected { tool, rule, why }.into());
+        }
+        self.prot_facts = Some(f);
+        // the screen guard reads again too, rather than reuse a cached tree
+        self.st(&d.serial).dirty = true;
+        Ok(())
+    }
+
+    /// A touch at device point (x, y) on the protected phone: never on a protected app's icon or a
+    /// PIN digit.
+    fn protected_at(&self, call: &Call, x: i32, y: i32) -> Result<(), CoreError> {
+        if self.prot_active.is_none() {
+            return Ok(());
+        }
+        match self
+            .prot_facts
+            .as_ref()
+            .and_then(|f| protected::screen_refusal(f, call, Some((x, y))))
+        {
+            Some((rule, why)) => Err(Refusal::Protected {
+                tool: call.name(),
+                rule,
+                why,
+            }
+            .into()),
+            None => Ok(()),
         }
     }
 
@@ -520,9 +709,18 @@ impl<T: Transport, C: Clock> Core<T, C> {
         self.lock_lease_ms = None;
         // (the lock's own check drops any older ticket for this phone, under any name)
         let key = serial.unwrap_or_default();
-        let r = self
-            .find(serial, tool)
-            .and_then(|d| self.lock_check(&d, tool).map_err(CoreError::from));
+        let r = self.find(serial, tool).and_then(|d| {
+            // a link segment runs on the phone out of core's sight: never on the protected phone
+            if Self::is_protected(&d) {
+                return Err(Refusal::Protected {
+                    tool,
+                    rule: "link",
+                    why: "link segments never run on the protected phone".into(),
+                }
+                .into());
+            }
+            self.lock_check(&d, tool).map_err(CoreError::from)
+        });
         let ticket = match (&r, self.lock_admitted.take()) {
             (Ok(()), Some(phone)) => self.lock_ticket(key, phone),
             _ => None,
@@ -714,19 +912,27 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 .any(|a| a.eq_ignore_ascii_case(&d.hw_serial) || matches_adb_serial(a, &d.serial))
     }
 
-    fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
-        let configured = self
-            .modes
+    /// The mode configured for `d` (`full` unless set), before the protected phone's override.
+    fn configured_mode(&self, d: &DeviceInfo) -> DeviceMode {
+        self.modes
             .get(&d.hw_serial)
             .or_else(|| self.modes.get(&d.serial))
             .copied()
-            .unwrap_or_default();
-        gate::effective_mode(&[&d.serial, &d.hw_serial], configured)
+            .unwrap_or_default()
+    }
+
+    fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
+        gate::effective_mode(&[&d.serial, &d.hw_serial], self.configured_mode(d))
     }
 
     /// phone-hands' `_pick`, followed by the gate.
     fn pick(&mut self, serial: Option<&str>, call: &Call) -> Result<DeviceInfo, CoreError> {
+        self.prot_overnight = false;
         let info = self.find(serial, call.name())?;
+        if self.protected_route(&info, call) {
+            self.pick_protected(&info, call.name(), Some(call))?;
+            return Ok(info);
+        }
         let mode = self.mode_of(&info);
         let subject = Subject {
             serial: &info.serial,
@@ -747,7 +953,41 @@ impl<T: Transport, C: Clock> Core<T, C> {
         serial: Option<&str>,
         tool: &'static str,
     ) -> Result<DeviceInfo, CoreError> {
+        self.pick_raw_path(serial, tool, None)
+    }
+
+    /// [`pick_raw`](Self::pick_raw) with the phone path of a `push` or `pull`, which the protected
+    /// phone checks before its lease (no ask for a path that is refused anyway).
+    fn pick_raw_path(
+        &mut self,
+        serial: Option<&str>,
+        tool: &'static str,
+        path: Option<&str>,
+    ) -> Result<DeviceInfo, CoreError> {
+        self.prot_overnight = false;
         let info = self.find(serial, tool)?;
+        if self.protected.is_some() && Self::is_protected(&info) {
+            let refusal = if tool == "shell" {
+                Some(Refusal::Protected {
+                    tool,
+                    rule: "shell",
+                    why: "raw shell lines never run on the protected phone (a shell can read notifications and app data)".into(),
+                })
+            } else {
+                path.and_then(protected::path_refusal)
+                    .map(|why| Refusal::Protected {
+                        tool,
+                        rule: "path",
+                        why,
+                    })
+            };
+            if let Some(r) = refusal {
+                self.pending = Some((device_name(&info), String::new()));
+                return Err(r.into());
+            }
+            self.pick_protected(&info, tool, None)?;
+            return Ok(info);
+        }
         let mode = self.mode_of(&info);
         let subject = Subject {
             serial: &info.serial,
@@ -797,7 +1037,11 @@ impl<T: Transport, C: Clock> Core<T, C> {
         self.lock_admitted = None;
         // a ticket handed out before this call is stale now, whatever the call is
         self.lock_running.remove(serial.unwrap_or_default());
+        self.prot_active = None;
+        self.prot_facts = None;
         let r = self.call_inner(serial, call);
+        self.prot_active = None;
+        self.prot_facts = None;
         if let Err(CoreError::Refused(refusal)) = &r {
             self.record_refusal(serial, call.name(), refusal, "");
         }
@@ -889,7 +1133,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         self.pending = None;
         let tool = op.as_str();
         let r = self
-            .pick_raw(serial, tool)
+            .pick_raw_path(serial, tool, Some(phone_path))
             .and_then(|d| self.raw_gate(&d, tool, fileguard::classify_file(op, phone_path)));
         if let Err(CoreError::Refused(refusal)) = &r {
             let target = fileguard::classify_file(op, phone_path).target;
@@ -991,6 +1235,17 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 format!("{reason} on {}", decision.target)
             }
         };
+        if self.prot_overnight {
+            return Err(Refusal::Screen {
+                tool,
+                verdict: "asked",
+                kind,
+                reason: format!(
+                    "{} (nothing is asked under an overnight lease: the owner is asleep)",
+                    with_target(&decision.reason)
+                ),
+            });
+        }
         let Some(approver) = self.approver.as_mut() else {
             return Err(Refusal::Screen {
                 tool,
@@ -1158,10 +1413,26 @@ impl<T: Transport, C: Clock> Core<T, C> {
         }
         let p = self.pick(serial, call)?;
         let s = p.serial.clone();
+        if self.protected_route(&p, call) {
+            self.prot_active = Some(call.name());
+            self.protected_pre(&p, call)?;
+        }
         match call {
             Call::ListDevices | Call::Wait { .. } => unreachable!("handled above"),
             Call::Screenshot { max_width } => {
                 let (img, note, shot) = self.shoot(&s, *max_width)?;
+                // the screen may have changed while the shot was taken: check it again, and
+                // drop the image when it now shows what is never shown
+                if let Some(tool) = self.prot_active {
+                    let xml = self.transport.tree_xml(&s, self.backend).map_err(|_| {
+                        Refusal::Protected {
+                            tool,
+                            rule: "screen",
+                            why: "the screen could not be read again after the shot, so the image was dropped".into(),
+                        }
+                    })?;
+                    self.protected_xml(tool, &xml)?;
+                }
                 Ok(Outcome {
                     text: note,
                     image: Some(img),
@@ -1176,8 +1447,19 @@ impl<T: Transport, C: Clock> Core<T, C> {
             } => self.ui_tree(&s, *interactive_only, require, *timeout_ms),
             Call::Look { max_width } => {
                 let (img, note, shot) = self.shoot(&s, *max_width)?;
+                // on the protected phone this tree is read after the shot and checked, so a
+                // refusal here drops the image too
                 let listing = match self.read_tree(&s, false) {
                     Ok(t) => t,
+                    Err(e @ CoreError::Refused(_)) => return Err(e),
+                    Err(_) if self.prot_active.is_some() => {
+                        return Err(Refusal::Protected {
+                            tool: "look",
+                            rule: "screen",
+                            why: "the screen could not be read again after the shot, so the image was dropped".into(),
+                        }
+                        .into())
+                    }
                     Err(e) => format!("(UI tree unavailable: {e})"),
                 };
                 Ok(Outcome {
@@ -1210,6 +1492,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             }
             Call::Tap { target } => {
                 let (x, y, display, how, res) = self.locate(&s, target)?;
+                self.protected_at(call, x, y)?;
                 self.screen_gate(&p, call, Some(Touch::At(x, y)))?;
                 self.send(&s, &Input::Tap { x, y, display })?;
                 Ok(Outcome {
@@ -1220,6 +1503,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             }
             Call::LongPress { target, ms } => {
                 let (x, y, display, how, res) = self.locate(&s, target)?;
+                self.protected_at(call, x, y)?;
                 self.screen_gate(&p, call, Some(Touch::At(x, y)))?;
                 self.send(
                     &s,
@@ -1247,6 +1531,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             } => {
                 let frame = self.frame(&s, space.as_deref(), *image_width)?;
                 let (a, b) = (frame.map(*x1, *y1)?, frame.map(*x2, *y2)?);
+                self.protected_at(call, a.x, a.y)?;
                 self.screen_gate(&p, call, Some(Touch::SwipeFrom(a.x, a.y)))?;
                 self.send(
                     &s,
@@ -1300,6 +1585,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 let at = match index {
                     Some(i) => {
                         let (x, y, ..) = self.locate(&s, &Target::Index(*i))?;
+                        self.protected_at(call, x, y)?;
                         Some((x, y))
                     }
                     None => None,
@@ -1373,7 +1659,28 @@ impl<T: Transport, C: Clock> Core<T, C> {
             serial: &p.serial,
             backend,
         };
-        Ok(settle(&mut src, &self.clock, opts))
+        if !(self.protected.is_some() && Self::is_protected(&p)) {
+            return Ok(settle(&mut src, &self.clock, opts));
+        }
+        // the protected phone: every poll is checked, and one refused tree ends the settle
+        let mut checked = ProtectedSource {
+            inner: src,
+            refused: None,
+        };
+        let r = settle(&mut checked, &self.clock, opts);
+        match checked.refused {
+            None => Ok(r),
+            Some((rule, why)) => {
+                let refusal = Refusal::Protected {
+                    tool: "settle",
+                    rule,
+                    why,
+                };
+                self.pending = Some((device_name(&p), String::new()));
+                self.record_refusal(serial, "settle", &refusal, "");
+                Err(refusal.into())
+            }
+        }
     }
 
     fn list_devices(&mut self) -> Result<Outcome, CoreError> {
@@ -1498,6 +1805,10 @@ impl<T: Transport, C: Clock> Core<T, C> {
         interactive_only: bool,
         took_ms: u64,
     ) -> Result<String, CoreError> {
+        // the protected phone: checked before anything of it is stored, kept as a snapshot or shown
+        if let Some(tool) = self.prot_active {
+            self.protected_xml(tool, &xml)?;
+        }
         let (listing, snap_id, injection) = {
             let tree = parse(&xml, interactive_only)
                 .map_err(|e| CoreError::Invalid(format!("UI tree unavailable: {e}")))?;
@@ -1577,6 +1888,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         if require.is_empty() {
             return match self.read_tree(serial, interactive_only) {
                 Ok(text) => Ok(Outcome::text(text)),
+                Err(e @ CoreError::Refused(_)) => Err(e),
                 // a dozing screen gives "null root node"; say why instead of failing bare
                 Err(e) => Ok(Outcome::text(format!(
                     "{}(UI tree unavailable: {e})",
@@ -1690,6 +2002,9 @@ impl<T: Transport, C: Clock> Core<T, C> {
             }
             Target::Select(sel) => {
                 let xml = self.transport.tree_xml(serial, self.backend)?;
+                if let Some(tool) = self.prot_active {
+                    self.protected_xml(tool, &xml)?;
+                }
                 let now = self.clock.now_ms();
                 let stt = self.st(serial);
                 stt.tree = Some((xml.clone(), false));

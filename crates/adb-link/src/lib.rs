@@ -2,6 +2,7 @@
 //!
 //! * [`parse`]: `adb devices -l`, `adb mdns services`, phone id, `choose` (port of phone-guard).
 //! * [`guard`]: deny-by-default command guard, S24 never a target.
+//! * [`lease`]: the protected-device lease book core and the guard share.
 //! * [`runner`]: the `Runner`, `Prober` and `Clock` seams, with real implementations.
 //! * [`gone`]: `device_gone` cause and human fix.
 //! * [`watcher`]: the 15 s watcher (mDNS first, then the last working address).
@@ -10,6 +11,7 @@
 
 pub mod gone;
 pub mod guard;
+pub mod lease;
 pub mod parse;
 pub mod runner;
 pub mod watcher;

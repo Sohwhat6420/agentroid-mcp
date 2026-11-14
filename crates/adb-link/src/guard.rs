@@ -5,10 +5,17 @@
 //! * commands that act on "the default device" (shell, get-state, ...) need an explicit selector
 //!   instead of being pinned to a transport id;
 //! * the protected phone is hardcoded as never-a-target instead of coming from readonly.json.
+//!
+//! The protected-device lease (`docs/design/protected-device-lease.md`) is the one way round the last
+//! rule: a guard built with a [`LeaseBook`] ([`GuardedRunner::with_leases`]) lets a command through
+//! to the protected phone only while a lease is open **and** core bound the command's `-s` name
+//! under it ([`LeaseBook::admits`]). Even then [`protected_policy`] keeps transport, install and
+//! credential commands refused, and `getevent` never reaches it.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::lease::LeaseBook;
 use crate::runner::{RunError, RunOutput, Runner};
 
 /// Hardware serial of the protected phone: read-only, never a target.
@@ -377,10 +384,93 @@ impl Checked {
     }
 }
 
-/// The guard. Holds the set of tokens learnt to be forbidden at run time (S24 addresses).
+/// The argv rules a lease never lifts. Applied to every non-read command sent to the protected
+/// phone under a lease, after [`Guard::check`]:
+/// * only `shell`, `exec-out`, `push` and `pull` (screen work and the file tools); `install`,
+///   `uninstall`, `tcpip`, `usb`, `root`, `reboot`, `emu`, `remount`, `sideload`, `forward`,
+///   `reverse`, `backup`, `restore` and every other subcommand stay refused;
+/// * no link-pairing shape (the helper's link is never paired with the protected phone);
+/// * no shell line that reboots, sets properties, becomes root, touches adbd or the USB, Wi-Fi or
+///   data transport, streams raw input, or installs, uninstalls or clears a package.
+pub fn protected_policy(c: &Checked) -> Result<(), String> {
+    const SUBS: [&str; 4] = ["shell", "exec-out", "push", "pull"];
+    if !SUBS.contains(&c.sub.as_str()) {
+        return Err(format!(
+            "adb {} is never sent to the protected phone, lease or not (only shell, exec-out, push and pull)",
+            c.sub
+        ));
+    }
+    if c.touches_link() {
+        return Err("the helper's link is never paired with the protected phone".into());
+    }
+    if c.sub == "shell" || c.sub == "exec-out" {
+        let line = c.rest.join(" ").to_ascii_lowercase();
+        if let Some(why) = protected_shell_refusal(&line) {
+            return Err(format!("{why}: never on the protected phone, lease or not"));
+        }
+    }
+    Ok(())
+}
+
+/// The shell-line half of [`protected_policy`]: the command words of every segment of `line`
+/// (split at `;`, `&`, `|`, newlines, backticks and brackets).
+fn protected_shell_refusal(line: &str) -> Option<&'static str> {
+    for seg in line.split([';', '&', '|', '\n', '`', '(', ')']) {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        let Some(first) = words.first().map(|w| w.trim_start_matches('$')) else {
+            continue;
+        };
+        // `/system/bin/reboot` is `reboot`
+        let first = first.rsplit('/').next().unwrap_or(first);
+        let second = words.get(1).copied().unwrap_or("");
+        let refused = match first {
+            "reboot" | "setprop" | "su" | "getevent" | "sendevent" | "start" | "stop" => {
+                Some("rebooting, properties, root, adbd and raw input")
+            }
+            "svc" if matches!(second, "usb" | "wifi" | "data") => Some("transport switches"),
+            "pm" if matches!(
+                second,
+                "install"
+                    | "install-create"
+                    | "install-write"
+                    | "install-commit"
+                    | "install-existing"
+                    | "uninstall"
+                    | "clear"
+            ) =>
+            {
+                Some("installing, uninstalling or clearing an app")
+            }
+            "cmd"
+                if second == "package"
+                    && matches!(
+                        words.get(2).copied().unwrap_or(""),
+                        "install" | "install-existing" | "uninstall" | "clear"
+                    ) =>
+            {
+                Some("installing, uninstalling or clearing an app")
+            }
+            _ => None,
+        };
+        if refused.is_some() {
+            return refused;
+        }
+        if words
+            .iter()
+            .any(|w| w.contains("adbd") || w.contains("adb_wifi") || w.contains("service.adb"))
+        {
+            return Some("adbd and the adb transport");
+        }
+    }
+    None
+}
+
+/// The guard. Holds the set of tokens learnt to be forbidden at run time (S24 addresses), and the
+/// protected-device lease book when one is wired (`None`: the protected phone is never a target).
 #[derive(Debug, Default)]
 pub struct Guard {
     denied: Mutex<HashSet<String>>,
+    leases: Option<Arc<LeaseBook>>,
     /// The protected phone screen-awake exception (see [`S24_SCREEN_AWAKE_KEYS`]). Off unless the runner was
     /// built with [`GuardedRunner::with_s24_screen_awake`].
     s24_screen_awake: bool,
@@ -396,6 +486,12 @@ fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>
 impl Guard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// May a non-read command for selector `v` reach the protected phone? Only with a lease book,
+    /// an open lease, and `v` bound under it by core ([`LeaseBook::admits`]).
+    pub fn lease_admits(&self, v: &str) -> bool {
+        self.leases.as_ref().is_some_and(|b| b.admits(v))
     }
 
     /// Forbid a token (for example the address an S24 was seen at).
@@ -421,7 +517,9 @@ impl Guard {
                 let read = probe.is_s24_read()
                     || (self.s24_screen_awake && probe.is_s24_screen_awake())
                     || (self.s24_call_state && probe.is_s24_call_state());
-                if self.is_forbidden(v) && !read {
+                // under a lease core bound this name: `GuardedRunner::admit` still reads the
+                // hardware serial and applies `protected_policy`
+                if self.is_forbidden(v) && !read && !self.lease_admits(v) {
                     return refuse(format!("{v} is the read-only S24, never a target"));
                 }
             }
@@ -518,7 +616,15 @@ impl Guard {
     ) -> Result<Checked, GuardError> {
         let c = self.check(argv)?;
         match &c.selector {
-            Some(sel) if sel.len() == 2 && sel[0] == "-s" => {}
+            Some(sel) if sel.len() == 2 && sel[0] == "-s" => {
+                // a lease never opens raw input streams: refused here in every spelling
+                if self.is_forbidden(&sel[1]) {
+                    return refuse(format!(
+                        "{} is the protected phone: getevent is never sent to it",
+                        sel[1]
+                    ));
+                }
+            }
             _ => return refuse("getevent needs an explicit -s <serial> target"),
         }
         if !c.is_getevent_shape() {
@@ -606,6 +712,19 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
+    /// As [`GuardedRunner::new`], plus the protected-device lease: a non-read command reaches the
+    /// protected phone while `leases` holds an open lease that core bound its `-s` name under,
+    /// and [`protected_policy`] allows it.
+    pub fn with_leases(inner: R, leases: Arc<LeaseBook>) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                leases: Some(leases),
+                ..Guard::default()
+            },
+        }
+    }
+
     pub fn guard(&self) -> &Guard {
         &self.guard
     }
@@ -688,9 +807,16 @@ impl<R: Runner> GuardedRunner<R> {
                     let excepted = (self.guard.s24_screen_awake && c.is_s24_screen_awake())
                         || (self.guard.s24_call_state && c.is_s24_call_state());
                     if !c.is_s24_read() && !excepted {
-                        return Err(RunError::Refused(
-                            "target is the read-only S24, never a target".into(),
-                        ));
+                        // the lease counts only for a name core checked and bound under it: a
+                        // phone core took for an ordinary device never rides on it
+                        let leased =
+                            sel.len() == 2 && sel[0] == "-s" && self.guard.lease_admits(&sel[1]);
+                        if !leased {
+                            return Err(RunError::Refused(
+                                "target is the read-only S24, never a target".into(),
+                            ));
+                        }
+                        protected_policy(&c).map_err(RunError::Refused)?;
                     }
                 }
             }
@@ -1831,5 +1957,148 @@ mod tests {
             )
             .is_ok());
         assert!(r.run(&args(&["kill-server"]), 1000).is_err());
+    }
+
+    // ---- the protected-device lease ----
+
+    use crate::lease::{Granted, Holder, Lease, LeaseBook, ManualClock};
+
+    const T0: u64 = 1_700_000_000_000;
+    const S24_IP: &str = "192.0.2.99:40000";
+
+    fn book_with_lease(bound: &[&str]) -> (Arc<ManualClock>, Arc<LeaseBook>) {
+        let clock = Arc::new(ManualClock::new(T0));
+        let book = Arc::new(LeaseBook::new(clock.clone()));
+        book.open(Lease {
+            id: "abcdefghijklmnopqrst".into(),
+            holder: Holder {
+                name: "lane".into(),
+                epoch: 3,
+            },
+            job: None,
+            opened_at_ms: T0,
+            expires_at_ms: T0 + 30 * 60_000,
+            granted: Granted::Overnight,
+            bound: vec![],
+        });
+        for b in bound {
+            book.bind(b);
+        }
+        (clock, book)
+    }
+
+    fn leased_s24(book: &Arc<LeaseBook>) -> GuardedRunner<Spy> {
+        GuardedRunner::with_leases(
+            Spy {
+                hw: S24_SERIAL.into(),
+                calls: RefCell::new(vec![]),
+            },
+            book.clone(),
+        )
+    }
+
+    #[test]
+    fn during_a_lease_screen_work_reaches_the_protected_phone_by_a_bound_name() {
+        let (clock, book) = book_with_lease(&[S24_IP, S24_SERIAL]);
+        let r = leased_s24(&book);
+        for a in [
+            vec!["-s", S24_IP, "shell", "input tap 1 1"],
+            vec!["-s", S24_SERIAL, "shell", "input", "tap", "1", "2"],
+            vec!["-s", S24_IP, "exec-out", "uiautomator", "dump", "/dev/tty"],
+            vec![
+                "-s",
+                S24_IP,
+                "push",
+                "C:/outbox/a.png",
+                "/sdcard/Download/a.png",
+            ],
+            vec![
+                "-s",
+                S24_IP,
+                "pull",
+                "/sdcard/Download/a.png",
+                "C:/inbox/a.png",
+            ],
+        ] {
+            assert!(r.run(&args(&a), 1000).is_ok(), "{a:?}");
+        }
+        assert!(r
+            .run_bytes(&args(&["-s", S24_IP, "exec-out", "screencap", "-p"]), 1000)
+            .is_ok());
+        // past the end: refused again, with nothing sent but the identity probe
+        clock.advance(30 * 60_000);
+        let r = leased_s24(&book);
+        assert!(r
+            .run(&args(&["-s", S24_IP, "shell", "input tap 1 1"]), 1000)
+            .is_err());
+        assert_eq!(r.inner.calls.borrow().len(), 1);
+    }
+
+    /// The review's "the adb guard trusts any open lease": with a lease open, a name core never bound
+    /// (core took the phone for an ordinary device because its `ro.serialno` read failed) is refused.
+    #[test]
+    fn a_lease_never_covers_a_name_core_did_not_bind() {
+        let (_, book) = book_with_lease(&[S24_IP]);
+        let r = leased_s24(&book);
+        let other = "192.0.2.98:41000";
+        assert!(matches!(
+            r.run(&args(&["-s", other, "shell", "input tap 1 1"]), 1000),
+            Err(RunError::Refused(_))
+        ));
+        assert_eq!(r.inner.calls.borrow().len(), 1, "only the identity probe");
+        // the address learnt to be the protected phone is now denied at the argv guard as well
+        assert!(r
+            .guard()
+            .check(&args(&["-s", other, "shell", "ls"]))
+            .is_err());
+        // and no lease book at all: the old rule, every name refused
+        let plain = GuardedRunner::new(Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        });
+        assert!(plain
+            .run(&args(&["-s", S24_IP, "shell", "input tap 1 1"]), 1000)
+            .is_err());
+    }
+
+    #[test]
+    fn a_lease_never_lifts_transport_install_or_raw_input_commands() {
+        let (_, book) = book_with_lease(&[S24_IP, S24_SERIAL]);
+        let refused: [&[&str]; 13] = [
+            &["install", "a.apk"],
+            &["uninstall", "com.whatsapp"],
+            &["tcpip", "5555"],
+            &["reboot"],
+            &["root"],
+            &["shell", "reboot"],
+            &["shell", "input tap 1 1; /system/bin/reboot"],
+            &["shell", "pm uninstall com.whatsapp"],
+            &["shell", "cmd package clear com.google.android.gm"],
+            &["shell", "setprop service.adb.tcp.port 5555"],
+            &["shell", "svc wifi disable"],
+            &["exec-out", "getevent", "-lt"],
+            &["forward", "--list"],
+        ];
+        for n in refused {
+            let r = leased_s24(&book);
+            let mut a = vec!["-s", S24_IP];
+            a.extend_from_slice(n);
+            assert!(r.run(&args(&a), 1000).is_err(), "{n:?}");
+            assert!(
+                r.inner.calls.borrow().len() <= 1,
+                "{n:?}: nothing but the probe"
+            );
+        }
+        let r = leased_s24(&book);
+        assert!(r.run(&link_dump_argv(S24_IP), 1000).is_err());
+        r.guard().deny(S24_IP);
+        assert!(r.run(&args(&["connect", S24_IP]), 1000).is_err());
+        assert!(r.run(&args(&["disconnect", S24_SERIAL]), 1000).is_err());
+        let g = &r.guard;
+        for sp in [S24_SERIAL, S24_IP] {
+            assert!(g
+                .check_getevent(&args(&["-s", sp, "exec-out", "getevent", "-lt"]), true)
+                .is_err());
+        }
     }
 }

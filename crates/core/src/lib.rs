@@ -21,6 +21,9 @@
 //!   (strict grammar, one shot, 90 s, deny on timeout; ntfy now, pluggable).
 //! * [`shellguard`] and [`fileguard`] (D3b): raw shell lines, `push` and `pull` through the same
 //!   deny-by-default rules and the same audit log.
+//! * [`protected`]: the protected-device lease (opt-in): one owner's Allow, or a signed and fresh
+//!   presence file overnight, opens a time-boxed lease on the protected phone; Gmail, WhatsApp,
+//!   the keyguard, notification previews and PIN entry stay off-limits under any lease.
 //!
 //! Nothing here starts adb or touches a device; the live transport is a later task.
 
@@ -31,6 +34,7 @@ pub mod fake;
 pub mod fileguard;
 pub mod frame;
 pub mod gate;
+pub mod protected;
 pub mod refs;
 pub mod require;
 pub mod screenguard;
