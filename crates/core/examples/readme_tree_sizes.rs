@@ -1,4 +1,4 @@
-//! The sizes in the README's "Real output" section, measured on a real screen.
+//! The sizes in the README's "What one look costs" section, measured on a real screen.
 //!
 //!     cargo run -p agentroid-core --example readme_tree_sizes
 //!

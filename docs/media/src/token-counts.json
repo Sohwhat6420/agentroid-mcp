@@ -1,0 +1,45 @@
+{
+  "what": "The raw token counts behind the README's 'What one look costs' section and the pictures drawn by build_readme_art_r2.py.",
+  "counted_on": "2026-11-14",
+  "counter": "Anthropic's count_tokens endpoint (POST /v1/messages/count_tokens), which is free and makes no model call",
+  "model": "claude-opus-5-5",
+  "method": [
+    "Each text is sent alone as one user message and the endpoint's input_tokens is recorded (the 'raw' field below).",
+    "A user message holding only a full stop counts 9 tokens: 8 for the message wrapper and 1 for the full stop. So a text's own size is raw minus 8.",
+    "The screenshot request holds the PNG and a full stop (a message needs some text), so its own size is raw minus 9.",
+    "The tool lists are counted by apps/mcp/scripts/count-tokens-ci.ts: each list's request minus a baseline request with one tiny tool."
+  ],
+  "screen": {
+    "text_rows": "the home screen of a Xiaomi POCO X6 Pro, recorded 20 Oct 2026: crates/core/tests/redteam/recorded/poco-launcher-2026-10-20.xml",
+    "screenshot_row": "the same phone's home screen on 14 Nov 2026, a 1220 x 2712 PNG from adb screencap (2,440,992 base64 characters; the file is not in the repository, a 480-pixel copy is: phone-home-480.jpg)"
+  },
+  "screen_counts": {
+    "empty_message_baseline": { "raw": 9 },
+    "android_raw_description": { "raw": 11573, "tokens": 11565, "characters": 30910 },
+    "screenshot_png": { "raw": 3876, "tokens": 3867 },
+    "agentroid_full_list": { "raw": 1249, "tokens": 1241, "characters": 2550 },
+    "agentroid_tappable_only": { "raw": 1119, "tokens": 1111 },
+    "agentroid_short_answer": { "raw": 237, "tokens": 229, "characters": 453 },
+    "agentroid_what_changed_nothing": { "raw": 43, "tokens": 35 }
+  },
+  "tool_list_counts": {
+    "baseline_one_tiny_tool": { "raw": 329 },
+    "full_27_tools": { "raw": 4964, "tokens": 4635 },
+    "minimal_8_tools": { "raw": 1660, "tokens": 1331 },
+    "full_27_tools_with_output_schemas_in_the_descriptions": { "raw": 8407, "tokens": 8078 },
+    "minimal_8_tools_with_output_schemas_in_the_descriptions": { "raw": 2702, "tokens": 2373 }
+  },
+  "arithmetic": {
+    "context_window": 200000,
+    "price_usd_per_million_input_tokens": 4,
+    "price_source": "Claude Opus 5.5 list price for input tokens, read 14 Nov 2026",
+    "looks_that_fit": "200,000 divided by tokens, rounded down",
+    "cost_of_1000_looks": "tokens x 1,000 x 4 / 1,000,000 US dollars"
+  },
+  "repeat_it": [
+    "cargo run -p agentroid-core --example readme_tree_sizes > tree_sizes.txt",
+    "node docs/media/src/make_token_bodies.mjs tree_sizes.txt crates/core/tests/redteam/recorded/poco-launcher-2026-10-20.xml bodies claude-opus-5-5",
+    "POST each file in bodies/ to https://api.anthropic.com/v1/messages/count_tokens with your own API key and read input_tokens",
+    "node --experimental-strip-types apps/mcp/scripts/count-tokens-ci.ts --emit-bodies bodies-tools (the tool lists, counted the same way)"
+  ]
+}
