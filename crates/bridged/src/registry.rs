@@ -223,6 +223,15 @@ impl Registry {
         self.lock().leases.get(device).map(|h| h.lease.clone())
     }
 
+    /// The lease on `device` when connection `conn` holds it (`None`: nobody, or someone else).
+    pub fn lease_held_by(&self, device: &str, conn: u64) -> Option<Lease> {
+        self.lock()
+            .leases
+            .get(device)
+            .filter(|h| h.conn == conn)
+            .map(|h| h.lease.clone())
+    }
+
     /// `Ok` when `conn` holds `device`; otherwise the current lease, if any.
     pub fn check_holder(&self, device: &str, conn: u64) -> Result<(), Option<Lease>> {
         match self.lock().leases.get(device) {

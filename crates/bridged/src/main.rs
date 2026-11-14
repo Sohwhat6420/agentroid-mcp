@@ -66,6 +66,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// Where the protected-device lease keeps a Deny's hold, in the state directory.
+const PROTECTED_HOLDS_FILE: &str = "protected-holds.json";
+
+/// The daemon's staged copy of the dump helper, in the state directory (pushed from here, never
+/// from the temp folder, when the protected-device lease is on).
+const DUMP_HELPER_STAGED: &str = "agentroid-dump.dex";
+
 /// Backend used when neither --fake nor --adb is given: no devices, so nothing can be leased or driven.
 struct NoDevices;
 
@@ -113,6 +120,20 @@ struct Args {
     audit_anchor_required: bool,
     /// `--ask-screen-state-dir`: where the screen lock reads ask-screen's leases.
     ask_screen_state_dir: Option<PathBuf>,
+    /// `--protected-lease`: the protected phone runs under a lease the owner allows (off by default).
+    protected_lease: bool,
+    protected_lease_min: Option<u64>,
+    protected_ask_window_min: Option<u64>,
+    /// `--presence-file` and `--presence-key-file`: the overnight rule's signed presence file.
+    presence_file: Option<PathBuf>,
+    presence_key_file: Option<PathBuf>,
+    presence_ttl_min: Option<u64>,
+}
+
+fn minutes(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, String> {
+    it.next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("{flag} needs a number of minutes"))
 }
 
 fn num(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u16, String> {
@@ -151,6 +172,12 @@ fn parse_args() -> Result<Args, String> {
         audit_anchor: None,
         audit_anchor_required: false,
         ask_screen_state_dir: None,
+        protected_lease: false,
+        protected_lease_min: None,
+        protected_ask_window_min: None,
+        presence_file: None,
+        presence_key_file: None,
+        presence_ttl_min: None,
     };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
@@ -212,6 +239,26 @@ fn parse_args() -> Result<Args, String> {
                 a.audit_anchor = Some(PathBuf::from(
                     it.next().ok_or("--audit-anchor needs a path")?,
                 ))
+            }
+            "--protected-lease" => a.protected_lease = true,
+            "--protected-lease-min" => {
+                a.protected_lease_min = Some(minutes(&mut it, "--protected-lease-min")?)
+            }
+            "--protected-ask-window-min" => {
+                a.protected_ask_window_min = Some(minutes(&mut it, "--protected-ask-window-min")?)
+            }
+            "--presence-file" => {
+                a.presence_file = Some(PathBuf::from(
+                    it.next().ok_or("--presence-file needs a path")?,
+                ))
+            }
+            "--presence-key-file" => {
+                a.presence_key_file = Some(PathBuf::from(
+                    it.next().ok_or("--presence-key-file needs a path")?,
+                ))
+            }
+            "--presence-ttl-min" => {
+                a.presence_ttl_min = Some(minutes(&mut it, "--presence-ttl-min")?)
             }
             "--audit-anchor-required" => a.audit_anchor_required = true,
             "--audit-anchor-best-effort" => a.audit_anchor_required = false,
@@ -363,6 +410,48 @@ fn bench_approve_refusal(args: &Args, allow: &[String]) -> Option<String> {
     None
 }
 
+/// Why `--protected-lease` (or one of its flags) must not start, or `None`. The lease needs the
+/// live transport and a real approval channel whose answers come on a topic of their own (so a
+/// process that reads the outbound push cannot answer it); the presence file and its key come as
+/// a pair.
+fn protected_lease_refusal(args: &Args) -> Option<String> {
+    let extras = args.protected_lease_min.is_some()
+        || args.protected_ask_window_min.is_some()
+        || args.presence_file.is_some()
+        || args.presence_key_file.is_some()
+        || args.presence_ttl_min.is_some();
+    if !args.protected_lease {
+        return extras.then(|| {
+            "--protected-lease-min, --protected-ask-window-min and the --presence-* flags need --protected-lease".into()
+        });
+    }
+    if args.adb.is_none() {
+        return Some("--protected-lease needs --adb (the live transport)".into());
+    }
+    if args.bench_approve {
+        return Some("--protected-lease never runs with --bench-approve".into());
+    }
+    let (Some(out), Some(inb)) = (&args.approval_topic_file, &args.approval_inbound_file) else {
+        return Some("--protected-lease needs an approval channel: --approval-topic-file and --approval-inbound-file (the answers on a topic of their own)".into());
+    };
+    let topic = |p: &Path| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    match (topic(out), topic(inb)) {
+        (Some(a), Some(b)) if !a.is_empty() && a != b => {}
+        (Some(_), Some(_)) => {
+            return Some("--protected-lease needs the inbound topic to differ from the outbound one (otherwise anything that reads the push could answer it)".into())
+        }
+        _ => return Some("--protected-lease: the approval topic files cannot be read".into()),
+    }
+    if args.presence_file.is_some() != args.presence_key_file.is_some() {
+        return Some("--presence-file and --presence-key-file come together".into());
+    }
+    None
+}
+
 #[cfg(any(windows, unix))]
 fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
     let registry = bridged::registry::Registry::open(args.state_dir.join("state.json"))
@@ -376,6 +465,15 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
         return Err("--allow-serial, --allow-file and --allow-emulators need --adb (the fake device has a fixed allowlist)".into());
     }
     let adb_path = args.adb.as_deref().map(resolve_adb);
+    if let Some(why) = protected_lease_refusal(args) {
+        return Err(why);
+    }
+    // the protected-device lease book, shared by core and the adb guard (one Allow, one lease)
+    let protected_book = args.protected_lease.then(|| {
+        std::sync::Arc::new(agentroid_adb_link::lease::LeaseBook::new(
+            std::sync::Arc::new(agentroid_adb_link::lease::SystemWallClock),
+        ))
+    });
     let backend: Box<dyn DeviceBackend> = if args.fake {
         Box::new(CoreBackend::new(Core::new(
             FakeDevice::new(),
@@ -386,10 +484,25 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
             &args.state_dir,
             &format!("live adb transport via {}", path.display()),
         );
-        let mut core = Core::new(
-            bridged::live::AdbTransport::new(GuardedRunner::new(AdbRunner::new(path))),
-            SystemClock::new(),
-        );
+        let runner = match &protected_book {
+            Some(book) => GuardedRunner::with_leases(AdbRunner::new(path), book.clone()),
+            None => GuardedRunner::new(AdbRunner::new(path)),
+        };
+        let mut transport = bridged::live::AdbTransport::new(runner);
+        if let Some(book) = &protected_book {
+            // the dump helper, staged in the state directory and checked by hash on the protected
+            // phone through its own single-purpose runner
+            let staged = args.state_dir.join(DUMP_HELPER_STAGED);
+            transport = transport.with_dump_helper(
+                Box::new(GuardedRunner::with_s24_helper(
+                    AdbRunner::new(path),
+                    staged.to_string_lossy().into_owned(),
+                    book.clone(),
+                )),
+                staged,
+            );
+        }
+        let mut core = Core::new(transport, SystemClock::new());
         // Nothing is allowed unless named: --allow-serial, the allow file, or --allow-emulators
         // (allowed() matches a hardware serial or an adb serial exactly, or the `adb-<serial>-` prefix of a wireless name; an emulator is `emulator-<port>`).
         let allow = bridged::allow::load(
@@ -468,6 +581,8 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
             Some(topic_file) => {
                 let mut cfg = agentroid_core::approval::NtfyConfig::new(topic_file.clone());
                 cfg.inbound_topic_file = args.approval_inbound_file.clone();
+                // the lease's answers must come on a topic of their own, checked on every send and poll
+                cfg.require_separate_inbound = args.protected_lease;
                 if let Some(b) = &args.ntfy_base {
                     cfg.base = b.trim_end_matches('/').to_string();
                 }
@@ -505,6 +620,37 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
             ),
         );
         bridged::live::install_screen_lock(&mut core, lock_dir, path);
+        if let Some(book) = &protected_book {
+            use agentroid_core::protected::{PresenceConfig, Protected, ProtectedConfig};
+            let presence = match (&args.presence_file, &args.presence_key_file) {
+                (Some(f), Some(k)) => Some(PresenceConfig::new(
+                    f,
+                    k,
+                    args.presence_ttl_min
+                        .unwrap_or(agentroid_core::protected::DEFAULT_PRESENCE_TTL_MIN),
+                )),
+                _ => None,
+            };
+            let cfg = ProtectedConfig::new(
+                args.protected_lease_min
+                    .unwrap_or(agentroid_adb_link::lease::DEFAULT_MINUTES),
+                args.protected_ask_window_min
+                    .unwrap_or(agentroid_core::protected::DEFAULT_ASK_WINDOW_MIN),
+                presence,
+            )
+            // a Deny's hold outlives a restart
+            .with_holds_file(args.state_dir.join(PROTECTED_HOLDS_FILE));
+            log(
+                &args.state_dir,
+                &format!(
+                    "protected-device lease: on ({} min leases, {} min to answer an ask, overnight rule {})",
+                    cfg.lease_ms / 60_000,
+                    cfg.ask_window_ms / 60_000,
+                    if cfg.presence.is_some() { "on (signed presence file)" } else { "off" }
+                ),
+            );
+            core.set_protected(Protected::new(cfg, book.clone()));
+        }
         Box::new(CoreBackend::new(core))
     } else {
         Box::new(NoDevices)
@@ -517,6 +663,9 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
     }
     let _ = &args.profiles; // the take-over needs care, which needs the live adb runner (not wired)
     let daemon = Daemon::with_jobs(registry, backend, Some(jobs));
+    if let Some(book) = protected_book {
+        daemon.attach_protected(book)?;
+    }
     // session stay-awake (bridged::awake): live adb only; read_only devices are refused by care,
     // except the protected phone's one exception (the two screen keys, nothing else) unless AGENTROID_NO_S24_AWAKE=1
     if let Some(path) = &adb_path {
@@ -684,4 +833,79 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
         log(&args.state_dir, "bridged stopped");
         r
     })
+}
+
+#[cfg(test)]
+mod protected_flag_tests {
+    use super::*;
+
+    fn args() -> Args {
+        let mut a = Args {
+            fake: false,
+            adb: Some("adb".into()),
+            allow_emulators: false,
+            allow_serials: vec![],
+            allow_file: None,
+            stop: false,
+            print_schema: None,
+            pipe: String::new(),
+            state_dir: PathBuf::new(),
+            link_bind: None,
+            link_lan: false,
+            link_port: 0,
+            view_dist: None,
+            view_port: 0,
+            profiles: None,
+            approval_topic_file: None,
+            approval_inbound_file: None,
+            ntfy_base: None,
+            bench_approve: false,
+            audit_anchor: None,
+            audit_anchor_required: false,
+            ask_screen_state_dir: None,
+            protected_lease: true,
+            protected_lease_min: None,
+            protected_ask_window_min: None,
+            presence_file: None,
+            presence_key_file: None,
+            presence_ttl_min: None,
+        };
+        a.protected_lease = true;
+        a
+    }
+
+    #[test]
+    fn the_protected_lease_needs_a_channel_whose_answers_come_on_their_own_topic() {
+        let d = std::env::temp_dir().join(format!("bridged-plp-flags-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (out, inb) = (d.join("out.topic"), d.join("in.topic"));
+        std::fs::write(&out, "agentroid-out-0123456789abcdef\n").unwrap();
+        std::fs::write(&inb, "agentroid-out-0123456789abcdef\n").unwrap();
+        let mut a = args();
+        assert!(protected_lease_refusal(&a)
+            .unwrap()
+            .contains("approval channel"));
+        a.approval_topic_file = Some(out.clone());
+        assert!(protected_lease_refusal(&a).is_some(), "no inbound file");
+        a.approval_inbound_file = Some(inb.clone());
+        assert!(protected_lease_refusal(&a).unwrap().contains("differ"));
+        std::fs::write(&inb, "agentroid-in-fedcba9876543210\n").unwrap();
+        assert_eq!(protected_lease_refusal(&a), None);
+        a.bench_approve = true;
+        assert!(protected_lease_refusal(&a).is_some());
+        a.bench_approve = false;
+        a.presence_file = Some(d.join("presence.json"));
+        assert!(protected_lease_refusal(&a).unwrap().contains("together"));
+        a.presence_key_file = Some(d.join("presence.key"));
+        assert_eq!(protected_lease_refusal(&a), None);
+        a.adb = None;
+        assert!(protected_lease_refusal(&a).is_some());
+        // off by default, and its flags alone do not turn it on
+        let mut off = args();
+        off.protected_lease = false;
+        assert_eq!(protected_lease_refusal(&off), None);
+        off.protected_lease_min = Some(5);
+        assert!(protected_lease_refusal(&off).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

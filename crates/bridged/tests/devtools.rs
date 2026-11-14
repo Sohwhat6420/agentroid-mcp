@@ -383,6 +383,13 @@ fn s24_answers_only_serial_and_the_approved_probes_through_diagnose() {
             "pm list packages",
             "getevent -pl",
             "getprop ro.serialno; id",
+            // the single-purpose reads of the screen lock and the dump helper: their own
+            // runners only, never doctor
+            agentroid_adb_link::guard::S24_CALL_STATE_READ,
+            // the screen lock's focused-app and keyboard reads (the owner's ruling, 14 Nov 2026)
+            agentroid_adb_link::guard::S24_FOCUS_READ,
+            agentroid_adb_link::guard::S24_KEYBOARD_READ,
+            agentroid_adb_link::guard::DUMP_HELPER_HASH_READ,
         ] {
             for _ in 0..10 {
                 assert_eq!(code(&c.diagnose(S24, cmd).await), REFUSED, "{cmd}");

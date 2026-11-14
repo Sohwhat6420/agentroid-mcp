@@ -282,7 +282,7 @@ Refs: each clickable line of a tree ends in a ref (r3fa91c) that stays the same 
 
 Result size: level digest (default) gives a short text, default gives more, full gives everything. Ask for more only when the digest is not enough. pixel_probe and look's element/ocr are not implemented yet; set_value sets text fields only.
 
-Device modes: full allows everything; helper allows only gestures, keys and typing; read_only answers reads only (look, ui_tree, list_apps, getprop, doctor, wait). A refusal is an error that quotes the daemon's reason. Do not retry it or look for a way round it. A device on the protected list answers only a fixed set of reads (a few getprop keys), whatever the mode.
+Device modes: full allows everything; helper allows only gestures, keys and typing; read_only answers reads only (look, ui_tree, list_apps, getprop, doctor, wait). A refusal is an error that quotes the daemon's reason. Do not retry it or look for a way round it, with one exception: a device on the protected list acts only under its owner's approval lease, and a lease:pending refusal means the owner has been asked; wait for his Allow, then retry the same call.
 
 doctor takes read-only commands from an allowlist (dumpsys <service> with no arguments for a few services, getprop, settings get, pm list and similar). Anything that changes state is refused.
 

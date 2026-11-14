@@ -38,6 +38,19 @@ pub const MAX_EARLY_MS: u64 = 60_000;
 /// How many inbound event ids and resolved request ids are remembered.
 pub const SEEN_MAX: usize = 500;
 
+/// What kind of push a [`Request`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Style {
+    /// One action that needs a yes (D3b): Allow and Deny.
+    #[default]
+    Action,
+    /// A protected-device lease ask: the `reason` is the whole question; Allow and Deny.
+    Lease,
+    /// Information only (an overnight lease was opened): the `reason` says what happened; Deny
+    /// only, which ends the lease.
+    Notice,
+}
+
 /// What the human is asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -51,11 +64,32 @@ pub struct Request {
     pub target: String,
     pub created_ms: u64,
     pub expires_ms: u64,
+    pub style: Style,
+    /// Sent at low priority (2), so it waits quietly in the shade: the protected-device lease's
+    /// ask after an overnight lease ended on an unreadable presence file.
+    pub quiet: bool,
 }
 
 impl Request {
     /// The push text: what the agent wants to do, in one line, with no typed text.
     pub fn message(&self) -> String {
+        match self.style {
+            Style::Action => {}
+            Style::Lease => {
+                return format!(
+                    "{}\nAnswer within {} min; no answer = denied. Request {}",
+                    self.reason,
+                    (self.expires_ms.saturating_sub(self.created_ms)).div_ceil(60_000),
+                    self.id
+                )
+            }
+            Style::Notice => {
+                return format!(
+                    "{}\nTap Deny (or reply `deny {}`) to end it.",
+                    self.reason, self.id
+                )
+            }
+        }
         let mut m = format!(
             "{} on {}{}: {}",
             self.tool,
@@ -262,7 +296,133 @@ impl Approver {
             target: target.chars().take(120).collect(),
             created_ms: now_ms,
             expires_ms: now_ms + self.expiry_ms,
+            style: Style::Action,
+            quiet: false,
         }
+    }
+
+    /// Send an ask WITHOUT waiting (the protected-device lease's background ask): the caller keeps
+    /// the request and calls [`Approver::check`] on later calls. `Err`: the channel cannot carry it.
+    pub fn send(&mut self, req: &Request) -> Result<(), String> {
+        self.channel.send(req)
+    }
+
+    /// One look at an ask sent with [`Approver::send`]: `Some` once it is answered (the same strict
+    /// grammar and one-shot rules as [`Approver::ask`]) or its window has closed at `now_ms`
+    /// (`Expired`); `None` while it is still open, including when the channel cannot be read just
+    /// now. The channel is read first even once the window has closed (review round 4, item 3):
+    /// an answer DATED inside the window counts however late the caller looks, and once the
+    /// window has closed only one dated no later than its end does (no grace at all). A channel
+    /// that cannot be read is `None` even after the window has closed, so an Allow tapped in time
+    /// is not lost to a failed read: the next call reads again (review round 4e, L2). So `None`
+    /// at or after `req.expires_ms` means only that the channel could not be read: a caller must
+    /// not call that ask "still open" (review round 4f, item 5).
+    pub fn check(&mut self, req: &Request, now_ms: u64) -> Option<Outcome> {
+        if self.resolved_set.contains(&req.id) {
+            return Some(Outcome::Expired);
+        }
+        let closed = now_ms >= req.expires_ms;
+        let Ok(events) = self.channel.poll(req) else {
+            return None;
+        };
+        for ev in &events {
+            if closed && ev.time_ms > req.expires_ms {
+                continue;
+            }
+            if let Some(a) = self.judge(req, ev) {
+                remember(&mut self.resolved, &mut self.resolved_set, &req.id);
+                return Some(match a {
+                    Answer::Allow => Outcome::Approved {
+                        event_id: ev.event_id.clone(),
+                    },
+                    Answer::Deny => Outcome::Denied {
+                        event_id: ev.event_id.clone(),
+                    },
+                });
+            }
+        }
+        if closed {
+            remember(&mut self.resolved, &mut self.resolved_set, &req.id);
+            return Some(Outcome::Expired);
+        }
+        None
+    }
+
+    /// Has a fresh, exact `deny <req.id>` arrived since the ask was made (even after it was
+    /// approved, or long after its window)? The open lease behind `req` ends on one. Each Deny
+    /// counts once (its event id is remembered), so a lease re-allowed after a Deny is not closed
+    /// again by the same Deny. `Ok(Some(event id))` on one, so the caller can keep it across a
+    /// restart ([`Approver::mark_seen`]). `Err`: the channel could not be read, which the caller
+    /// must not take for "no deny".
+    pub fn poll_deny(&mut self, req: &Request) -> Result<Option<String>, String> {
+        Ok(self
+            .poll_denies(std::slice::from_ref(req))?
+            .map(|(_, ev)| ev))
+    }
+
+    /// [`Approver::poll_deny`] for several asks at once, in one read of the channel (from the
+    /// oldest ask's creation, so every later event is in it): the first fresh, exact `deny <id>`
+    /// for any of them, dated no earlier than [`MAX_EARLY_MS`] before that ask was made, as
+    /// `(index into reqs, event id)`. Only that event is marked used. `Ok(None)` with no asks.
+    pub fn poll_denies(&mut self, reqs: &[Request]) -> Result<Option<(usize, String)>, String> {
+        let Some(oldest) = reqs.iter().min_by_key(|r| r.created_ms) else {
+            return Ok(None);
+        };
+        let events = self.channel.poll(oldest)?;
+        for ev in &events {
+            if ev.event_id.is_empty()
+                || ev.event_id.len() > 64
+                || self.seen_set.contains(&ev.event_id)
+            {
+                continue;
+            }
+            let Some((Answer::Deny, id)) = parse_answer(&ev.message) else {
+                continue;
+            };
+            let hit = reqs
+                .iter()
+                .position(|r| r.id == id && ev.time_ms + MAX_EARLY_MS >= r.created_ms);
+            if let Some(i) = hit {
+                remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
+                return Ok(Some((i, ev.event_id.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Mark answer events as used already (the protected-device lease's Deny events, kept in its
+    /// holds file): after a restart an old Deny never counts again.
+    pub fn mark_seen(&mut self, event_ids: &[String]) {
+        for id in event_ids {
+            if !id.is_empty() && id.len() <= 64 {
+                remember(&mut self.seen_events, &mut self.seen_set, id);
+            }
+        }
+    }
+
+    /// The explicit re-allow after a Deny: a fresh `allow <req.id>` (an event id never applied
+    /// before) dated after `after_ms`, the time of the Deny, and no later than `until_ms` (the end
+    /// of the ask window after it). `req` is resolved already, so [`Approver::check`] would ignore
+    /// it; this is the one way back. `Some(event id)` on one.
+    pub fn reallowed(&mut self, req: &Request, after_ms: u64, until_ms: u64) -> Option<String> {
+        let events = self.channel.poll(req).ok()?;
+        for ev in &events {
+            if ev.event_id.is_empty()
+                || ev.event_id.len() > 64
+                || self.seen_set.contains(&ev.event_id)
+            {
+                continue;
+            }
+            // only the one event used is marked seen: others may answer other asks
+            if ev.time_ms > after_ms
+                && ev.time_ms <= until_ms
+                && parse_answer(&ev.message) == Some((Answer::Allow, req.id.clone()))
+            {
+                remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
+                return Some(ev.event_id.clone());
+            }
+        }
+        None
     }
 
     /// Judge one inbound event against an open request: `Some(answer)` only for a fresh event that
@@ -272,16 +432,24 @@ impl Approver {
         {
             return None;
         }
-        remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
         let (answer, id) = parse_answer(&ev.message)?;
         if id != req.id || self.resolved_set.contains(&id) {
             return None;
         }
-        // a replay from before the ask, or an event dated after the window: not an answer
-        if ev.time_ms + MAX_EARLY_MS < req.created_ms || ev.time_ms > req.expires_ms + MAX_EARLY_MS
-        {
+        // a replay from before the ask, or an event dated after the window: not an answer. A
+        // protected-device lease ask is strict about its end (review round 3, item 9): an Allow
+        // dated after its window never opens the phone, whatever the clocks say
+        let late_ms = if req.style == Style::Lease {
+            0
+        } else {
+            MAX_EARLY_MS
+        };
+        if ev.time_ms + MAX_EARLY_MS < req.created_ms || ev.time_ms > req.expires_ms + late_ms {
             return None;
         }
+        // only the event that answers this request is used up: any other (a Deny of an open
+        // protected-device lease, an answer to another ask) stays for the one it names
+        remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
         Some(answer)
     }
 
@@ -476,6 +644,10 @@ pub struct NtfyConfig {
     /// deny-all`), so a short topic name such as `alerts` is safe. Only with `token_file` set, and
     /// never for ntfy.sh, where anyone may read an unreserved topic.
     pub login_topics: bool,
+    /// The answers must come on their own topic (`inbound_topic_file` set, naming a topic other than
+    /// the outbound one). Set when the protected-device lease is on: a process that can read the
+    /// outbound push (and so the request id) cannot then post `allow <id>` to the same topic.
+    pub require_separate_inbound: bool,
 }
 
 impl NtfyConfig {
@@ -489,6 +661,7 @@ impl NtfyConfig {
             tap_token_file: None,
             tap_base: None,
             login_topics: false,
+            require_separate_inbound: false,
         }
     }
 }
@@ -519,6 +692,11 @@ impl<H: Http> NtfyChannel<H> {
             Some(p) => read_topic_for(p, login)?,
             None => out.clone(),
         };
+        if self.cfg.require_separate_inbound && inb == out {
+            return Err(
+                "the answers must come on their own topic (--approval-inbound-file naming a topic other than the outbound one)".into(),
+            );
+        }
         Ok((out, inb))
     }
 
@@ -571,13 +749,20 @@ impl<H: Http> NtfyChannel<H> {
             }
             b
         };
+        // a notice (an overnight lease was opened) offers only Deny, which ends it
+        let actions = if req.style == Style::Notice {
+            vec![button("Deny", "deny")]
+        } else {
+            vec![button("Allow", "allow"), button("Deny", "deny")]
+        };
         serde_json::json!({
             "topic": topic,
             "title": self.cfg.title,
             "message": req.message(),
-            "priority": 4,
+            // a notice needs no answer: it arrives quietly (ntfy 2 = low), an ask at 4 (high)
+            "priority": if req.style == Style::Notice || req.quiet { 2 } else { 4 },
             "tags": ["lock"],
-            "actions": [button("Allow", "allow"), button("Deny", "deny")]
+            "actions": actions
         })
         .to_string()
     }
@@ -1259,6 +1444,299 @@ mod tests {
     }
 
     #[test]
+    fn the_lease_channel_refuses_answers_on_the_outbound_topic() {
+        let d = tmp("ntfy-separate");
+        let out = d.join("out.key");
+        let inb = d.join("in.key");
+        std::fs::write(&out, "agentroid-outbound-0123456789abcdef\n").unwrap();
+        std::fs::write(&inb, "agentroid-outbound-0123456789abcdef\n").unwrap();
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let r = req(&mut a, 1_700_000_000_000);
+        let rec = || RecHttp {
+            posts: vec![],
+            gets: vec![],
+            reply: String::new(),
+        };
+        let mut cfg = NtfyConfig::new(&out);
+        cfg.require_separate_inbound = true;
+        // no inbound file: the answers would come on the outbound topic
+        let mut ch = NtfyChannel::new(cfg.clone(), rec());
+        assert!(ch.send(&r).unwrap_err().contains("own topic"));
+        assert!(ch.poll(&r).is_err());
+        assert!(ch.http.posts.is_empty() && ch.http.gets.is_empty());
+        // an inbound file naming the same topic
+        cfg.inbound_topic_file = Some(inb.clone());
+        let mut ch = NtfyChannel::new(cfg.clone(), rec());
+        assert!(ch.send(&r).is_err());
+        // a topic of its own
+        std::fs::write(&inb, "agentroid-inbound-fedcba9876543210xx\n").unwrap();
+        let mut ch = NtfyChannel::new(cfg, rec());
+        assert!(ch.send(&r).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_notice_offers_only_deny_and_a_lease_ask_counts_minutes() {
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let mut r = req(&mut a, 1_700_000_000_000);
+        r.style = Style::Notice;
+        r.reason = "A lease opened".into();
+        let ch = NtfyChannel::new(
+            NtfyConfig::new("unused"),
+            RecHttp {
+                posts: vec![],
+                gets: vec![],
+                reply: String::new(),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
+        let acts = v["actions"].as_array().unwrap();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0]["body"], format!("deny {}", r.id));
+        r.style = Style::Lease;
+        r.expires_ms = r.created_ms + 600_000;
+        assert!(r.message().contains("within 10 min"));
+    }
+
+    /// Review round 2, item 2: an ask judged while a lease is open must not use up the lease's
+    /// Deny. The same Deny, with and without a concurrent ask, ends the lease either way.
+    #[test]
+    fn a_concurrent_ask_never_swallows_another_requests_deny() {
+        for concurrent in [false, true] {
+            let ch = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Inbound>::new()));
+            struct Shared(std::sync::Arc<std::sync::Mutex<Vec<Inbound>>>);
+            impl Channel for Shared {
+                fn name(&self) -> &'static str {
+                    "shared"
+                }
+                fn send(&mut self, _: &Request) -> Result<(), String> {
+                    Ok(())
+                }
+                fn poll(&mut self, _: &Request) -> Result<Vec<Inbound>, String> {
+                    Ok(self.0.lock().unwrap().clone())
+                }
+            }
+            let mut a = Approver::new(Box::new(Shared(ch.clone())));
+            let t0 = 1_700_000_000_000u64;
+            let lease = req(&mut a, t0);
+            ch.lock().unwrap().push(Inbound {
+                event_id: "e1".into(),
+                time_ms: t0 + 5,
+                message: format!("allow {}", lease.id),
+            });
+            assert!(matches!(
+                a.check(&lease, t0 + 6),
+                Some(Outcome::Approved { .. })
+            ));
+            ch.lock().unwrap().push(Inbound {
+                event_id: "e2".into(),
+                time_ms: t0 + 20,
+                message: format!("deny {}", lease.id),
+            });
+            if concurrent {
+                // another ask is checked first: it sees the lease's Deny, which is not its answer
+                let other = req(&mut a, t0 + 10);
+                assert_eq!(a.check(&other, t0 + 21), None, "{concurrent}");
+            }
+            assert_eq!(
+                a.poll_deny(&lease),
+                Ok(Some("e2".to_string())),
+                "concurrent ask: {concurrent}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_is_sent_quietly_and_an_ask_loudly() {
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let mut r = req(&mut a, 1_700_000_000_000);
+        let ch = NtfyChannel::new(
+            NtfyConfig::new("unused"),
+            RecHttp {
+                posts: vec![],
+                gets: vec![],
+                reply: String::new(),
+            },
+        );
+        for (style, want) in [(Style::Notice, 2), (Style::Lease, 4), (Style::Action, 4)] {
+            r.style = style;
+            let v: serde_json::Value =
+                serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
+            assert_eq!(v["priority"], want, "{style:?}");
+        }
+        // review round 4, item 5: a quiet ask goes at low priority
+        r.style = Style::Lease;
+        r.quiet = true;
+        let v: serde_json::Value = serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
+        assert_eq!(v["priority"], 2);
+    }
+
+    #[test]
+    fn a_background_ask_is_checked_without_waiting_and_a_deny_poll_error_is_an_error() {
+        let ch = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Inbound>::new()));
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Shared(
+            std::sync::Arc<std::sync::Mutex<Vec<Inbound>>>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        );
+        impl Channel for Shared {
+            fn name(&self) -> &'static str {
+                "shared"
+            }
+            fn send(&mut self, _: &Request) -> Result<(), String> {
+                Ok(())
+            }
+            fn poll(&mut self, _: &Request) -> Result<Vec<Inbound>, String> {
+                if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("network down".into());
+                }
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+        let mut a = Approver::new(Box::new(Shared(ch.clone(), fail.clone())));
+        let t0 = 1_700_000_000_000u64;
+        let r = req(&mut a, t0);
+        a.send(&r).unwrap();
+        assert_eq!(a.check(&r, t0 + 1), None, "open, no answer");
+        let ev = |id: &str, at: u64, msg: String| Inbound {
+            event_id: id.into(),
+            time_ms: at,
+            message: msg,
+        };
+        ch.lock()
+            .unwrap()
+            .push(ev("e1", t0 + 5, format!("allow {}", r.id)));
+        assert!(matches!(
+            a.check(&r, t0 + 6),
+            Some(Outcome::Approved { .. })
+        ));
+        assert_eq!(a.poll_deny(&r), Ok(None));
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            a.poll_deny(&r).is_err(),
+            "an unreadable channel is not 'no deny'"
+        );
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        ch.lock()
+            .unwrap()
+            .push(ev("e2", t0 + 50, format!("deny {}", r.id)));
+        assert_eq!(a.poll_deny(&r), Ok(Some("e2".to_string())));
+        assert_eq!(a.poll_deny(&r), Ok(None), "a Deny counts once");
+        // review round 3, item 8: a Deny kept across a restart counts as used in a new approver
+        let mut b = Approver::new(Box::new(Shared(ch.clone(), fail.clone())));
+        b.mark_seen(&[String::new(), "x".repeat(65)]);
+        assert_eq!(
+            b.poll_deny(&r),
+            Ok(Some("e2".to_string())),
+            "not marked yet"
+        );
+        let mut b = Approver::new(Box::new(Shared(ch.clone(), fail.clone())));
+        b.mark_seen(&["e2".to_string()]);
+        assert_eq!(b.poll_deny(&r), Ok(None), "the old Deny was kept");
+        // re-allow: only a fresh allow dated after the deny
+        assert_eq!(
+            a.reallowed(&r, t0 + 50, u64::MAX),
+            None,
+            "the old allow was used"
+        );
+        ch.lock()
+            .unwrap()
+            .push(ev("e3", t0 + 40, format!("allow {}", r.id)));
+        assert_eq!(
+            a.reallowed(&r, t0 + 50, u64::MAX),
+            None,
+            "dated before the deny"
+        );
+        ch.lock()
+            .unwrap()
+            .push(ev("e4", t0 + 60, format!("allow {}", r.id)));
+        assert_eq!(
+            a.reallowed(&r, t0 + 50, t0 + 59),
+            None,
+            "dated after the ask window that followed the deny"
+        );
+        assert_eq!(a.reallowed(&r, t0 + 50, t0 + 60).as_deref(), Some("e4"));
+        assert_eq!(a.reallowed(&r, t0 + 50, u64::MAX), None, "one shot");
+        // review round 4, item 3: once its window has closed, a checked ask still takes an answer
+        // DATED inside it (with no grace after it), and is expired otherwise, for good
+        let mut r2 = req(&mut a, t0);
+        r2.style = Style::Lease;
+        ch.lock()
+            .unwrap()
+            .push(ev("e5", r2.expires_ms + 1, format!("allow {}", r2.id)));
+        assert_eq!(
+            a.check(&r2, r2.expires_ms + 5_000),
+            Some(Outcome::Expired),
+            "dated after the window"
+        );
+        assert_eq!(a.check(&r2, t0 + 11), Some(Outcome::Expired), "resolved");
+        let r3 = req(&mut a, t0);
+        ch.lock()
+            .unwrap()
+            .push(ev("e6", r3.expires_ms + 1, format!("allow {}", r3.id)));
+        assert_eq!(
+            a.check(&r3, r3.expires_ms + 5_000),
+            Some(Outcome::Expired),
+            "no grace once the window has closed, whatever the style"
+        );
+        let r4 = req(&mut a, t0);
+        ch.lock()
+            .unwrap()
+            .push(ev("e7", r4.expires_ms, format!("allow {}", r4.id)));
+        assert_eq!(
+            a.check(&r4, r4.expires_ms + 60 * 60_000),
+            Some(Outcome::Approved {
+                event_id: "e7".into()
+            }),
+            "tapped in time, looked at late"
+        );
+        // review round 4e, L2: a channel that cannot be read is no answer, open or closed, so an
+        // Allow dated in time is found once a read works; then a closed ask with none is expired
+        let r5 = req(&mut a, t0);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.check(&r5, r5.expires_ms - 1), None, "open: try again");
+        assert_eq!(a.check(&r5, r5.expires_ms), None, "closed: still try again");
+        assert_eq!(a.check(&r5, r5.expires_ms + 60_000), None);
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        ch.lock()
+            .unwrap()
+            .push(ev("e7b", r5.expires_ms - 2, format!("allow {}", r5.id)));
+        assert_eq!(
+            a.check(&r5, r5.expires_ms + 90_000),
+            Some(Outcome::Approved {
+                event_id: "e7b".into()
+            }),
+            "the Allow tapped in time is not lost to the failed reads"
+        );
+        let r5b = req(&mut a, t0);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.check(&r5b, r5b.expires_ms), None);
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.check(&r5b, r5b.expires_ms), Some(Outcome::Expired));
+        // several asks in one read: the first Deny on any of them, and only that event is used
+        let (p1, p2) = (req(&mut a, t0 + 100), req(&mut a, t0 + 200));
+        ch.lock()
+            .unwrap()
+            .push(ev("e8", t0 + 300, format!("deny {}", p2.id)));
+        ch.lock()
+            .unwrap()
+            .push(ev("e9", t0 + 300, format!("deny {}", p1.id)));
+        let both = [p1.clone(), p2.clone()];
+        assert_eq!(a.poll_denies(&both), Ok(Some((1, "e8".to_string()))));
+        assert_eq!(a.poll_denies(&both), Ok(Some((0, "e9".to_string()))));
+        assert_eq!(a.poll_denies(&both), Ok(None));
+        assert_eq!(a.poll_denies(&[]), Ok(None));
+        // a Deny dated more than a minute before the ask it names is a replay
+        let p3 = req(&mut a, t0 + 10 * 60_000);
+        ch.lock().unwrap().push(ev(
+            "e10",
+            t0 + 10 * 60_000 - 60_001,
+            format!("deny {}", p3.id),
+        ));
+        assert_eq!(a.poll_denies(&[p1, p3]), Ok(None));
+    }
+
+    #[test]
     fn a_missing_or_malformed_topic_file_makes_ntfy_unavailable() {
         let d = tmp("ntfy-missing");
         let http = RecHttp {
@@ -1614,5 +2092,40 @@ mod tests {
         })]);
         assert!(none.send(&r).is_err());
         assert!(AnyChannel::new(vec![]).send(&r).is_err());
+    }
+
+    /// Review round 3, item 9: a protected-device lease ask takes no Allow dated after its window,
+    /// even one seen while the window is still open by the daemon's clock; other asks keep the
+    /// one-minute allowance for a phone's clock running ahead.
+    #[test]
+    fn a_lease_ask_takes_no_allow_dated_after_its_window() {
+        for (style, late, want) in [
+            (Style::Lease, 0, true),
+            (Style::Lease, 1, false),
+            (Style::Lease, MAX_EARLY_MS, false),
+            (Style::Action, 1, true),
+            (Style::Action, MAX_EARLY_MS, true),
+            (Style::Action, MAX_EARLY_MS + 1, false),
+        ] {
+            let mut a = Approver::new(Box::new(FakeChannel {
+                answer_with: Some(Box::new(move |r: &Request, _| {
+                    vec![Inbound {
+                        event_id: "e1".into(),
+                        time_ms: r.expires_ms + late,
+                        message: format!("allow {}", r.id),
+                    }]
+                })),
+                ..FakeChannel::default()
+            }));
+            let t0 = 1_700_000_000_000u64;
+            let mut r = req(&mut a, t0);
+            r.style = style;
+            let got = a.check(&r, t0 + 1);
+            assert_eq!(
+                matches!(got, Some(Outcome::Approved { .. })),
+                want,
+                "{style:?} +{late}: {got:?}"
+            );
+        }
     }
 }

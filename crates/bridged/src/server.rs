@@ -161,6 +161,18 @@ pub trait DeviceBackend: Send {
     /// The work `ticket` names ([`DeviceBackend::lock_admit_segment`], or a shell line through
     /// [`DeviceBackend::shell_gate`]) has run: its end is the agent's own activity. Default: none.
     fn lock_done(&mut self, _ticket: LockTicket) {}
+    /// Is the protected-device lease on (`--protected-lease`)? Default: no.
+    fn protected_lease_on(&self) -> bool {
+        false
+    }
+    /// How core learns who holds the protected phone (the daemon's registry). Default: no lease.
+    fn set_protected_holders(&mut self, _f: agentroid_core::protected::HolderFn) {}
+    /// A job under daemon lease `epoch` started (`Some(run id)`) or ended (`None`): named on the
+    /// protected phone's asks and lease. Default: none.
+    fn protected_job(&mut self, _epoch: u64, _job: Option<String>) {}
+    /// Write the protected-device leases that closed outside core (released, connection gone, run
+    /// out) to the audit log now. Default: none.
+    fn protected_audit_closes(&mut self) {}
 }
 
 /// Why a backend without the phone half answers `pixel_probe` and element crops with an error.
@@ -279,6 +291,22 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
     fn lock_done(&mut self, ticket: LockTicket) {
         self.core.lock_done(ticket);
     }
+    fn protected_lease_on(&self) -> bool {
+        self.core.protected().is_some()
+    }
+    fn set_protected_holders(&mut self, f: agentroid_core::protected::HolderFn) {
+        if let Some(p) = self.core.protected_mut() {
+            p.set_holders(f);
+        }
+    }
+    fn protected_job(&mut self, epoch: u64, job: Option<String>) {
+        if let Some(p) = self.core.protected_mut() {
+            p.set_job(epoch, job);
+        }
+    }
+    fn protected_audit_closes(&mut self) {
+        self.core.protected_audit_closes("lease.release");
+    }
 }
 
 pub struct Daemon {
@@ -300,6 +328,9 @@ pub struct Daemon {
     pub(crate) files_dir: OnceLock<PathBuf>,
     /// Session stay-awake (`crate::awake`), once attached (live adb only).
     pub(crate) awake: OnceLock<Arc<crate::awake::SessionAwake>>,
+    /// The protected-device lease book, once attached: a connection that goes, or a release of
+    /// the protected phone, closes the lease it holds.
+    pub(crate) protected_book: OnceLock<Arc<agentroid_adb_link::lease::LeaseBook>>,
     /// The `Arc` this daemon lives in, so a job thread can own a handle to it.
     me: Weak<Daemon>,
 }
@@ -347,6 +378,50 @@ impl Conn {
     }
 }
 
+thread_local! {
+    /// The connection (and, for a job, the daemon-lease epoch it runs under) whose call this thread
+    /// is serving: the protected-device lease is admitted for that caller's own lease, never for
+    /// whoever holds the device in the registry at the time.
+    static CALLER: std::cell::Cell<Option<(u64, Option<u64>)>> = const { std::cell::Cell::new(None) };
+}
+
+/// While this lives, calls on this thread are made for connection `conn` (and daemon-lease
+/// `epoch`, when given). Dropping it restores the caller before it.
+pub(crate) struct CallerScope(Option<(u64, Option<u64>)>);
+
+pub(crate) fn caller_scope(conn: u64, epoch: Option<u64>) -> CallerScope {
+    CallerScope(CALLER.with(|c| c.replace(Some((conn, epoch)))))
+}
+
+impl Drop for CallerScope {
+    fn drop(&mut self) {
+        CALLER.with(|c| c.set(self.0));
+    }
+}
+
+/// The caller this thread is serving, if any.
+pub(crate) fn caller() -> Option<(u64, Option<u64>)> {
+    CALLER.with(std::cell::Cell::get)
+}
+
+/// The protected-device lease's holder for a call on device `key`: the caller's own daemon lease
+/// (`conn`, and `epoch` when a job gives one), only while it is the current grant of that device.
+pub(crate) fn caller_holder(
+    registry: &Registry,
+    key: &str,
+    caller: Option<(u64, Option<u64>)>,
+) -> Option<agentroid_adb_link::lease::Holder> {
+    let (conn, epoch) = caller?;
+    let l = registry.lease_held_by(key, conn)?;
+    if epoch.is_some_and(|e| e != l.epoch) {
+        return None;
+    }
+    Some(agentroid_adb_link::lease::Holder {
+        name: l.holder,
+        epoch: l.epoch,
+    })
+}
+
 /// Releases a connection's leases however its task ends (EOF, broken pipe, abort, panic).
 struct ConnGuard<'a> {
     daemon: &'a Daemon,
@@ -355,7 +430,20 @@ struct ConnGuard<'a> {
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
-        self.daemon.registry.release_conn(self.id);
+        let released = self.daemon.registry.release_conn(self.id);
+        // its protected-device lease goes with it (the book alone: no backend lock in a drop)
+        if let Some(book) = self.daemon.protected_book.get() {
+            let mut closed = false;
+            for l in &released {
+                closed |= book.close_epoch(l.epoch, "connection closed").is_some();
+            }
+            // logged now when the backend is free (never waited for in a drop), else at the next call
+            if closed {
+                if let Ok(mut b) = self.daemon.backend.try_lock() {
+                    b.protected_audit_closes();
+                }
+            }
+        }
         if let Some(a) = self.daemon.awake.get() {
             // the restore talks to the phone: queued on stay-awake's worker, after this session's hold
             a.leave_later(self.id);
@@ -413,8 +501,26 @@ impl Daemon {
             waits: OnceLock::new(),
             files_dir: OnceLock::new(),
             awake: OnceLock::new(),
+            protected_book: OnceLock::new(),
             me: me.clone(),
         })
+    }
+
+    /// Attach the protected-device lease (once): core learns from this daemon's registry who
+    /// holds the protected phone, and the lease closes with its holder's connection or release.
+    pub fn attach_protected(
+        &self,
+        book: Arc<agentroid_adb_link::lease::LeaseBook>,
+    ) -> Result<(), String> {
+        self.protected_book
+            .set(book)
+            .map_err(|_| "the protected-device lease is already attached".to_string())?;
+        let registry = self.registry.clone();
+        // the caller's own connection (and a job's epoch), never the registry's holder of the moment
+        self.backend().set_protected_holders(Box::new(move |d| {
+            caller_holder(&registry, &device_key(d), caller())
+        }));
+        Ok(())
     }
 
     /// Start the link hub and attach it (once). Its epochs come from this daemon's registry.
@@ -733,8 +839,17 @@ impl Daemon {
                     .resolve(&p.device)
                     .map(|d| device_key(&d))
                     .unwrap_or(p.device);
+                let epoch = self.registry.lease_of(&key).map(|l| l.epoch);
                 match self.registry.release(&key, conn.id) {
-                    ReleaseOutcome::Released => to_value(&LeaseReleaseResult { released: true }),
+                    ReleaseOutcome::Released => {
+                        if let (Some(book), Some(e)) = (self.protected_book.get(), epoch) {
+                            if book.close_epoch(e, "released").is_some() {
+                                // audited now, not at the next call
+                                self.backend().protected_audit_closes();
+                            }
+                        }
+                        to_value(&LeaseReleaseResult { released: true })
+                    }
                     ReleaseOutcome::NotLeased => to_value(&LeaseReleaseResult { released: false }),
                     ReleaseOutcome::NotHolder(l) => Err(RpcError::new(
                         NOT_HOLDER,
@@ -955,5 +1070,37 @@ mod tests {
             !may_lease(&dev("DEVICE0000EXAMPLE"), false),
             "an unlisted phone is refused"
         );
+    }
+
+    #[test]
+    fn the_protected_holder_is_the_caller_s_own_lease_never_the_registry_s() {
+        let reg = Registry::in_memory();
+        let key = "PROTECTED0000EXAMPLE";
+        let l = reg.acquire(key, 7, "lane-a").unwrap();
+        // the holder's own call, and its job under the same grant
+        let own = caller_holder(&reg, key, Some((7, None))).unwrap();
+        assert_eq!((own.name.as_str(), own.epoch), ("lane-a", l.epoch));
+        assert!(caller_holder(&reg, key, Some((7, Some(l.epoch)))).is_some());
+        // another connection, no caller at all, or a job from an earlier grant: no holder
+        assert!(caller_holder(&reg, key, Some((8, None))).is_none());
+        assert!(caller_holder(&reg, key, None).is_none());
+        assert!(caller_holder(&reg, key, Some((7, Some(l.epoch + 1)))).is_none());
+        // released and taken again: the old grant's job is not the new one's
+        reg.release(key, 7);
+        let again = reg.acquire(key, 7, "lane-a").unwrap();
+        assert_ne!(again.epoch, l.epoch);
+        assert!(caller_holder(&reg, key, Some((7, Some(l.epoch)))).is_none());
+        // the scope names the caller only while it lives, and restores the one before
+        assert_eq!(caller(), None);
+        {
+            let _a = caller_scope(7, None);
+            assert_eq!(caller(), Some((7, None)));
+            {
+                let _b = caller_scope(9, Some(3));
+                assert_eq!(caller(), Some((9, Some(3))));
+            }
+            assert_eq!(caller(), Some((7, None)));
+        }
+        assert_eq!(caller(), None);
     }
 }

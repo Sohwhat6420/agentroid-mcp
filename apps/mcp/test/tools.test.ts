@@ -99,7 +99,9 @@ test("three response levels, digest first", () => {
 
 test("instructions mention the header, the protected-list rule and the 110 s limit", () => {
   assert.match(INSTRUCTIONS, /focus_changed/);
-  assert.match(INSTRUCTIONS, /device on the protected list answers only a fixed set of reads/);
+  assert.match(INSTRUCTIONS, /device on the protected list acts only under its owner's approval lease/);
+  assert.match(INSTRUCTIONS, /lease:pending refusal means the owner has been asked; wait for his Allow, then retry the same call/);
+  assert.doesNotMatch(INSTRUCTIONS, /fixed set of reads/);
   assert.match(INSTRUCTIONS, /110 seconds/);
 });
 

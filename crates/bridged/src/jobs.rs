@@ -855,6 +855,8 @@ fn run_thread(daemon: Arc<Daemon>, job: Arc<Job>, conn: u64, resume: Option<Resu
         .registry
         .lease_of(&job.meta.device)
         .map_or(0, |l| l.epoch);
+    // the protected-device lease: this job's connection and the epoch it started under, only
+    let _caller = crate::server::caller_scope(conn, Some(epoch));
     // care (2.13) and take-over (2.15): leases first, before any step
     let care = match job_care(&daemon, &job, cfg) {
         Ok(c) => c,
@@ -891,6 +893,10 @@ fn run_thread(daemon: Arc<Daemon>, job: Arc<Job>, conn: u64, resume: Option<Resu
     opts.start_unix_ms = unix_ms().saturating_sub(resume.as_ref().map_or(0, |r| r.from.elapsed_ms));
     let rules = Rulebook::seeded();
     let mut driver = SharedDriver { daemon: &daemon };
+    // the protected phone's asks and lease name the job running under this daemon lease
+    daemon
+        .backend()
+        .protected_job(epoch, Some(job.meta.run_id.clone()));
     let rep = engine::run(
         &mut driver,
         &job.flow,
@@ -904,6 +910,7 @@ fn run_thread(daemon: Arc<Daemon>, job: Arc<Job>, conn: u64, resume: Option<Resu
         },
         resume,
     );
+    daemon.backend().protected_job(epoch, None);
     // an ended job gives its settings back (a paused one keeps them; a take-over already did)
     if let Some(c) = &care {
         if !matches!(rep.stop, Stop::Paused(_)) {

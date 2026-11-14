@@ -5,10 +5,17 @@
 //! * commands that act on "the default device" (shell, get-state, ...) need an explicit selector
 //!   instead of being pinned to a transport id;
 //! * the protected phone is hardcoded as never-a-target instead of coming from readonly.json.
+//!
+//! The protected-device lease (`docs/design/protected-device-lease.md`) is the one way round the last
+//! rule: a guard built with a [`LeaseBook`] ([`GuardedRunner::with_leases`]) lets a command through
+//! to the protected phone only while a lease is open **and** core bound the command's `-s` name
+//! under it ([`LeaseBook::admits`]). Even then [`protected_policy`] keeps transport, install and
+//! credential commands refused, and `getevent` never reaches it.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::lease::LeaseBook;
 use crate::runner::{RunError, RunOutput, Runner};
 
 /// Hardware serial of the protected phone: read-only, never a target.
@@ -59,6 +66,100 @@ pub const S24_SCREEN_AWAKE_KEYS: [(&str, &str); 2] = [
 /// protected phone, so the full dump never reaches an agent: the reader keeps only the parsed call state
 /// (`askscreen::parse_call_state`) and drops the text. It is not in [`S24_READS`].
 pub const S24_CALL_STATE_READ: &str = "dumpsys telephony.registry";
+
+/// The protected phone's focused app and keyboard, for the screen lock and `ask-screen` alone.
+/// Added 14 Nov 2026 on the owner's rulings, word for word: "Allow the two reads (Recommended)"
+/// (the daemon's screen lock), then "Yes, ask-screen too". Without them the protected phone's
+/// focused app and keyboard are unknown, so with its screen on it always reads as in use, and work
+/// on it was limited to bursts.
+///
+/// These are exactly the two lines the screen lock sends to every phone
+/// (`askscreen::read_signals_timed` uses these constants). Only a runner built with
+/// [`GuardedRunner::with_s24_lock_reads`] (the daemon's screen-lock reader and `ask-screen`'s
+/// reader, and no other) lets them through to the protected phone, and only in the exact shape
+/// [`Checked::is_s24_lock_read`] accepts (`shell` plus one of these two arguments, word for word).
+/// Every other runner (the call-state runner included), the plain [`Guard`], the leased guard,
+/// `doctor` and the MCP tools still refuse them for the protected phone. They are not in
+/// [`S24_READS`]. Both readers keep only the focused package and the keyboard's yes or no
+/// (`askscreen::lock_signals`) and drop the text.
+pub const S24_FOCUS_READ: &str = "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='";
+/// See [`S24_FOCUS_READ`].
+pub const S24_KEYBOARD_READ: &str = "dumpsys input_method | grep -E 'mInputShown='";
+
+/// The fallback screen reader's path on a phone (`bridged/assets/idle-free-dump`).
+pub const DUMP_HELPER_REMOTE: &str = "/data/local/tmp/agentroid-dump.dex";
+
+/// The fallback screen read, as an `exec-out` line (the dump goes to stdout).
+pub const IDLE_FREE_READ: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump /dev/tty";
+
+/// The dump helper's hash on a phone, as a `shell` line: the live transport checks the helper on the
+/// protected phone with this before it runs it there, through the helper's own runner
+/// ([`GuardedRunner::with_s24_helper`]) under a lease.
+pub const DUMP_HELPER_HASH_READ: &str = "sha256sum /data/local/tmp/agentroid-dump.dex";
+
+/// File names that carry code a phone could run: a push of one to the protected phone is refused,
+/// lease or not (only the dump helper's own runner puts the helper there).
+const CODE_SUFFIXES: [&str; 12] = [
+    ".dex", ".apk", ".apks", ".apex", ".jar", ".so", ".odex", ".vdex", ".oat", ".art", ".xapk",
+    ".aab",
+];
+
+/// A path as the phone spells it, for the code-push rule: lower case, `\` as `/`, empty and `.`
+/// segments dropped, `..` taken off the segment before it. (A remote path with a `..` segment is
+/// refused before this is used for it, so `..` is resolved here only for the laptop file's name;
+/// `/proc` and the `/dev/fd` aliases are not resolved either: [`code_push_refusal`] refuses every
+/// path under them.)
+fn normalise_phone_path(p: &str) -> String {
+    let p = p.trim().to_lowercase().replace('\\', "/");
+    let lead = if p.starts_with('/') { "/" } else { "" };
+    let mut out: Vec<&str> = vec![];
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    format!("{lead}{}", out.join("/"))
+}
+
+/// The `/dev` names that are links into `/proc/self/fd` (AOSP's init.rc links `/dev/fd` to
+/// `/proc/self/fd`; `stdin`, `stdout` and `stderr` are its first three): a push under any of
+/// them reaches a process's open files, as `/proc` does (review round 4g, M1).
+const DEV_FD_ALIASES: [&str; 4] = ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
+
+/// Why a push to the protected phone is refused as code, or `None`. `local` is the file sent and
+/// `remote` the path it lands at: a code file by name (either side, any case), anything into
+/// `/data/local/tmp` (where `app_process` and the shell run code from), anything under `/proc`
+/// (a process's or a thread's view of `/`, its open files: `/proc/<any>/root`, `cwd`, `fd/<n>`,
+/// `task/<any>/root`... are other spellings of real paths, so none is let through; review round
+/// 4f, item 6) or under the `/dev/fd` links ([`DEV_FD_ALIASES`]), or onto the dump helper's path.
+/// A remote path that does not start with `/` is refused too (adbd opens it against its working
+/// folder, `/`, so `data/local/tmp/x` lands in `/data/local/tmp`), and so is one with a `..`
+/// segment: resolving `..` as text is unsound across links (`/dev/fd/../root/...` is
+/// `/proc/self/root/...` on the phone), so it is not resolved at all (review round 4g, M1). A
+/// fixed refusal: no lease or approval lifts it.
+pub fn code_push_refusal(local: &str, remote: &str) -> Option<String> {
+    let spelt = remote.trim().replace('\\', "/");
+    let relative = !spelt.starts_with('/');
+    let dotdot = spelt.split('/').any(|seg| seg == "..");
+    let r = normalise_phone_path(remote);
+    let named_code = [local, remote].iter().any(|p| {
+        let n = normalise_phone_path(p);
+        let base = n.rsplit('/').next().unwrap_or("");
+        CODE_SUFFIXES.iter().any(|s| base.ends_with(s))
+    });
+    let tmp = r == "/data/local/tmp" || r.starts_with("/data/local/tmp/");
+    let proc = r == "/proc" || r.starts_with("/proc/");
+    let dev_fd = DEV_FD_ALIASES
+        .iter()
+        .any(|d| r == *d || r.strip_prefix(d).is_some_and(|rest| rest.starts_with('/')));
+    (named_code || tmp || proc || dev_fd || relative || dotdot || r == DUMP_HELPER_REMOTE).then(|| {
+        "code is never pushed to the protected phone (a .dex, .apk, .jar, .so or similar, anything into /data/local/tmp or under /proc or /dev/fd, and any phone path that is relative or has a `..` in it), lease or not".to_string()
+    })
+}
 
 /// A value the protected phone exception may write: a plain decimal (no sign, no leading zero), at most
 /// `i32::MAX` ms for the timeout and at most 15 (the AC, USB, wireless and dock bits) for stay-on.
@@ -328,6 +429,27 @@ impl Checked {
         self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == S24_CALL_STATE_READ
     }
 
+    /// True when this is exactly one of the screen lock's two reads of the protected phone's
+    /// focused app and keyboard: `shell` plus [`S24_FOCUS_READ`] or [`S24_KEYBOARD_READ`], word
+    /// for word.
+    pub fn is_s24_lock_read(&self) -> bool {
+        self.sub == "shell"
+            && self.rest.len() == 1
+            && (self.rest[0] == S24_FOCUS_READ || self.rest[0] == S24_KEYBOARD_READ)
+    }
+
+    /// True when this is exactly one of the dump helper's two lines for the protected phone: the
+    /// hash read (`shell` plus [`DUMP_HELPER_HASH_READ`]) or the push of `staged`, the daemon's
+    /// own staged copy, to [`DUMP_HELPER_REMOTE`], word for word.
+    pub fn is_s24_helper(&self, staged: &str) -> bool {
+        (self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == DUMP_HELPER_HASH_READ)
+            || (self.sub == "push"
+                && !staged.is_empty()
+                && self.rest.len() == 2
+                && self.rest[0] == staged
+                && self.rest[1] == DUMP_HELPER_REMOTE)
+    }
+
     /// True when `sub` + `rest` is exactly one of [`GETEVENT_SHAPES`].
     pub fn is_getevent_shape(&self) -> bool {
         let mut words = vec![self.sub.as_str()];
@@ -377,16 +499,252 @@ impl Checked {
     }
 }
 
-/// The guard. Holds the set of tokens learnt to be forbidden at run time (S24 addresses).
+/// The argv rules a lease never lifts. Applied to every non-read command sent to the protected
+/// phone under a lease, after [`Guard::check`]:
+/// * only `shell`, `exec-out`, `push` and `pull` (screen work and the file tools); `install`,
+///   `uninstall`, `tcpip`, `usb`, `root`, `reboot`, `emu`, `remount`, `sideload`, `forward`,
+///   `reverse`, `backup`, `restore` and every other subcommand stay refused;
+/// * no link-pairing shape (the helper's link is never paired with the protected phone);
+/// * a `shell` or `exec-out` line only in one of the exact shapes core and the live transport
+///   send ([`protected_shell_allowed`]); anything else is refused, whatever it does;
+/// * no push of code ([`code_push_refusal`]): only the dump helper's own runner puts the helper
+///   on the phone.
+pub fn protected_policy(c: &Checked) -> Result<(), String> {
+    const SUBS: [&str; 4] = ["shell", "exec-out", "push", "pull"];
+    if !SUBS.contains(&c.sub.as_str()) {
+        return Err(format!(
+            "adb {} is never sent to the protected phone, lease or not (only shell, exec-out, push and pull)",
+            c.sub
+        ));
+    }
+    if c.touches_link() {
+        return Err("the helper's link is never paired with the protected phone".into());
+    }
+    if c.sub == "shell" || c.sub == "exec-out" {
+        let line = c.rest.join(" ");
+        if !protected_shell_allowed(&c.sub, &line) {
+            return Err(
+                "the line is not one of the exact shapes core sends to the protected phone (taps, swipes, keys, text, a screen read, a launch): never on the protected phone, lease or not"
+                    .into(),
+            );
+        }
+    }
+    if c.sub == "push" {
+        // `push <local>... <remote>`: every word is checked, so no flag or extra source slips by
+        let Some((remote, locals)) = c.rest.split_last() else {
+            return Err("adb push without a destination".into());
+        };
+        if locals.is_empty() {
+            return Err("adb push without a file to send".into());
+        }
+        for l in locals {
+            if let Some(why) = code_push_refusal(l, remote) {
+                return Err(why);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The lines sent to the protected phone word for word.
+const PROTECTED_EXACT_SHELL: [&str; 3] = [
+    "wm size; dumpsys input | grep -m1 SurfaceOrientation",
+    "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -1",
+    "pm list packages",
+];
+const PROTECTED_EXACT_EXEC_OUT: [&str; 3] =
+    ["screencap -p", "uiautomator dump /dev/tty", IDLE_FREE_READ];
+
+/// The `input text` argument as core escapes it: one word, every shell metacharacter behind a
+/// backslash, spaces as `%s`.
+fn escaped_input_text(t: &str) -> bool {
+    const SPECIAL: &str = "\\'\"`$&|;<>()*?!#~{}[]";
+    let mut it = t.chars();
+    let mut any = false;
+    while let Some(c) = it.next() {
+        any = true;
+        if c == '\\' {
+            match it.next() {
+                Some(n) if SPECIAL.contains(n) => {}
+                _ => return false,
+            }
+        } else if c.is_whitespace() || c.is_control() || SPECIAL.contains(c) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Split a shell line into words the way the phone's `sh` would, accepting only plain words
+/// (`[A-Za-z0-9_.:/=+,@%-]`) and single-quoted ones (with the `'\''` escape), one space apart.
+/// `None` for anything else: no unquoted metacharacter, no other quoting, no double space.
+fn plain_words(line: &str) -> Option<Vec<String>> {
+    let mut words = vec![];
+    let mut w = String::new();
+    let mut started = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' => {
+                // one space between words, none leading or trailing
+                if !started || chars.peek().is_none_or(|n| *n == ' ') {
+                    return None;
+                }
+                words.push(std::mem::take(&mut w));
+                started = false;
+            }
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(x) if !x.is_control() => w.push(x),
+                        _ => return None,
+                    }
+                }
+            }
+            '\\' if chars.peek() == Some(&'\'') => {
+                started = true;
+                chars.next();
+                w.push('\'');
+            }
+            c if c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | ',' | '@' | '%' | '-') =>
+            {
+                started = true;
+                w.push(c)
+            }
+            _ => return None,
+        }
+    }
+    if !started {
+        return None;
+    }
+    words.push(w);
+    Some(words)
+}
+
+fn int_word(w: &str) -> bool {
+    let d = w.strip_prefix('-').unwrap_or(w);
+    !d.is_empty() && d.len() <= 6 && d.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Is `line` (the words after `shell` or `exec-out`) one of the exact shapes core and the live
+/// transport send to the protected phone? An allowlist: `input` taps, long presses, swipes, key
+/// events and escaped text; the screen size, rotation, wakefulness and package reads; `getprop` of
+/// one key; a launcher `monkey` of one package; `am start -W` in the two shapes core builds
+/// (`open_url_args`: `-a android.intent.action.VIEW -d <uri> [-p <package>]`;
+/// `start_activity_args`: `-n <package/activity> [-a <action>] [-d <data>]`, values never a flag);
+/// the file tools' `sha256sum <path>`, `ls -1tp <dir>` and `stat -c %s <path>` (one path word,
+/// never a flag); and, as `exec-out`, `screencap -p`, `uiautomator dump /dev/tty` and the fallback
+/// reader.
+pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
+    if sub == "exec-out" {
+        return PROTECTED_EXACT_EXEC_OUT.contains(&line);
+    }
+    if sub != "shell" {
+        return false;
+    }
+    if PROTECTED_EXACT_SHELL.contains(&line) {
+        return true;
+    }
+    if let Some(t) = line.strip_prefix("input text ") {
+        return escaped_input_text(t);
+    }
+    let Some(w) = plain_words(line) else {
+        return false;
+    };
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    let key = |k: &str| {
+        !k.is_empty()
+            && k.len() <= 64
+            && k.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    };
+    let pkg = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 128
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    };
+    // one path word (plain_words has already refused metacharacters outside quotes): never a flag
+    let path = |p: &str| !p.is_empty() && p.len() <= 1024 && !p.starts_with('-');
+    // an intent's data or link: one word, never a flag
+    let value = |v: &str| !v.is_empty() && v.len() <= 2048 && !v.starts_with('-');
+    let action = |a: &str| {
+        !a.is_empty()
+            && a.len() <= 128
+            && a.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    };
+    // `package/activity` (`com.android.settings/.Settings`, `a.b/.C$D`)
+    let component = |c: &str| {
+        c.split_once('/').is_some_and(|(p, a)| {
+            pkg(p)
+                && !a.is_empty()
+                && a.len() <= 256
+                && a.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'$'))
+        })
+    };
+    let input = match w.as_slice() {
+        ["input", "-d", d, rest @ ..] if d.bytes().all(|b| b.is_ascii_digit()) && !d.is_empty() => {
+            rest
+        }
+        ["input", rest @ ..] => rest,
+        _ => &[][..],
+    };
+    let input_ok = match input {
+        ["tap", x, y] => int_word(x) && int_word(y),
+        ["swipe", a, b, c, d, ms] => [a, b, c, d, ms].iter().all(|v| int_word(v)),
+        ["keyevent", k] => key(k),
+        _ => false,
+    };
+    if !input.is_empty() {
+        return input_ok;
+    }
+    match w.as_slice() {
+        ["getprop", k] => {
+            k.len() <= 64
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        }
+        ["monkey", "-p", p, "-c", "android.intent.category.LAUNCHER", "1"] => pkg(p),
+        // `am start -W` exactly as `open_url_args` and `start_activity_args` build it (review
+        // round 4, item 8)
+        ["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", uri] => value(uri),
+        ["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", uri, "-p", p] => {
+            value(uri) && pkg(p)
+        }
+        ["am", "start", "-W", "-n", c] => component(c),
+        ["am", "start", "-W", "-n", c, "-a", x] => component(c) && action(x),
+        ["am", "start", "-W", "-n", c, "-d", d] => component(c) && value(d),
+        ["am", "start", "-W", "-n", c, "-a", x, "-d", d] => component(c) && action(x) && value(d),
+        // the file tools' reads: push's read-back, and pull_new's listing, size and hash
+        ["sha256sum", p] | ["ls", "-1tp", p] | ["stat", "-c", "%s", p] => path(p),
+        _ => false,
+    }
+}
+
+/// The guard. Holds the set of tokens learnt to be forbidden at run time (S24 addresses), and the
+/// protected-device lease book when one is wired (`None`: the protected phone is never a target).
 #[derive(Debug, Default)]
 pub struct Guard {
     denied: Mutex<HashSet<String>>,
+    leases: Option<Arc<LeaseBook>>,
     /// The protected phone screen-awake exception (see [`S24_SCREEN_AWAKE_KEYS`]). Off unless the runner was
     /// built with [`GuardedRunner::with_s24_screen_awake`].
     s24_screen_awake: bool,
     /// The protected phone call-state read (see [`S24_CALL_STATE_READ`]). Off unless the runner was built
     /// with [`GuardedRunner::with_s24_call_state`].
     s24_call_state: bool,
+    /// The protected phone's focused-app and keyboard reads (see [`S24_FOCUS_READ`]). Off unless
+    /// the runner was built with [`GuardedRunner::with_s24_lock_reads`].
+    s24_lock_reads: bool,
+    /// The dump helper's staged copy on the laptop, for its two lines to the protected phone under a
+    /// lease ([`Checked::is_s24_helper`]). `None` unless the runner was built with
+    /// [`GuardedRunner::with_s24_helper`].
+    s24_helper: Option<String>,
 }
 
 fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -396,6 +754,12 @@ fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>
 impl Guard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// May a non-read command for selector `v` reach the protected phone? Only with a lease book,
+    /// an open lease, and `v` bound under it by core ([`LeaseBook::admits`]).
+    pub fn lease_admits(&self, v: &str) -> bool {
+        self.leases.as_ref().is_some_and(|b| b.admits(v))
     }
 
     /// Forbid a token (for example the address an S24 was seen at).
@@ -420,8 +784,11 @@ impl Guard {
             if let Some(v) = sel.get(1) {
                 let read = probe.is_s24_read()
                     || (self.s24_screen_awake && probe.is_s24_screen_awake())
-                    || (self.s24_call_state && probe.is_s24_call_state());
-                if self.is_forbidden(v) && !read {
+                    || (self.s24_call_state && probe.is_s24_call_state())
+                    || (self.s24_lock_reads && probe.is_s24_lock_read());
+                // under a lease core bound this name: `GuardedRunner::admit` still reads the
+                // hardware serial and applies `protected_policy`
+                if self.is_forbidden(v) && !read && !self.lease_admits(v) {
                     return refuse(format!("{v} is the read-only S24, never a target"));
                 }
             }
@@ -518,7 +885,15 @@ impl Guard {
     ) -> Result<Checked, GuardError> {
         let c = self.check(argv)?;
         match &c.selector {
-            Some(sel) if sel.len() == 2 && sel[0] == "-s" => {}
+            Some(sel) if sel.len() == 2 && sel[0] == "-s" => {
+                // a lease never opens raw input streams: refused here in every spelling
+                if self.is_forbidden(&sel[1]) {
+                    return refuse(format!(
+                        "{} is the protected phone: getevent is never sent to it",
+                        sel[1]
+                    ));
+                }
+            }
             _ => return refuse("getevent needs an explicit -s <serial> target"),
         }
         if !c.is_getevent_shape() {
@@ -593,14 +968,59 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
-    /// The runner the screen lock and `ask-screen` read the phone through, and nothing else: as
-    /// [`GuardedRunner::new`], plus the protected phone's call-state read ([`S24_CALL_STATE_READ`],
-    /// exactly as [`Checked::is_s24_call_state`] accepts it).
+    /// As [`GuardedRunner::new`], plus the protected phone's call-state read
+    /// ([`S24_CALL_STATE_READ`], exactly as [`Checked::is_s24_call_state`] accepts it), and
+    /// nothing else. The screen lock and `ask-screen` now read through
+    /// [`Self::with_s24_lock_reads`], which adds the focused-app and keyboard reads to this.
     pub fn with_s24_call_state(inner: R) -> Self {
         Self {
             inner,
             guard: Guard {
                 s24_call_state: true,
+                ..Guard::default()
+            },
+        }
+    }
+
+    /// The daemon's screen-lock reader and `ask-screen`'s reader, and nothing else: as
+    /// [`Self::with_s24_call_state`], plus
+    /// the protected phone's focused-app and keyboard reads ([`S24_FOCUS_READ`],
+    /// [`S24_KEYBOARD_READ`], exactly as [`Checked::is_s24_lock_read`] accepts them).
+    pub fn with_s24_lock_reads(inner: R) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                s24_call_state: true,
+                s24_lock_reads: true,
+                ..Guard::default()
+            },
+        }
+    }
+
+    /// The runner the live transport checks and puts the dump helper on the protected phone
+    /// through, and nothing else: as [`GuardedRunner::with_leases`], plus, under an open lease for
+    /// a bound name, the helper's hash read and the push of `staged` (the daemon's own copy) to
+    /// [`DUMP_HELPER_REMOTE`], exactly as [`Checked::is_s24_helper`] accepts them. Every other code
+    /// push stays refused ([`protected_policy`]).
+    pub fn with_s24_helper(inner: R, staged: String, leases: Arc<LeaseBook>) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                leases: Some(leases),
+                s24_helper: Some(staged),
+                ..Guard::default()
+            },
+        }
+    }
+
+    /// As [`GuardedRunner::new`], plus the protected-device lease: a non-read command reaches the
+    /// protected phone while `leases` holds an open lease that core bound its `-s` name under,
+    /// and [`protected_policy`] allows it.
+    pub fn with_leases(inner: R, leases: Arc<LeaseBook>) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                leases: Some(leases),
                 ..Guard::default()
             },
         }
@@ -686,11 +1106,26 @@ impl<R: Runner> GuardedRunner<R> {
                         self.guard.deny(v);
                     }
                     let excepted = (self.guard.s24_screen_awake && c.is_s24_screen_awake())
-                        || (self.guard.s24_call_state && c.is_s24_call_state());
+                        || (self.guard.s24_call_state && c.is_s24_call_state())
+                        || (self.guard.s24_lock_reads && c.is_s24_lock_read());
                     if !c.is_s24_read() && !excepted {
-                        return Err(RunError::Refused(
-                            "target is the read-only S24, never a target".into(),
-                        ));
+                        // the lease counts only for a name core checked and bound under it: a
+                        // phone core took for an ordinary device never rides on it
+                        let leased =
+                            sel.len() == 2 && sel[0] == "-s" && self.guard.lease_admits(&sel[1]);
+                        if !leased {
+                            return Err(RunError::Refused(
+                                "target is the read-only S24, never a target".into(),
+                            ));
+                        }
+                        let helper = self
+                            .guard
+                            .s24_helper
+                            .as_deref()
+                            .is_some_and(|staged| c.is_s24_helper(staged));
+                        if !helper {
+                            protected_policy(&c).map_err(RunError::Refused)?;
+                        }
                     }
                 }
             }
@@ -1818,6 +2253,109 @@ mod tests {
             .is_ok());
     }
 
+    // ---- round 4c: "Allow the two reads (Recommended)" ----
+
+    #[test]
+    fn only_the_lock_runner_lets_the_focus_and_keyboard_reads_reach_the_s24() {
+        for line in [S24_FOCUS_READ, S24_KEYBOARD_READ] {
+            let exact = line.to_string();
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let argv = args(&["-s", sel, "shell", &exact]);
+                // the screen lock's reader: through, as sent, and the call state too
+                let r = GuardedRunner::with_s24_lock_reads(s24_spy());
+                r.run(&argv, 1000)
+                    .unwrap_or_else(|e| panic!("{sel} {line}: {e:?}"));
+                assert_eq!(r.inner.calls.borrow().last(), Some(&argv), "{sel}");
+                let mut marked = false;
+                assert!(r.run_marked(&argv, 1000, &mut || marked = true).is_ok());
+                assert!(marked);
+                let call = args(&["-s", sel, "shell", S24_CALL_STATE_READ]);
+                assert!(r.run(&call, 1000).is_ok(), "{sel}");
+                // every other runner, ask-screen's call-state runner included, and the plain
+                // guard refuse them
+                for other in [
+                    GuardedRunner::new(s24_spy()),
+                    GuardedRunner::with_s24_screen_awake(s24_spy()),
+                    GuardedRunner::with_s24_call_state(s24_spy()),
+                ] {
+                    assert!(
+                        matches!(other.run(&argv, 1000), Err(RunError::Refused(_))),
+                        "{sel} {line}"
+                    );
+                    assert!(!other
+                        .inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&exact)));
+                }
+                if sel == S24_SERIAL {
+                    assert!(Guard::new().check(&argv).is_err());
+                }
+            }
+        }
+        // not approved reads, for doctor or anyone
+        assert!(!S24_READS
+            .iter()
+            .any(|r| r.contains("window") || r.contains("input_method")));
+    }
+
+    #[test]
+    fn the_lock_runner_refuses_every_other_shape_on_the_s24() {
+        let near = [
+            "dumpsys window",
+            "dumpsys input_method",
+            "dumpsys window | grep -E 'mCurrentFocus='",
+            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing=' ",
+            " dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='",
+            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing=|mFocusedApp='",
+            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='; input tap 1 1",
+            "dumpsys window windows | grep -E 'mCurrentFocus=|isKeyguardShowing='",
+            "dumpsys input_method | grep -E 'mInputShown=' | cat",
+            "dumpsys input_method | grep -E 'mInputShown=|mCurText'",
+            "dumpsys input_method|grep -E 'mInputShown='",
+            "dumpsys notification",
+            "input tap 1 1",
+        ];
+        for line in near {
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let r = GuardedRunner::with_s24_lock_reads(s24_spy());
+                let argv = args(&["-s", sel, "shell", line]);
+                assert!(
+                    matches!(r.run(&argv, 1000), Err(RunError::Refused(_))),
+                    "{sel} {line}"
+                );
+                assert!(
+                    !r.inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&line.to_string())),
+                    "{line} reached adb"
+                );
+            }
+        }
+        // the multi-word spelling and exec-out are not the shape the lock sends
+        for a in [
+            &["-s", S24_SERIAL, "exec-out", S24_FOCUS_READ][..],
+            &["-s", S24_SERIAL, "shell", "dumpsys", "input_method"][..],
+        ] {
+            let r = GuardedRunner::with_s24_lock_reads(s24_spy());
+            assert!(r.run(&args(a), 1000).is_err(), "{a:?}");
+        }
+        // and on other phones it drives as before
+        let r = GuardedRunner::with_s24_lock_reads(Spy {
+            hw: POCO_HW.into(),
+            calls: RefCell::new(vec![]),
+        });
+        assert!(r
+            .run(
+                &args(&["-s", "192.0.2.78:37123", "shell", "input tap 1 1"]),
+                1000
+            )
+            .is_ok());
+    }
+
     #[test]
     fn the_opt_in_runner_drives_other_phones_as_before() {
         let r = GuardedRunner::with_s24_screen_awake(Spy {
@@ -1831,5 +2369,490 @@ mod tests {
             )
             .is_ok());
         assert!(r.run(&args(&["kill-server"]), 1000).is_err());
+    }
+
+    // ---- the protected-device lease ----
+
+    use crate::lease::{Granted, Holder, Lease, LeaseBook, ManualClock};
+
+    const T0: u64 = 1_700_000_000_000;
+    const S24_IP: &str = "192.0.2.99:40000";
+
+    fn book_with_lease(bound: &[&str]) -> (Arc<ManualClock>, Arc<LeaseBook>) {
+        let clock = Arc::new(ManualClock::new(T0));
+        let book = Arc::new(LeaseBook::new(clock.clone()));
+        book.open(Lease {
+            id: "abcdefghijklmnopqrst".into(),
+            holder: Holder {
+                name: "lane".into(),
+                epoch: 3,
+            },
+            job: None,
+            opened_at_ms: T0,
+            expires_at_ms: T0 + 30 * 60_000,
+            granted: Granted::Overnight,
+            bound: vec![],
+        });
+        for b in bound {
+            book.bind(b);
+        }
+        (clock, book)
+    }
+
+    fn leased_s24(book: &Arc<LeaseBook>) -> GuardedRunner<Spy> {
+        GuardedRunner::with_leases(
+            Spy {
+                hw: S24_SERIAL.into(),
+                calls: RefCell::new(vec![]),
+            },
+            book.clone(),
+        )
+    }
+
+    #[test]
+    fn during_a_lease_screen_work_reaches_the_protected_phone_by_a_bound_name() {
+        let (clock, book) = book_with_lease(&[S24_IP, S24_SERIAL]);
+        let r = leased_s24(&book);
+        for a in [
+            vec!["-s", S24_IP, "shell", "input tap 1 1"],
+            vec!["-s", S24_SERIAL, "shell", "input", "tap", "1", "2"],
+            vec!["-s", S24_IP, "exec-out", "uiautomator", "dump", "/dev/tty"],
+            vec![
+                "-s",
+                S24_IP,
+                "push",
+                "C:/outbox/a.png",
+                "/sdcard/Download/a.png",
+            ],
+            vec![
+                "-s",
+                S24_IP,
+                "pull",
+                "/sdcard/Download/a.png",
+                "C:/inbox/a.png",
+            ],
+        ] {
+            assert!(r.run(&args(&a), 1000).is_ok(), "{a:?}");
+        }
+        assert!(r
+            .run_bytes(&args(&["-s", S24_IP, "exec-out", "screencap", "-p"]), 1000)
+            .is_ok());
+        // past the end: refused again, with nothing sent but the identity probe
+        clock.advance(30 * 60_000);
+        let r = leased_s24(&book);
+        assert!(r
+            .run(&args(&["-s", S24_IP, "shell", "input tap 1 1"]), 1000)
+            .is_err());
+        assert_eq!(r.inner.calls.borrow().len(), 1);
+    }
+
+    /// The review's "the adb guard trusts any open lease": with a lease open, a name core never bound
+    /// (core took the phone for an ordinary device because its `ro.serialno` read failed) is refused.
+    #[test]
+    fn a_lease_never_covers_a_name_core_did_not_bind() {
+        let (_, book) = book_with_lease(&[S24_IP]);
+        let r = leased_s24(&book);
+        let other = "192.0.2.98:41000";
+        assert!(matches!(
+            r.run(&args(&["-s", other, "shell", "input tap 1 1"]), 1000),
+            Err(RunError::Refused(_))
+        ));
+        assert_eq!(r.inner.calls.borrow().len(), 1, "only the identity probe");
+        // the address learnt to be the protected phone is now denied at the argv guard as well
+        assert!(r
+            .guard()
+            .check(&args(&["-s", other, "shell", "ls"]))
+            .is_err());
+        // and no lease book at all: the old rule, every name refused
+        let plain = GuardedRunner::new(Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        });
+        assert!(plain
+            .run(&args(&["-s", S24_IP, "shell", "input tap 1 1"]), 1000)
+            .is_err());
+    }
+
+    /// Review round 2, item 9: the lease's shell rule is an allowlist of the exact shapes core
+    /// sends, not a denylist of known-bad words.
+    #[test]
+    fn a_lease_lets_through_only_the_shapes_core_sends() {
+        for (sub, line) in [
+            ("shell", "input tap 10 20"),
+            ("shell", "input -d 1 tap 10 20"),
+            ("shell", "input swipe 1 2 3 4 350"),
+            ("shell", "input keyevent KEYCODE_BACK"),
+            ("shell", "input text hello%sworld\\!"),
+            (
+                "shell",
+                "wm size; dumpsys input | grep -m1 SurfaceOrientation",
+            ),
+            (
+                "shell",
+                "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -1",
+            ),
+            ("shell", "pm list packages"),
+            ("shell", "getprop ro.product.model"),
+            (
+                "shell",
+                "monkey -p 'com.android.settings' -c android.intent.category.LAUNCHER 1",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://example.com/it'\\''s'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://example.com/' '-p' 'com.android.chrome'",
+            ),
+            ("shell", "am start -W '-n' 'com.android.settings/.Settings'"),
+            (
+                "shell",
+                "am start -W '-n' 'a.b/.C$D' '-a' 'android.intent.action.MAIN' '-d' 'd:1'",
+            ),
+            ("shell", "am start -W '-n' 'a.b/.C' '-a' 'act'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-d' 'content://x/1'"),
+            ("exec-out", "screencap -p"),
+            ("exec-out", "uiautomator dump /dev/tty"),
+            ("exec-out", IDLE_FREE_READ),
+        ] {
+            assert!(protected_shell_allowed(sub, line), "{sub} {line}");
+        }
+        for (sub, line) in [
+            ("shell", "dumpsys notification"),
+            ("shell", "dumpsys notification --noredact"),
+            // the screen lock's own reads (review round 4c/4d): never under the lease
+            ("shell", S24_FOCUS_READ),
+            ("shell", S24_KEYBOARD_READ),
+            ("shell", "content query --uri content://sms"),
+            ("shell", "cat /data/system/notification_log.db"),
+            ("shell", "input tap 1 1; reboot"),
+            ("shell", "input tap 1 1 && ls"),
+            ("shell", "input text a b"),
+            ("shell", "input text $(id)"),
+            ("shell", "input keyevent 'KEYCODE_BACK; reboot'"),
+            ("shell", "getprop ro.product.model; id"),
+            (
+                "shell",
+                "monkey -p com.whatsapp -c android.intent.category.LAUNCHER 1 ; id",
+            ),
+            ("shell", "am start -W $(id)"),
+            ("shell", "am start -W"),
+            // review round 4, item 8: only the two shapes core builds, never a flag for a value
+            ("shell", "am start -W '-a' 'android.intent.action.VIEW'"),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.CALL' '-d' 'tel:1'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' '--user' '-p' 'a.b'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://x' '-p' 'a;b'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://x' '--es' 'k' 'v'",
+            ),
+            ("shell", "am start -W '-n' 'com.android.settings'"),
+            ("shell", "am start -W '-n' '/.Settings'"),
+            ("shell", "am start -W '-n' 'a.b/'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '--ez' 'k' 'true'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-d' '-x'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-a' 'a b'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-d' 'x' '-a' 'act'"),
+            ("shell", "am start -W '--user' '0' '-n' 'a.b/.C'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-f' '0x10000000'"),
+            ("shell", "settings put global adb_enabled 0"),
+            ("shell", "uiautomator dump /sdcard/x.xml"),
+            ("exec-out", "uiautomator dump /dev/tty; cat /sdcard/x"),
+            ("exec-out", "cat /data/system/notification_log.db"),
+            ("exec-out", DUMP_HELPER_HASH_READ),
+            // the file tools' reads: one path word, never a flag, nothing chained
+            ("shell", "sha256sum -c /sdcard/x"),
+            ("shell", "sha256sum --help"),
+            ("shell", "ls -1tp -R"),
+            ("shell", "stat -c %s -L"),
+            ("shell", "sha256sum /sdcard/a /sdcard/b"),
+            ("shell", "sha256sum"),
+            ("shell", "sha256sum /sdcard/a; id"),
+            ("shell", "ls -1tp -R /"),
+            ("shell", "ls -1tp"),
+            ("shell", "ls -la /sdcard"),
+            ("shell", "ls -1tp /sdcard | sh"),
+            ("shell", "stat -c %s"),
+            ("shell", "stat -c %n /sdcard/a"),
+            ("shell", "stat -c %s -L /sdcard/a"),
+            ("shell", "stat -c %s $(id)"),
+            ("shell", "md5sum /sdcard/a"),
+        ] {
+            assert!(!protected_shell_allowed(sub, line), "{sub} {line}");
+        }
+        // review round 3, item 11: push's read-back and pull_new's three reads, as devtools
+        // quotes them
+        for line in [
+            "sha256sum /sdcard/Download/a.png",
+            "sha256sum '/sdcard/Download/my file.png'",
+            "ls -1tp /sdcard/Download",
+            "ls -1tp '/sdcard/Download/it'\\''s'",
+            "stat -c %s /sdcard/Download/a.png",
+            DUMP_HELPER_HASH_READ,
+        ] {
+            assert!(protected_shell_allowed("shell", line), "{line}");
+        }
+        let long = format!("sha256sum /{}", "a".repeat(1024));
+        assert!(!protected_shell_allowed("shell", &long));
+        let at_most = format!("sha256sum /{}", "a".repeat(1023));
+        assert!(protected_shell_allowed("shell", &at_most));
+    }
+
+    /// Review round 3, item 2: no code reaches the protected phone by push, lease or not, in any
+    /// spelling of its path; only the helper's own runner puts its one staged copy on it.
+    #[test]
+    fn code_is_never_pushed_to_the_protected_phone() {
+        for (local, remote) in [
+            ("C:/outbox/a.dex", "/sdcard/Download/a.bin"),
+            ("C:/outbox/a.bin", "/sdcard/Download/a.DEX"),
+            ("C:/outbox/app.apk", "/sdcard/Download/app.apk"),
+            ("C:/outbox/lib.so", "/sdcard/lib.so"),
+            ("C:/outbox/x.jar", "/sdcard/x.jar"),
+            ("C:/outbox/x.odex", "/sdcard/x"),
+            ("C:/outbox/x.vdex", "/sdcard/x"),
+            ("C:/outbox/x.oat", "/sdcard/x"),
+            ("C:/outbox/x.apks", "/sdcard/x"),
+            ("C:/outbox/x.apex", "/sdcard/x"),
+            ("C:/outbox/x.art", "/sdcard/x"),
+            ("C:/outbox/x.xapk", "/sdcard/x"),
+            ("C:/outbox/x.aab", "/sdcard/x"),
+            ("C:/outbox/note.txt", "/data/local/tmp"),
+            ("C:/outbox/note.txt", "/data/local/tmp/note.txt"),
+            ("C:/outbox/note.txt", "/DATA/Local/TMP/note.txt"),
+            ("C:/outbox/note.txt", "//data//local/./tmp/x"),
+            ("C:/outbox/note.txt", "/sdcard/../data/local/tmp/x"),
+            ("C:/outbox/note.txt", "\\data\\local\\tmp\\x"),
+            // review round 4, item 8: through a process's view of `/`
+            ("C:/outbox/note.txt", "/proc/self/root/data/local/tmp/x"),
+            ("C:/outbox/note.txt", "/proc/1/root/data/local/tmp"),
+            (
+                "C:/outbox/note.txt",
+                "/proc/thread-self/root/./data/local/tmp/x",
+            ),
+            (
+                "C:/outbox/note.txt",
+                "/PROC/self/ROOT/proc/self/root/data/local/tmp/x",
+            ),
+            ("C:/outbox/note.txt", "/proc/self/cwd/data/local/tmp/x"),
+            (
+                "C:/outbox/note.txt",
+                "/sdcard/../proc/self/root/data/local/tmp/x",
+            ),
+            // review round 4e, L7: and through a thread's
+            (
+                "C:/outbox/note.txt",
+                "/proc/self/task/1234/root/data/local/tmp/x",
+            ),
+            ("C:/outbox/note.txt", "/proc/1/task/1/cwd/data/local/tmp"),
+            (
+                "C:/outbox/note.txt",
+                "/proc/self/task/9/root/proc/1/task/2/cwd/data/local/tmp/x",
+            ),
+            // review round 4f, item 6: anything under /proc, a process's open files included,
+            // and the spellings that once read as other paths
+            ("C:/outbox/note.txt", "/proc/self/fd/3"),
+            ("C:/outbox/note.txt", "/proc/1234/fd/7"),
+            ("C:/outbox/note.txt", "/sdcard/../PROC/1/fd/0"),
+            ("C:/outbox/note.txt", "/proc"),
+            ("C:/outbox/a", "/proc/self/rootx/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/task/1/rootx/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/tasks/1/root/data/local/tmp/x"),
+            // review round 4g, M1: a relative path lands under adbd's working folder, `/`
+            ("C:/outbox/note.txt", "data/local/tmp/x"),
+            ("C:/outbox/note.txt", "sdcard/Download/note.txt"),
+            ("C:/outbox/note.txt", "./data/local/tmp/x"),
+            ("C:/outbox/note.txt", ""),
+            // a `..` segment is refused outright, wherever it leads
+            ("C:/outbox/note.txt", "/dev/fd/../root/data/local/tmp/x"),
+            (
+                "C:/outbox/note.txt",
+                "/sdcard/Download/../Download/note.txt",
+            ),
+            ("C:/outbox/note.txt", "\\sdcard\\..\\sdcard\\note.txt"),
+            // the /dev links into /proc/self/fd, and anything under them
+            ("C:/outbox/note.txt", "/dev/fd"),
+            ("C:/outbox/note.txt", "/dev/fd/3"),
+            ("C:/outbox/note.txt", "/DEV/FD/0/x"),
+            ("C:/outbox/note.txt", "/dev//./stdin"),
+            ("C:/outbox/note.txt", "/dev/stdout"),
+            ("C:/outbox/note.txt", "/dev/stderr/x"),
+            ("C:/outbox/note.txt", DUMP_HELPER_REMOTE),
+            ("C:\\outbox\\a.DeX", "/sdcard/a"),
+        ] {
+            assert!(
+                code_push_refusal(local, remote).is_some(),
+                "{local} {remote}"
+            );
+        }
+        for (local, remote) in [
+            ("C:/outbox/a.png", "/sdcard/Download/a.png"),
+            ("C:/outbox/dex.txt", "/sdcard/Download/dex.txt"),
+            ("C:/outbox/a.sox", "/sdcard/a.sox"),
+            ("C:/outbox/a", "/data/local/tmpx/a"),
+            ("C:/outbox/a", "/data/local/tm"),
+            ("C:/outbox/a", "/sdcard/tmp/x"),
+            ("C:/outbox/a", "/sdcard/proc/self/root/data/local/tmp/x"),
+            ("C:/outbox/a", "/sdcard/proc/self/fd/3"),
+            ("C:/outbox/a", "/procx/self/fd/3"),
+            ("C:/outbox/a", "/dev/fdx/3"),
+            ("C:/outbox/a", "/dev/stdinx"),
+            ("C:/outbox/a", "/sdcard/dev/fd/3"),
+            ("C:/outbox/a", "/sdcard/a..b/c..txt"),
+            ("C:/outbox/a", "/sdcard/./Download/a"),
+            ("C:/outbox/../outbox/a", "/sdcard/a"),
+        ] {
+            assert!(
+                code_push_refusal(local, remote).is_none(),
+                "{local} {remote}"
+            );
+        }
+        assert_eq!(normalise_phone_path("/a/b/../c"), "/a/c");
+        assert_eq!(normalise_phone_path("a//./b"), "a/b");
+
+        // through the lease's policy: refused with nothing sent but the identity probe
+        let (_, book) = book_with_lease(&[S24_IP]);
+        for a in [
+            vec!["-s", S24_IP, "push", "C:/outbox/a.dex", "/sdcard/a.dex"],
+            vec!["-s", S24_IP, "push", "C:/outbox/n.txt", DUMP_HELPER_REMOTE],
+            vec![
+                "-s",
+                S24_IP,
+                "push",
+                "C:/outbox/n.txt",
+                "C:/outbox/b.so",
+                "/sdcard/",
+            ],
+            vec!["-s", S24_IP, "push", "/sdcard/x"],
+            vec!["-s", S24_IP, "push"],
+        ] {
+            let r = leased_s24(&book);
+            assert!(r.run(&args(&a), 1000).is_err(), "{a:?}");
+            assert_eq!(r.inner.calls.borrow().len(), 1, "{a:?}: only the probe");
+        }
+        let ok = args(&["-s", S24_IP, "push", "C:/outbox/n.txt", "/sdcard/n.txt"]);
+        assert!(leased_s24(&book).run(&ok, 1000).is_ok());
+    }
+
+    /// Review round 3, item 2: the helper's runner sends its two exact lines to the protected
+    /// phone under a lease, and nothing more than a leased runner would.
+    #[test]
+    fn the_helper_runner_has_two_exact_lines_under_a_lease() {
+        const STAGED: &str = "C:/state/agentroid-dump.dex";
+        let spy = || Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        };
+        let push = args(&["-s", S24_IP, "push", STAGED, DUMP_HELPER_REMOTE]);
+        let hash = args(&["-s", S24_IP, "shell", DUMP_HELPER_HASH_READ]);
+        let (clock, book) = book_with_lease(&[S24_IP]);
+        let helper = || GuardedRunner::with_s24_helper(spy(), STAGED.into(), book.clone());
+        assert!(helper().run(&push, 1000).is_ok());
+        assert!(helper().run(&hash, 1000).is_ok());
+        for near in [
+            args(&[
+                "-s",
+                S24_IP,
+                "push",
+                "C:/other/agentroid-dump.dex",
+                DUMP_HELPER_REMOTE,
+            ]),
+            args(&["-s", S24_IP, "push", STAGED, "/data/local/tmp/other.dex"]),
+            args(&["-s", S24_IP, "push", STAGED, DUMP_HELPER_REMOTE, "x"]),
+            args(&["-s", S24_IP, "push", STAGED]),
+            args(&["-s", S24_IP, "exec-out", DUMP_HELPER_HASH_READ]),
+            args(&["-s", S24_IP, "shell", "install x.apk"]),
+            args(&["-s", "192.0.2.1:5555", "push", STAGED, DUMP_HELPER_REMOTE]),
+        ] {
+            assert!(helper().run(&near, 1000).is_err(), "{near:?}");
+        }
+        // an empty staged path matches nothing
+        let blank = GuardedRunner::with_s24_helper(spy(), String::new(), book.clone());
+        assert!(blank
+            .run(&args(&["-s", S24_IP, "push", "", DUMP_HELPER_REMOTE]), 1000)
+            .is_err());
+        // other runners: the push is code, refused
+        assert!(leased_s24(&book).run(&push, 1000).is_err());
+        assert!(GuardedRunner::new(spy()).run(&push, 1000).is_err());
+        assert!(GuardedRunner::new(spy()).run(&hash, 1000).is_err());
+        // past the lease: refused, nothing sent but the probe
+        clock.advance(30 * 60_000);
+        let r = helper();
+        assert!(r.run(&push, 1000).is_err());
+        assert!(r.run(&hash, 1000).is_err());
+        let sent = r.inner.calls.borrow();
+        assert_eq!(sent.len(), 1, "only the identity probe: {sent:?}");
+        assert!(
+            !sent
+                .iter()
+                .any(|c| c.iter().any(|w| w == "push" || w.contains("sha256sum"))),
+            "{sent:?}"
+        );
+        drop(sent);
+        // and on an ordinary phone the helper runner is a plain runner
+        let poco = GuardedRunner::with_s24_helper(
+            Spy {
+                hw: POCO_HW.into(),
+                calls: RefCell::new(vec![]),
+            },
+            STAGED.into(),
+            book.clone(),
+        );
+        assert!(poco
+            .run(
+                &args(&["-s", "192.0.2.78:37123", "push", STAGED, DUMP_HELPER_REMOTE]),
+                1000
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn a_lease_never_lifts_transport_install_or_raw_input_commands() {
+        let (_, book) = book_with_lease(&[S24_IP, S24_SERIAL]);
+        let refused: [&[&str]; 13] = [
+            &["install", "a.apk"],
+            &["uninstall", "com.whatsapp"],
+            &["tcpip", "5555"],
+            &["reboot"],
+            &["root"],
+            &["shell", "reboot"],
+            &["shell", "input tap 1 1; /system/bin/reboot"],
+            &["shell", "pm uninstall com.whatsapp"],
+            &["shell", "cmd package clear com.google.android.gm"],
+            &["shell", "setprop service.adb.tcp.port 5555"],
+            &["shell", "svc wifi disable"],
+            &["exec-out", "getevent", "-lt"],
+            &["forward", "--list"],
+        ];
+        for n in refused {
+            let r = leased_s24(&book);
+            let mut a = vec!["-s", S24_IP];
+            a.extend_from_slice(n);
+            assert!(r.run(&args(&a), 1000).is_err(), "{n:?}");
+            assert!(
+                r.inner.calls.borrow().len() <= 1,
+                "{n:?}: nothing but the probe"
+            );
+        }
+        let r = leased_s24(&book);
+        assert!(r.run(&link_dump_argv(S24_IP), 1000).is_err());
+        r.guard().deny(S24_IP);
+        assert!(r.run(&args(&["connect", S24_IP]), 1000).is_err());
+        assert!(r.run(&args(&["disconnect", S24_SERIAL]), 1000).is_err());
+        let g = &r.guard;
+        for sp in [S24_SERIAL, S24_IP] {
+            assert!(g
+                .check_getevent(&args(&["-s", sp, "exec-out", "getevent", "-lt"]), true)
+                .is_err());
+        }
     }
 }

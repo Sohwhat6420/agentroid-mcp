@@ -178,6 +178,7 @@ impl Daemon {
         let key = device_key(&info);
         self.require_holder(&key, conn)?;
         self.keep_awake(conn, &key, &info);
+        let _caller = crate::server::caller_scope(conn, None);
         let (mode, allowed) = {
             let b = self.backend();
             (b.mode_of(&info), b.allowed(&info))
@@ -249,6 +250,16 @@ impl Daemon {
             DeviceMode::ReadOnly => Err(refused(&Refusal::ReadOnly { tool }, tool, "read_only")),
             DeviceMode::Helper => Err(refused(&Refusal::NeedsAdbShell { tool }, tool, "helper")),
         }
+    }
+
+    /// [`Self::full_only`], except that the protected phone goes on to core's file gate when the
+    /// protected-device lease is on: its lease, its configured mode and the protected paths are
+    /// checked there.
+    fn full_or_leased(&self, t: &Target, tool: &'static str) -> Result<(), RpcError> {
+        if t.s24 && self.backend().protected_lease_on() {
+            return Ok(());
+        }
+        Self::full_only(t, tool)
     }
 
     fn doctor(&self, t: &Target, call: &Value) -> Result<Value, RpcError> {
@@ -334,7 +345,7 @@ impl Daemon {
     }
 
     fn push(&self, t: &Target, call: &Value) -> Result<Value, RpcError> {
-        Self::full_only(t, "push")?;
+        self.full_or_leased(t, "push")?;
         let local = arg(call, "local")?;
         let remote = arg(call, "phone_path")?;
         check_phone_path(remote)?;
@@ -393,7 +404,7 @@ impl Daemon {
     }
 
     fn pull_new(&self, t: &Target, call: &Value) -> Result<Value, RpcError> {
-        Self::full_only(t, "pull_new")?;
+        self.full_or_leased(t, "pull_new")?;
         let dir = arg(call, "dir")?;
         check_phone_path(dir)?;
         // the directory first (a refused directory is never listed), the file itself below
