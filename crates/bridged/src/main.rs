@@ -538,6 +538,8 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
                         "stay-awake alerts: bridged.log only (no ntfy topic file, or AGENTROID_AWAKE_ALERTS=0)",
                     ),
                 }
+                // each alert at most once a day, across restarts too
+                a.set_alert_file(args.state_dir.join("awake-alerts.json"));
                 // a push can take seconds: off the start-up path
                 let a = a.clone();
                 std::thread::spawn(move || a.leftover_check());
