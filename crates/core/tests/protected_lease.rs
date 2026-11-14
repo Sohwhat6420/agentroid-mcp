@@ -1683,7 +1683,7 @@ fn a_re_allow_after_a_restart_is_not_closed_again_by_the_old_deny() {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(r.dir.join("protected-holds.json")).unwrap())
             .unwrap();
-    assert_eq!(v["version"], 2);
+    assert_eq!(v["version"], 3);
     assert_eq!(v["hold"]["reallow"], true);
     assert_eq!(v["seen_denies"], serde_json::json!(["ev1"]));
     // a restart: the channel still carries the old Deny

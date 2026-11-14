@@ -24,6 +24,10 @@ And on what one Allow covers (14 Nov 2026, round 4b):
 
 > "Allow covers pulls; links still ask (Recommended)"
 
+And on the screen lock's reads of the protected phone (14 Nov 2026, round 4c):
+
+> "Allow the two reads (Recommended)"
+
 So the earlier content rules (protected apps, their web hosts and file paths, the keyguard, the
 notification shade, Recents, notification history, and the heads-up check) are gone. The approval
 push, the engineering around it (holds, one ask per phone, the audit log), the fixed refusals that
@@ -204,6 +208,30 @@ are not on the list, not because a list of bad words names them.
 
 The guard therefore never trusts a lease on its own. If `getprop ro.serialno` fails and core takes
 the phone for an ordinary device, core binds nothing, and the guard refuses the phone.
+
+### The screen lock's own reads
+
+Apart from the lease, one runner may read the protected phone: the daemon's screen-lock reader
+(`GuardedRunner::with_s24_lock_reads`, built in `bridged`'s `lock_reader`). With no lease it sends
+the approved `dumpsys power`, and these three lines, each as `shell` plus the one argument, word
+for word (`Checked::is_s24_call_state`, `Checked::is_s24_lock_read`):
+
+- `dumpsys telephony.registry` (`S24_CALL_STATE_READ`, the call state; 14 Nov 2026);
+- `dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='` (`S24_FOCUS_READ`, the app in
+  front; the owner's ruling "Allow the two reads (Recommended)", round 4c);
+- `dumpsys input_method | grep -E 'mInputShown='` (`S24_KEYBOARD_READ`, whether the keyboard is up;
+  the same ruling).
+
+They are the same lines the screen lock sends to every phone (`askscreen::read_signals_timed`
+uses the constants). The reader keeps only the focused package, the keyboard's yes or no and the
+call state (`askscreen::lock_signals` drops the lock-screen flag; the dumps are never kept, logged
+or returned). They are not approved reads (`S24_READS`): `doctor`, the MCP tools, `ask-screen`'s
+call-state runner, the plain guard and every other runner still refuse them on the protected
+phone. Any other spelling (another grep, a flag, a pipe more, `exec-out`, spare spaces) is refused.
+
+So the screen lock on the protected phone now judges it the way it judges any phone: with the
+screen on, a phone that is untouched, with no listed app in front and no keyboard, is free, so
+work on it (daytime or overnight) is no longer limited to bursts while the screen is off.
 
 ### The dump helper's integrity
 

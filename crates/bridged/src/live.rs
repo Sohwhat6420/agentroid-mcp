@@ -770,6 +770,29 @@ impl<R: Runner> Transport for AdbTransport<R> {
     }
 }
 
+/// The screen lock's phone reader over `inner`: the one runner that may read the protected
+/// phone's call state, focused app and keyboard (adb-link's `S24_CALL_STATE_READ` and
+/// `S24_FOCUS_READ`; the owner's ruling of 14 Nov 2026, "Allow the two reads (Recommended)"), and
+/// it keeps only the parsed state the lock decides on ([`agentroid_core::askscreen::lock_signals`]).
+pub fn lock_reader<R: Runner + Send + 'static>(
+    inner: R,
+) -> impl FnMut(&str, &dyn Fn() -> u64) -> Option<Reading> + Send {
+    let read_runner = agentroid_adb_link::guard::GuardedRunner::with_s24_lock_reads(inner);
+    move |serial, mono| {
+        agentroid_core::askscreen::read_signals_timed(
+            &read_runner,
+            serial,
+            mono,
+            agentroid_core::screenlock::LOCK_READ_BUDGET_MS,
+        )
+        .map(|(signals, power_from, power_to)| Reading {
+            signals: agentroid_core::askscreen::lock_signals(signals),
+            power_from,
+            power_to,
+        })
+    }
+}
+
 /// The screen lock for live adb (13 Nov 2026): no screen-changing call to a real phone unless
 /// `ask-screen` gave a live lease or the phone is not in use at the time of the call. It reads the
 /// phone through its own guarded runners and the leases from `lease_dir`. There is no switch to
@@ -777,26 +800,11 @@ impl<R: Runner> Transport for AdbTransport<R> {
 pub fn screen_lock_for_adb(lease_dir: std::path::PathBuf, adb: &Path) -> ScreenLock {
     use agentroid_adb_link::guard::GuardedRunner;
     use agentroid_adb_link::runner::AdbRunner;
-    // the one reader that may read the protected phone's call state (and keeps only the parsed
-    // state): see adb-link's S24_CALL_STATE_READ
-    let read_runner = GuardedRunner::with_s24_call_state(AdbRunner::new(adb));
     let probe_runner = GuardedRunner::new(AdbRunner::new(adb));
     let origin = Instant::now();
     ScreenLock::new(
         lease_dir,
-        Box::new(move |serial, mono| {
-            agentroid_core::askscreen::read_signals_timed(
-                &read_runner,
-                serial,
-                mono,
-                agentroid_core::screenlock::LOCK_READ_BUDGET_MS,
-            )
-            .map(|(signals, power_from, power_to)| Reading {
-                signals,
-                power_from,
-                power_to,
-            })
-        }),
+        Box::new(lock_reader(AdbRunner::new(adb))),
         Box::new(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -837,6 +845,49 @@ mod lock_wiring_tests {
         );
         let lock = core.screen_lock().expect("the lock is installed");
         assert_eq!(lock.state_dir(), dir.as_path());
+    }
+
+    /// The protected phone as adb would answer the screen lock's reads, recording each line.
+    struct ProtectedPhone(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl Runner for ProtectedPhone {
+        fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
+            use agentroid_adb_link::guard::{
+                S24_CALL_STATE_READ, S24_FOCUS_READ, S24_KEYBOARD_READ, S24_SERIAL,
+            };
+            let cmd = a.last().cloned().unwrap_or_default();
+            self.0.lock().unwrap().push(cmd.clone());
+            let out = match cmd.as_str() {
+                "getprop ro.serialno" => format!("{S24_SERIAL}\n"),
+                "dumpsys power" => "  mWakefulness=Awake\n  mWakeLockSummary=0x1\n  mLastWakeTime=1 (900000 ms ago)\nDisplay Group 0:\n  lastUserActivityTime=1 (600000 ms ago)\n".into(),
+                c if c == S24_CALL_STATE_READ => "  mCallState=0\n".into(),
+                c if c == S24_FOCUS_READ => "  mCurrentFocus=Window{1 u0 com.example.notes/com.example.notes.Main}\n    isKeyguardShowing=false\n".into(),
+                c if c == S24_KEYBOARD_READ => "  mInputShown=false\n".into(),
+                _ => return Err(RunError::Refused("not on the list".into())),
+            };
+            Ok(RunOutput {
+                code: Some(0),
+                stdout: out,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Review round 4c, the owner's ruling (14 Nov 2026): "Allow the two reads (Recommended)".
+    /// The daemon's screen lock reads the protected phone's focused app and keyboard through its
+    /// own runner, and keeps the package and the keyboard's yes or no only.
+    #[test]
+    fn the_screen_lock_reads_the_protected_phones_focused_app_and_keyboard() {
+        use agentroid_adb_link::guard::{S24_FOCUS_READ, S24_KEYBOARD_READ};
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let mut read = lock_reader(ProtectedPhone(sent.clone()));
+        let mono = || 0u64;
+        let r = read("192.0.2.99:40000", &mono).expect("the protected phone is read");
+        assert_eq!(r.signals.focus.as_deref(), Some("com.example.notes"));
+        assert_eq!(r.signals.ime_shown, Some(false));
+        assert_eq!(r.signals.keyguard, None);
+        let sent = sent.lock().unwrap();
+        assert!(sent.iter().any(|c| c == S24_FOCUS_READ), "{sent:?}");
+        assert!(sent.iter().any(|c| c == S24_KEYBOARD_READ), "{sent:?}");
     }
 }
 

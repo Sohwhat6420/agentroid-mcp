@@ -537,7 +537,16 @@ fn write_head(path: &Path, seq: u64, hash: &str) -> io::Result<()> {
             std::fs::create_dir_all(dir)?;
         }
     }
-    std::fs::write(path, format!("{seq} {hash}\n"))
+    // written beside it and renamed over it, so a failed write leaves the old head whole
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let r =
+        std::fs::write(&tmp, format!("{seq} {hash}\n")).and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 impl AuditLog {
@@ -698,10 +707,37 @@ impl AuditLog {
         };
         let mut line = r.to_json();
         line.push('\n');
-        self.file.write_all(line.as_bytes())?;
-        self.file.flush()?;
-        self.file.sync_data()?;
-        write_head(&head_path(&self.path), r.seq, &r.hash)?;
+        // A failure up to and including the head write leaves nothing behind: the line is taken
+        // out again, so a caller that retries (the protected lease's close queue does) never
+        // writes the record twice, and the chain never holds two records with one `seq`. Before
+        // this, the line stayed while `seq` did not move, so a retry forked the chain.
+        let before = std::fs::metadata(&self.path)?.len();
+        let written = self
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_data())
+            .and_then(|()| write_head(&head_path(&self.path), r.seq, &r.hash));
+        if let Err(err) = written {
+            let undo = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|f| f.set_len(before).and_then(|()| f.sync_data()));
+            if let Err(undo) = undo {
+                // the line could not be taken out: it stands, so the chain moves on from it
+                self.seq = seq;
+                self.last = r.hash.clone();
+                self.part_records += 1;
+                self.part_first_ts.get_or_insert(ts_ms);
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!(
+                        "{err} (the record stays in the log: it could not be taken out: {undo})"
+                    ),
+                ));
+            }
+            return Err(err);
+        }
         self.seq = seq;
         self.last = r.hash.clone();
         self.part_records += 1;
@@ -1061,6 +1097,43 @@ mod tests {
         // a broken chain is never appended to
         std::fs::write(&p1, orig.replacen("case 0", "case 9", 1)).unwrap();
         assert!(AuditLog::open(&p).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ------------------------------------------------------------------ a failed append
+
+    /// Review round 4c: an append whose head file cannot be written reports a failure AND leaves
+    /// nothing behind, so a retry writes the record once and the chain never forks (Windows and
+    /// Linux alike: a directory in the head file's place refuses the write on both).
+    #[test]
+    fn a_failed_append_leaves_nothing_so_a_retry_writes_the_record_once() {
+        let d = tmp("failed-append");
+        let p = d.join("audit.jsonl");
+        let mut log = AuditLog::open(&p).unwrap();
+        log.append(&entry(0, "allowed")).unwrap();
+        let head = head_path(&p);
+        std::fs::remove_file(&head).unwrap();
+        std::fs::create_dir_all(&head).unwrap();
+        for _ in 0..3 {
+            log.append(&entry(1, "blocked")).unwrap_err();
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "nothing of the failed appends: {text}"
+        );
+        assert_eq!(log.head().0, 1);
+        std::fs::remove_dir_all(&head).unwrap();
+        let r = log.append(&entry(1, "blocked")).unwrap();
+        assert_eq!(r.seq, 2);
+        let c = verify_chain(&p, None).unwrap();
+        assert_eq!(c.all.records, 2);
+        assert_eq!(read_head(&head).unwrap().unwrap().0, 2);
+        assert!(
+            !d.join("audit.jsonl.head.tmp").exists(),
+            "no temporary head left"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

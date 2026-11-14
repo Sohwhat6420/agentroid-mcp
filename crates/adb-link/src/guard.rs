@@ -67,6 +67,24 @@ pub const S24_SCREEN_AWAKE_KEYS: [(&str, &str); 2] = [
 /// (`askscreen::parse_call_state`) and drops the text. It is not in [`S24_READS`].
 pub const S24_CALL_STATE_READ: &str = "dumpsys telephony.registry";
 
+/// The protected phone's focused app and keyboard, for the screen lock alone. Added 14 Nov 2026 on
+/// the owner's ruling, word for word: "Allow the two reads (Recommended)". Without them the
+/// protected phone's focused app and keyboard are unknown, so with its screen on it always reads
+/// as in use, and work on it was limited to bursts.
+///
+/// These are exactly the two lines the screen lock sends to every phone
+/// (`askscreen::read_signals_timed` uses these constants). Only a runner built with
+/// [`GuardedRunner::with_s24_lock_reads`] (the daemon's screen-lock reader, and no other) lets them
+/// through to the protected phone, and only in the exact shape [`Checked::is_s24_lock_read`]
+/// accepts (`shell` plus one of these two arguments, word for word). Every other runner (the
+/// call-state runner `ask-screen` uses included), the plain [`Guard`], `doctor` and the MCP tools
+/// still refuse them for the protected phone. They are not in [`S24_READS`]. The reader keeps only
+/// the focused package and the keyboard's yes or no (`askscreen::lock_signals`) and drops the
+/// text.
+pub const S24_FOCUS_READ: &str = "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='";
+/// See [`S24_FOCUS_READ`].
+pub const S24_KEYBOARD_READ: &str = "dumpsys input_method | grep -E 'mInputShown='";
+
 /// The fallback screen reader's path on a phone (`bridged/assets/idle-free-dump`).
 pub const DUMP_HELPER_REMOTE: &str = "/data/local/tmp/agentroid-dump.dex";
 
@@ -393,6 +411,15 @@ impl Checked {
         self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == S24_CALL_STATE_READ
     }
 
+    /// True when this is exactly one of the screen lock's two reads of the protected phone's
+    /// focused app and keyboard: `shell` plus [`S24_FOCUS_READ`] or [`S24_KEYBOARD_READ`], word
+    /// for word.
+    pub fn is_s24_lock_read(&self) -> bool {
+        self.sub == "shell"
+            && self.rest.len() == 1
+            && (self.rest[0] == S24_FOCUS_READ || self.rest[0] == S24_KEYBOARD_READ)
+    }
+
     /// True when this is exactly one of the dump helper's two lines for the protected phone: the
     /// hash read (`shell` plus [`DUMP_HELPER_HASH_READ`]) or the push of `staged`, the daemon's
     /// own staged copy, to [`DUMP_HELPER_REMOTE`], word for word.
@@ -693,6 +720,9 @@ pub struct Guard {
     /// The protected phone call-state read (see [`S24_CALL_STATE_READ`]). Off unless the runner was built
     /// with [`GuardedRunner::with_s24_call_state`].
     s24_call_state: bool,
+    /// The protected phone's focused-app and keyboard reads (see [`S24_FOCUS_READ`]). Off unless
+    /// the runner was built with [`GuardedRunner::with_s24_lock_reads`].
+    s24_lock_reads: bool,
     /// The dump helper's staged copy on the laptop, for its two lines to the protected phone under a
     /// lease ([`Checked::is_s24_helper`]). `None` unless the runner was built with
     /// [`GuardedRunner::with_s24_helper`].
@@ -736,7 +766,8 @@ impl Guard {
             if let Some(v) = sel.get(1) {
                 let read = probe.is_s24_read()
                     || (self.s24_screen_awake && probe.is_s24_screen_awake())
-                    || (self.s24_call_state && probe.is_s24_call_state());
+                    || (self.s24_call_state && probe.is_s24_call_state())
+                    || (self.s24_lock_reads && probe.is_s24_lock_read());
                 // under a lease core bound this name: `GuardedRunner::admit` still reads the
                 // hardware serial and applies `protected_policy`
                 if self.is_forbidden(v) && !read && !self.lease_admits(v) {
@@ -932,6 +963,20 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
+    /// The daemon's screen-lock reader, and nothing else: as [`Self::with_s24_call_state`], plus
+    /// the protected phone's focused-app and keyboard reads ([`S24_FOCUS_READ`],
+    /// [`S24_KEYBOARD_READ`], exactly as [`Checked::is_s24_lock_read`] accepts them).
+    pub fn with_s24_lock_reads(inner: R) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                s24_call_state: true,
+                s24_lock_reads: true,
+                ..Guard::default()
+            },
+        }
+    }
+
     /// The runner the live transport checks and puts the dump helper on the protected phone
     /// through, and nothing else: as [`GuardedRunner::with_leases`], plus, under an open lease for
     /// a bound name, the helper's hash read and the push of `staged` (the daemon's own copy) to
@@ -1041,7 +1086,8 @@ impl<R: Runner> GuardedRunner<R> {
                         self.guard.deny(v);
                     }
                     let excepted = (self.guard.s24_screen_awake && c.is_s24_screen_awake())
-                        || (self.guard.s24_call_state && c.is_s24_call_state());
+                        || (self.guard.s24_call_state && c.is_s24_call_state())
+                        || (self.guard.s24_lock_reads && c.is_s24_lock_read());
                     if !c.is_s24_read() && !excepted {
                         // the lease counts only for a name core checked and bound under it: a
                         // phone core took for an ordinary device never rides on it
@@ -2176,6 +2222,109 @@ mod tests {
         assert!(r.run(&link_dump_argv(S24_SERIAL), 1000).is_err());
         // and on other phones it drives as before
         let r = GuardedRunner::with_s24_call_state(Spy {
+            hw: POCO_HW.into(),
+            calls: RefCell::new(vec![]),
+        });
+        assert!(r
+            .run(
+                &args(&["-s", "192.0.2.78:37123", "shell", "input tap 1 1"]),
+                1000
+            )
+            .is_ok());
+    }
+
+    // ---- round 4c: "Allow the two reads (Recommended)" ----
+
+    #[test]
+    fn only_the_lock_runner_lets_the_focus_and_keyboard_reads_reach_the_s24() {
+        for line in [S24_FOCUS_READ, S24_KEYBOARD_READ] {
+            let exact = line.to_string();
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let argv = args(&["-s", sel, "shell", &exact]);
+                // the screen lock's reader: through, as sent, and the call state too
+                let r = GuardedRunner::with_s24_lock_reads(s24_spy());
+                r.run(&argv, 1000)
+                    .unwrap_or_else(|e| panic!("{sel} {line}: {e:?}"));
+                assert_eq!(r.inner.calls.borrow().last(), Some(&argv), "{sel}");
+                let mut marked = false;
+                assert!(r.run_marked(&argv, 1000, &mut || marked = true).is_ok());
+                assert!(marked);
+                let call = args(&["-s", sel, "shell", S24_CALL_STATE_READ]);
+                assert!(r.run(&call, 1000).is_ok(), "{sel}");
+                // every other runner, ask-screen's call-state runner included, and the plain
+                // guard refuse them
+                for other in [
+                    GuardedRunner::new(s24_spy()),
+                    GuardedRunner::with_s24_screen_awake(s24_spy()),
+                    GuardedRunner::with_s24_call_state(s24_spy()),
+                ] {
+                    assert!(
+                        matches!(other.run(&argv, 1000), Err(RunError::Refused(_))),
+                        "{sel} {line}"
+                    );
+                    assert!(!other
+                        .inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&exact)));
+                }
+                if sel == S24_SERIAL {
+                    assert!(Guard::new().check(&argv).is_err());
+                }
+            }
+        }
+        // not approved reads, for doctor or anyone
+        assert!(!S24_READS
+            .iter()
+            .any(|r| r.contains("window") || r.contains("input_method")));
+    }
+
+    #[test]
+    fn the_lock_runner_refuses_every_other_shape_on_the_s24() {
+        let near = [
+            "dumpsys window",
+            "dumpsys input_method",
+            "dumpsys window | grep -E 'mCurrentFocus='",
+            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing=' ",
+            " dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='",
+            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing=|mFocusedApp='",
+            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='; input tap 1 1",
+            "dumpsys window windows | grep -E 'mCurrentFocus=|isKeyguardShowing='",
+            "dumpsys input_method | grep -E 'mInputShown=' | cat",
+            "dumpsys input_method | grep -E 'mInputShown=|mCurText'",
+            "dumpsys input_method|grep -E 'mInputShown='",
+            "dumpsys notification",
+            "input tap 1 1",
+        ];
+        for line in near {
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let r = GuardedRunner::with_s24_lock_reads(s24_spy());
+                let argv = args(&["-s", sel, "shell", line]);
+                assert!(
+                    matches!(r.run(&argv, 1000), Err(RunError::Refused(_))),
+                    "{sel} {line}"
+                );
+                assert!(
+                    !r.inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&line.to_string())),
+                    "{line} reached adb"
+                );
+            }
+        }
+        // the multi-word spelling and exec-out are not the shape the lock sends
+        for a in [
+            &["-s", S24_SERIAL, "exec-out", S24_FOCUS_READ][..],
+            &["-s", S24_SERIAL, "shell", "dumpsys", "input_method"][..],
+        ] {
+            let r = GuardedRunner::with_s24_lock_reads(s24_spy());
+            assert!(r.run(&args(a), 1000).is_err(), "{a:?}");
+        }
+        // and on other phones it drives as before
+        let r = GuardedRunner::with_s24_lock_reads(Spy {
             hw: POCO_HW.into(),
             calls: RefCell::new(vec![]),
         });

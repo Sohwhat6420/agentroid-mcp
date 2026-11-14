@@ -482,15 +482,17 @@ pub fn read_signals_timed(
     s.in_call = shell_within(r, device, "dumpsys telephony.registry", left()?)
         .and_then(|t| parse_call_state(&t));
     if s.screen_on() == Some(true) {
+        // the same two lines on every phone: on the protected phone only the screen lock's own
+        // runner lets them through (adb-link's S24_FOCUS_READ, the owner's ruling of 14 Nov 2026)
         if let Some(w) = shell_within(
             r,
             device,
-            "dumpsys window | grep -E 'mCurrentFocus=|isKeyguardShowing='",
+            agentroid_adb_link::guard::S24_FOCUS_READ,
             left()?,
         ) {
             (s.focus, s.keyguard) = parse_window(&w);
         }
-        let cmd = "dumpsys input_method | grep -E 'mInputShown='";
+        let cmd = agentroid_adb_link::guard::S24_KEYBOARD_READ;
         if let Some(i) = shell_within(r, device, cmd, left()?) {
             s.ime_shown = parse_ime(&i);
         }
@@ -498,6 +500,23 @@ pub fn read_signals_timed(
     // the budget spent by the last command: what was read may be out of date
     left()?;
     Some((s, from, to))
+}
+
+/// What the screen lock keeps of a reading: only the fields [`judge`] decides on (the screen,
+/// the last touch, whether the screen is held on, the call state, the focused package and the
+/// keyboard's yes or no). The lock-screen flag is dropped: the lock never uses it, and on the
+/// protected phone the owner allowed the focused app and the keyboard only (14 Nov 2026: "Allow
+/// the two reads (Recommended)"). The dumps themselves were never kept.
+pub fn lock_signals(s: Signals) -> Signals {
+    Signals {
+        wakefulness: s.wakefulness,
+        idle_ms: s.idle_ms,
+        screen_kept_on: s.screen_kept_on,
+        in_call: s.in_call,
+        focus: s.focus,
+        ime_shown: s.ime_shown,
+        keyguard: None,
+    }
 }
 
 /// A hardware serial too generic to tell phones apart (cheap phones and some boards all report
@@ -1622,6 +1641,82 @@ mod tests {
             }
         }
     }
+
+    /// The protected phone, through the guard: its hardware serial is the protected one.
+    struct ProtectedPhone(Mutex<Vec<String>>);
+    impl Runner for ProtectedPhone {
+        fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
+            use agentroid_adb_link::guard::{
+                S24_CALL_STATE_READ, S24_FOCUS_READ, S24_KEYBOARD_READ, S24_SERIAL,
+            };
+            let cmd = a.last().cloned().unwrap_or_default();
+            self.0.lock().unwrap().push(cmd.clone());
+            let out = match cmd.as_str() {
+                "getprop ro.serialno" => format!("{S24_SERIAL}\n"),
+                "dumpsys power" => POWER_AWAKE.into(),
+                c if c == S24_CALL_STATE_READ => NO_CALL.into(),
+                c if c == S24_FOCUS_READ => "  mCurrentFocus=Window{535f00b u0 com.example.notes/com.example.notes.secret.EditActivity}\n    isKeyguardShowing=false\n".into(),
+                c if c == S24_KEYBOARD_READ => "  mInputShown=true\n".into(),
+                _ => return Err(RunError::Refused("not on the list".into())),
+            };
+            Ok(RunOutput {
+                code: Some(0),
+                stdout: out,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Review round 4c, the owner's ruling (14 Nov 2026): "Allow the two reads (Recommended)".
+    /// The screen lock's own runner reads the protected phone's focused app and keyboard; the
+    /// lock keeps the package and the keyboard's yes or no, nothing else.
+    #[test]
+    fn the_lock_reads_the_protected_phones_focused_app_and_keyboard_and_keeps_only_those() {
+        use agentroid_adb_link::guard::GuardedRunner;
+        let dev = "192.0.2.99:40000";
+        let clock = || 0u64;
+        let lock = GuardedRunner::with_s24_lock_reads(ProtectedPhone(Mutex::new(vec![])));
+        let (s, _, _) = read_signals_timed(&lock, dev, &clock, LOCK_BUDGET).expect("read");
+        let s = lock_signals(s);
+        assert_eq!(
+            s.focus.as_deref(),
+            Some("com.example.notes"),
+            "the package only"
+        );
+        assert_eq!(s.ime_shown, Some(true));
+        assert_eq!(s.keyguard, None, "the lock-screen flag is dropped");
+        assert_eq!(s.in_call, Some(false));
+        assert!(
+            matches!(judge(&s, 60_000, &[]), Use::InUse(_)),
+            "the keyboard is open"
+        );
+        // ask-screen's call-state runner and the plain runner still cannot read them
+        for other in [
+            GuardedRunner::with_s24_call_state(ProtectedPhone(Mutex::new(vec![]))),
+            GuardedRunner::new(ProtectedPhone(Mutex::new(vec![]))),
+        ] {
+            let got = read_signals_timed(&other, dev, &clock, LOCK_BUDGET).map(|(s, _, _)| s);
+            if let Some(s) = got {
+                assert_eq!((s.focus, s.ime_shown), (None, None));
+            }
+        }
+        // lock_signals keeps every field the judge decides on
+        let full = Signals {
+            keyguard: Some(true),
+            ..awake("com.example.reader", false, 3_600_000)
+        };
+        let kept = lock_signals(full.clone());
+        assert_eq!(
+            kept,
+            Signals {
+                keyguard: None,
+                ..full
+            }
+        );
+    }
+
+    /// A budget the fake clock never spends.
+    const LOCK_BUDGET: u64 = 60_000;
 
     #[test]
     fn a_dozing_phone_is_read_with_two_commands_power_and_the_call_state() {
