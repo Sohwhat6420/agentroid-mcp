@@ -161,6 +161,15 @@ pub trait DeviceBackend: Send {
     /// The work `ticket` names ([`DeviceBackend::lock_admit_segment`], or a shell line through
     /// [`DeviceBackend::shell_gate`]) has run: its end is the agent's own activity. Default: none.
     fn lock_done(&mut self, _ticket: LockTicket) {}
+    /// Is the protected-device lease on (`--protected-lease`)? Default: no.
+    fn protected_lease_on(&self) -> bool {
+        false
+    }
+    /// How core learns who holds the protected phone (the daemon's registry). Default: no lease.
+    fn set_protected_holders(&mut self, _f: agentroid_core::protected::HolderFn) {}
+    /// A job under daemon lease `epoch` started (`Some(run id)`) or ended (`None`): named on the
+    /// protected phone's asks and lease. Default: none.
+    fn protected_job(&mut self, _epoch: u64, _job: Option<String>) {}
 }
 
 /// Why a backend without the phone half answers `pixel_probe` and element crops with an error.
@@ -279,6 +288,19 @@ impl<T: Transport + Send, C: Clock + Send> DeviceBackend for CoreBackend<T, C> {
     fn lock_done(&mut self, ticket: LockTicket) {
         self.core.lock_done(ticket);
     }
+    fn protected_lease_on(&self) -> bool {
+        self.core.protected().is_some()
+    }
+    fn set_protected_holders(&mut self, f: agentroid_core::protected::HolderFn) {
+        if let Some(p) = self.core.protected_mut() {
+            p.set_holders(f);
+        }
+    }
+    fn protected_job(&mut self, epoch: u64, job: Option<String>) {
+        if let Some(p) = self.core.protected_mut() {
+            p.set_job(epoch, job);
+        }
+    }
 }
 
 pub struct Daemon {
@@ -300,6 +322,9 @@ pub struct Daemon {
     pub(crate) files_dir: OnceLock<PathBuf>,
     /// Session stay-awake (`crate::awake`), once attached (live adb only).
     pub(crate) awake: OnceLock<Arc<crate::awake::SessionAwake>>,
+    /// The protected-device lease book, once attached: a connection that goes, or a release of
+    /// the protected phone, closes the lease it holds.
+    pub(crate) protected_book: OnceLock<Arc<agentroid_adb_link::lease::LeaseBook>>,
     /// The `Arc` this daemon lives in, so a job thread can own a handle to it.
     me: Weak<Daemon>,
 }
@@ -355,7 +380,13 @@ struct ConnGuard<'a> {
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
-        self.daemon.registry.release_conn(self.id);
+        let released = self.daemon.registry.release_conn(self.id);
+        // its protected-device lease goes with it (the book alone: no backend lock in a drop)
+        if let Some(book) = self.daemon.protected_book.get() {
+            for l in &released {
+                book.close_epoch(l.epoch);
+            }
+        }
         if let Some(a) = self.daemon.awake.get() {
             // the restore talks to the phone: queued on stay-awake's worker, after this session's hold
             a.leave_later(self.id);
@@ -413,8 +444,30 @@ impl Daemon {
             waits: OnceLock::new(),
             files_dir: OnceLock::new(),
             awake: OnceLock::new(),
+            protected_book: OnceLock::new(),
             me: me.clone(),
         })
+    }
+
+    /// Attach the protected-device lease (once): core learns from this daemon's registry who
+    /// holds the protected phone, and the lease closes with its holder's connection or release.
+    pub fn attach_protected(
+        &self,
+        book: Arc<agentroid_adb_link::lease::LeaseBook>,
+    ) -> Result<(), String> {
+        self.protected_book
+            .set(book)
+            .map_err(|_| "the protected-device lease is already attached".to_string())?;
+        let registry = self.registry.clone();
+        self.backend().set_protected_holders(Box::new(move |d| {
+            registry
+                .lease_of(&device_key(d))
+                .map(|l| agentroid_adb_link::lease::Holder {
+                    name: l.holder,
+                    epoch: l.epoch,
+                })
+        }));
+        Ok(())
     }
 
     /// Start the link hub and attach it (once). Its epochs come from this daemon's registry.
@@ -733,8 +786,14 @@ impl Daemon {
                     .resolve(&p.device)
                     .map(|d| device_key(&d))
                     .unwrap_or(p.device);
+                let epoch = self.registry.lease_of(&key).map(|l| l.epoch);
                 match self.registry.release(&key, conn.id) {
-                    ReleaseOutcome::Released => to_value(&LeaseReleaseResult { released: true }),
+                    ReleaseOutcome::Released => {
+                        if let (Some(book), Some(e)) = (self.protected_book.get(), epoch) {
+                            book.close_epoch(e);
+                        }
+                        to_value(&LeaseReleaseResult { released: true })
+                    }
                     ReleaseOutcome::NotLeased => to_value(&LeaseReleaseResult { released: false }),
                     ReleaseOutcome::NotHolder(l) => Err(RpcError::new(
                         NOT_HOLDER,

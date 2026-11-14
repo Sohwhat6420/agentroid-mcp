@@ -1318,4 +1318,113 @@ mod tests {
             );
         }
     }
+
+    /// The guard and core together: core's lease binds the adb name it checked, the guard lets
+    /// that name (and only that name) through, with the protected-phone policy still on.
+    #[test]
+    fn behind_the_guard_one_allow_lets_core_act_on_the_protected_phone_and_nothing_else_rides_on_it(
+    ) {
+        use agentroid_adb_link::lease::{Holder, LeaseBook, ManualClock};
+        use agentroid_core::approval::{Approver, Channel, Inbound, Request};
+        use agentroid_core::fake::FakeClock;
+        use agentroid_core::gate::{Call, Refusal, Target};
+        use agentroid_core::protected::{Protected, ProtectedConfig};
+        use agentroid_core::transport::{Core, CoreError};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Box2 {
+            sent: Vec<Request>,
+            events: Vec<Inbound>,
+        }
+        struct Ch(Arc<Mutex<Box2>>);
+        impl Channel for Ch {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn send(&mut self, req: &Request) -> Result<(), String> {
+                self.0.lock().unwrap().sent.push(req.clone());
+                Ok(())
+            }
+            fn poll(&mut self, _: &Request) -> Result<Vec<Inbound>, String> {
+                Ok(self.0.lock().unwrap().events.clone())
+            }
+        }
+
+        let log: Log = Default::default();
+        let mut s = Script::new(&log);
+        s.hw = S24_SERIAL.into();
+        s.devices = "List of devices attached
+192.0.2.99:40000   device model:SM_S921B transport_id:1
+"
+        .into();
+        let ip = "192.0.2.99:40000";
+        let wall = Arc::new(ManualClock::new(1_800_000_000_000));
+        let book = Arc::new(LeaseBook::new(wall.clone()));
+        let mut prot = Protected::new(ProtectedConfig::new(30, 10, None), book.clone());
+        prot.set_holders(Box::new(|_| {
+            Some(Holder {
+                name: "lane-a".into(),
+                epoch: 1,
+            })
+        }));
+        let inbox = Arc::new(Mutex::new(Box2::default()));
+        let mut core = Core::new(
+            AdbTransport::new(GuardedRunner::with_leases(s, book.clone())),
+            FakeClock::new(),
+        );
+        core.set_approver(Approver::new(Box::new(Ch(inbox.clone()))));
+        core.set_protected(prot);
+        let tap = Call::Tap {
+            target: Target::Point {
+                x: 5.0,
+                y: 5.0,
+                space: Some("device".into()),
+                image_width: None,
+            },
+        };
+        let acted = |log: &Log| {
+            lines(log)
+                .into_iter()
+                .filter(|l| l.contains("input tap"))
+                .count()
+        };
+        // no lease: an ask, and nothing acts
+        let r = core.call(Some(ip), &tap);
+        assert!(
+            matches!(r, Err(CoreError::Refused(Refusal::LeasePending { .. }))),
+            "{r:?}"
+        );
+        assert_eq!(acted(&log), 0);
+        // the owner allows: core binds the name it checked, the guard lets the tap through
+        let id = inbox.lock().unwrap().sent[0].id.clone();
+        inbox.lock().unwrap().events.push(Inbound {
+            event_id: "ev1".into(),
+            time_ms: 1_800_000_000_000,
+            message: format!("allow {id}"),
+        });
+        core.call(Some(ip), &tap).expect("the lease admits the tap");
+        assert_eq!(acted(&log), 1, "{:?}", lines(&log));
+        assert!(book.admits(ip));
+        // another name for the protected phone never rides on the lease, nor does a refused form
+        let other = core
+            .transport
+            .run(&["-s", "192.0.2.98:40000", "shell", "input tap 1 1"], 1000);
+        assert!(other.is_err(), "an unbound name is refused: {other:?}");
+        let reboot = core.transport.run(&["-s", ip, "shell", "reboot"], 1000);
+        assert!(
+            reboot.is_err(),
+            "the protected policy holds under the lease"
+        );
+        let usb = core.transport.run(&["-s", ip, "usb"], 1000);
+        assert!(usb.is_err(), "only shell, exec-out, push and pull");
+        // the lease ends: the guard refuses again, whatever core does
+        book.close_epoch(1);
+        assert!(!book.admits(ip));
+        let after = core
+            .transport
+            .run(&["-s", ip, "shell", "input tap 1 1"], 1000);
+        assert!(after.is_err());
+        assert_eq!(acted(&log), 1, "{:?}", lines(&log));
+    }
 }
