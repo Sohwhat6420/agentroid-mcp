@@ -213,7 +213,12 @@ impl<R: Runner> AdbTransport<R> {
         if self.dex_on.contains(serial) {
             return Ok(());
         }
-        let local = std::env::temp_dir().join(format!("agentroid-dump-{}.dex", std::process::id()));
+        // one staging file per push: two transports in one process never write or remove each
+        // other's (on Windows a file another thread has open cannot be written)
+        static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let local =
+            std::env::temp_dir().join(format!("agentroid-dump-{}-{n}.dex", std::process::id()));
         std::fs::write(&local, IDLE_FREE_DEX)
             .map_err(|e| TransportError(format!("could not stage the fallback reader: {e}")))?;
         let pushed = self.push(serial, &local, IDLE_FREE_REMOTE);
