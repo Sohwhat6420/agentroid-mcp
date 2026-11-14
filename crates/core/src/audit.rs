@@ -963,15 +963,17 @@ impl AuditLog {
         self.part_records += 1;
         self.part_first_ts.get_or_insert(ts_ms);
         if let Some(a) = &self.options.anchor {
-            let written = write_head(&a.path, r.seq, &r.hash);
+            // The injected fault replaces the write: the anchor must not move when it "fails".
             #[cfg(test)]
             let written = if self.faults.anchor {
                 Err(io::Error::other(
                     "injected: the anchor could not be written",
                 ))
             } else {
-                written
+                write_head(&a.path, r.seq, &r.hash)
             };
+            #[cfg(not(test))]
+            let written = write_head(&a.path, r.seq, &r.hash);
             if let Err(err) = written {
                 self.anchor_failures += 1;
                 if a.required {
