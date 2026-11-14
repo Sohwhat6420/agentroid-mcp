@@ -650,13 +650,19 @@ impl crate::server::Daemon {
                         p.expires_in_s = Some(p.expires_in_s.unwrap_or(DEFAULT_SEGMENT_S).min(max));
                     }
                     let ticket = adm.ticket;
+                    // an id already running when this call came in: this call can only fail as a
+                    // duplicate, and it ran nothing of its own
+                    let repeat = link.segment_is_running(&key, &id);
                     let r = link.segment(&key, epoch, p);
                     // the phone's answer is in (or the segment may be running): the end of the
                     // agent's own action, stamped now, before the daemon's lock is taken again.
-                    // A segment that failed before it ran cancels its ticket (dropped: nothing it
-                    // did is the agent's)
+                    // A segment that failed before it ran, or a repeat of one still running,
+                    // cancels its ticket (dropped: nothing it did is the agent's, and the first
+                    // run's report keeps its own cap)
                     match ticket {
-                        Some(mut t) if r.is_ok() || link.segment_is_running(&key, &id) => {
+                        Some(mut t)
+                            if r.is_ok() || (!repeat && link.segment_is_running(&key, &id)) =>
+                        {
                             t.finished();
                             self.backend().lock_done_segment(t, &id)
                         }

@@ -471,9 +471,15 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 }
                 if let Admitted::Lease(ms) = a {
                     self.lock_lease_ms = Some(ms);
+                    // the lease drops any burst from before it, so a segment report still to
+                    // come from before it may not bring that burst back
+                    self.lock_tails
+                        .retain(|_, (s, h, _)| phone_key(h, s) != phone);
                 }
                 Ok(())
             }
+            // a refusal keeps a pending segment report: dropping it would refuse the agent that
+            // calls before it pulls its own report (the README says how far it can reach)
             Err(why) => Err(Refusal::ScreenLock { tool, why }),
         }
     }
@@ -532,11 +538,11 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// * let through because the phone is not in use now (or by the agent's burst), not by a lease,
     ///   it must be short: at most [`FREE_SEGMENT_MAX_STEPS`] steps, and it may not ask for more than
     ///   [`FREE_SEGMENT_MAX_S`] seconds;
-    /// * let through by a lease, it may not outlive the lease: it may not ask for more than the
-    ///   whole seconds left on it (none left: refused).
+    /// * let through by a lease, it may not outlive the lease: its life is cut to the whole seconds
+    ///   left on it (under a second left: refused).
     ///
-    /// Otherwise it is refused (logged) and nothing is sent. `max_life_s` is the life to give a
-    /// segment that asks for none (or for more than the link's default).
+    /// Otherwise it is refused (logged) and nothing is sent. `max_life_s` is the longest life the
+    /// segment may be given: the caller cuts what it asks for (or the link's default) to that.
     pub fn lock_admit_segment(
         &mut self,
         serial: Option<&str>,
@@ -563,15 +569,16 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 "the phone was let through because it is not in use now, not by a lease, so a segment may carry at most {FREE_SEGMENT_MAX_STEPS} steps and live at most {FREE_SEGMENT_MAX_S} s (this one: {steps} steps, {asks}); split it, or run `agentroid ask-screen --device {device} --minutes N --why \"...\"` for a lease"
             )
         } else if let Some(ms) = lease_ms {
+            // the owner's call (14 Nov 2026): under a lease, cut the life rather than refuse
             let left_s = ms / 1000;
-            if left_s > 0 && !expires_s.is_some_and(|s| s > left_s) {
+            if left_s > 0 {
                 return Ok(SegmentAdmission {
                     ticket: None,
                     max_life_s: Some(left_s),
                 });
             }
             format!(
-                "the ask-screen lease that lets the phone through ends in {left_s} s, so a segment may live at most that long (this one asks for {asks}); ask for a shorter life, or run `agentroid ask-screen --device {device} --minutes N --why \"...\"` again for a longer lease"
+                "the ask-screen lease that lets the phone through ends in under a second, so nothing was sent (this segment asks for {asks}); run `agentroid ask-screen --device {device} --minutes N --why \"...\"` again for a new lease"
             )
         } else {
             // no lock, or an emulator
@@ -2928,14 +2935,17 @@ mod tests {
         let mut m = Memory::default();
         m.leases.insert("0123456789abcdef".into(), T0 + 60_000);
         save_memory(&dir, POCO_SERIAL, &m).unwrap();
-        // the review's probe: 50 steps asking for 600 s, 1 s before a 60 s lease ends: refused
+        // the review's probe: 50 steps asking for 600 s, 1 s before a 60 s lease ends: it goes,
+        // with its life cut to what is left of the lease (the owner's call: cut, not refused)
         clock.store(T0 + 59_000, Ordering::SeqCst);
-        let why = seg_refused(c.lock_admit_segment(None, 50, Some(600)));
-        assert!(
-            why.contains("ends in 1 s") && why.contains("ask-screen"),
-            "{why}"
-        );
-        // asking for no life: given what is left of the lease
+        assert!(matches!(
+            c.lock_admit_segment(None, 50, Some(600)),
+            Ok(SegmentAdmission {
+                ticket: None,
+                max_life_s: Some(1)
+            })
+        ));
+        // asking for no life: the same
         assert!(matches!(
             c.lock_admit_segment(None, 50, None),
             Ok(SegmentAdmission {
@@ -2945,7 +2955,11 @@ mod tests {
         ));
         // under a second left: nothing may run
         clock.store(T0 + 59_500, Ordering::SeqCst);
-        seg_refused(c.lock_admit_segment(None, 1, None));
+        let why = seg_refused(c.lock_admit_segment(None, 1, None));
+        assert!(
+            why.contains("under a second") && why.contains("ask-screen"),
+            "{why}"
+        );
         // the positive control: early in the lease, the same segment goes, with its own life
         clock.store(T0, Ordering::SeqCst);
         assert!(matches!(
@@ -3061,6 +3075,104 @@ mod tests {
             *phone.lock().unwrap() = busy(key_at - touch);
             let r = c.call(None, &back);
             assert_eq!(r.is_ok(), ok, "case {i}: {r:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_lease_drops_a_segment_report_still_to_come_from_before_it() {
+        use crate::askscreen::{save_memory, Memory};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        for leased in [true, false] {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-tail-lease-{leased}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut c = core();
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            // the review's probe: S1 let through at T0 (the phone is free)
+            let mut t = c.lock_admit_segment(None, 3, None).unwrap().ticket.unwrap();
+            clock.store(T0 + 200, Ordering::SeqCst);
+            t.finished();
+            c.lock_done_segment(t, "seg-1");
+            if leased {
+                let mut m = Memory::default();
+                m.leases.insert("0123456789abcdef".into(), T0 + 60_000);
+                save_memory(&dir, POCO_SERIAL, &m).unwrap();
+            }
+            // a call at T0 + 2 s (by the lease, or in the positive control by the burst)
+            clock.store(T0 + 2_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(1_800);
+            assert!(c.call(None, &back).is_ok());
+            // S1's report at T0 + 9 s
+            clock.store(T0 + 9_000, Ordering::SeqCst);
+            let stamped = c.lock_clock().map(|k| k.now());
+            c.lock_segment_reported("", "seg-1", stamped);
+            // after the lease, at T0 + 70 s: an app and the keyboard up, the last touch at T0 + 8 s
+            clock.store(T0 + 70_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(62_000);
+            let r = c.call(None, &back);
+            if leased {
+                assert!(
+                    matches!(r, Err(CoreError::Refused(Refusal::ScreenLock { .. }))),
+                    "{r:?}"
+                );
+            } else {
+                assert!(r.is_ok(), "{r:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Deliberate, and in the README: a refusal keeps a segment's pending report, so the report can
+    /// reopen, within 10 s of the segment's admission, a burst that the refusal ended.
+    #[test]
+    fn a_pending_segment_report_can_reopen_a_burst_a_refusal_ended_within_its_cap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // (someone's touch, the report, admitted after the report?)
+        for (touch, report, ok) in [(3_000, 6_000, true), (11_000, 12_000, false)] {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-tail-refused-{touch}-{}",
+                std::process::id()
+            ));
+            let mut c = core();
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            let mut t = c.lock_admit_segment(None, 3, None).unwrap().ticket.unwrap();
+            clock.store(T0 + 200, Ordering::SeqCst);
+            t.finished();
+            c.lock_done_segment(t, "seg-1");
+            // someone picks the phone up; a key a second later is refused
+            clock.store(T0 + touch + 1_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(1_000);
+            assert!(matches!(
+                c.call(None, &back),
+                Err(CoreError::Refused(Refusal::ScreenLock { .. }))
+            ));
+            // the segment's report is pulled, and a key half a second later
+            clock.store(T0 + report, Ordering::SeqCst);
+            let stamped = c.lock_clock().map(|k| k.now());
+            c.lock_segment_reported("", "seg-1", stamped);
+            clock.store(T0 + report + 500, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(report + 500 - touch);
+            let r = c.call(None, &back);
+            // inside the 10 s the report reopens the burst while someone holds the phone; a touch
+            // after the cap (admission + 10 s) is never covered
+            assert_eq!(r.is_ok(), ok, "touch {touch}: {r:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

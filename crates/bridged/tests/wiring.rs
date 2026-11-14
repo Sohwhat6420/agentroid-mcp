@@ -1029,7 +1029,7 @@ async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_i
     // after the phone took it (past the 0.3 s the lock allows). Before its report that touch reads as anyone's: refused, nothing
     // sent (past the 1 s the lock keeps a verdict)
     tokio::time::sleep(Duration::from_millis(1_100)).await;
-    *phone_state.lock().unwrap() = busy;
+    *phone_state.lock().unwrap() = busy.clone();
     *touched.lock().unwrap() = Some(accepted + 500);
     let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-early", "run_id": "run-a", "steps": r1_steps() })).await;
     assert_eq!(code(&r), REFUSED, "{r}");
@@ -1074,6 +1074,74 @@ async fn a_segment_to_a_phone_in_use_is_refused_by_the_screen_lock_and_nothing_i
     let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-late", "run_id": "run-a", "steps": r1_steps() })).await;
     assert_eq!(code(&r), REFUSED, "{r}");
     assert_eq!(p.st().segments_seen.len(), 2);
+    // fifth review, nit 3: a repeat of a segment id still running fails as a duplicate, and its
+    // ticket does not count. The phone is put down, then left with the agent's own touch last.
+    for id in ["seg-p1", "seg-p2", "seg-p3"] {
+        p.st().canned.insert(
+            id.into(),
+            json!({"accepted": true, "outcome": "started", "segment_id": id}),
+        );
+    }
+    *phone_state.lock().unwrap() = Signals {
+        wakefulness: Some("Asleep".into()),
+        in_call: Some(false),
+        ..Signals::default()
+    };
+    *touched.lock().unwrap() = None;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-p1", "run_id": "run-a", "steps": r1_steps() })).await;
+    let first = mono();
+    *phone_state.lock().unwrap() = busy.clone();
+    *touched.lock().unwrap() = Some(first);
+    // the positive control: a new segment inside the burst moves its end, so a touch just
+    // before that segment returned is the agent's
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-p2", "run_id": "run-a", "steps": r1_steps() })).await;
+    *touched.lock().unwrap() = Some(mono() - 50);
+    a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-p3", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(p.st().segments_seen.len(), 5);
+    // a repeat of seg-p3 (still running) inside the burst: refused as a duplicate by the hub's
+    // own check, nothing sent, and it does not move the end of the burst
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-p3", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("duplicate_segment")),
+        "{r}"
+    );
+    assert_eq!(p.st().segments_seen.len(), 5);
+    *touched.lock().unwrap() = Some(mono() - 50);
+    let r = a.call("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-p4", "run_id": "run-a", "steps": r1_steps() })).await;
+    assert_eq!(code(&r), REFUSED, "{r}");
+    assert_eq!(r["error"]["data"]["rule"], "screen_lock", "{r}");
+    assert_eq!(p.st().segments_seen.len(), 5);
+    // fifth review, item 4: under a lease a segment asking to outlive it goes, with its life cut
+    // to the whole seconds left (30 s here)
+    let mut m = agentroid_core::askscreen::Memory::default();
+    m.leases
+        .insert("0123456789abcdef".into(), TEST_EPOCH_MS + 30_000);
+    agentroid_core::askscreen::save_memory(&dir.join("leases"), FAKE_POCO_ADB, &m).unwrap();
+    p.st().canned.insert(
+        "seg-lease".into(),
+        json!({"accepted": true, "outcome": "started", "segment_id": "seg-lease"}),
+    );
+    let r = a.ok("link.segment", json!({ "device": POCO_SERIAL, "segment_id": "seg-lease", "run_id": "run-a", "steps": r1_steps(), "expires_in_s": 600 })).await;
+    assert_eq!(r["response"]["result"]["accepted"], true, "{r}");
+    {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expires = p.st().segments_seen[5]["segment"]["expires"]
+            .as_str()
+            .and_then(agentroid_segments::time::parse_utc)
+            .unwrap();
+        assert!(
+            expires <= now_s + 31 && expires >= now_s + 25,
+            "expires {expires}, now {now_s}"
+        );
+    }
     runner.stop().await;
     link.shutdown();
 }
