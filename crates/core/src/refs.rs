@@ -644,6 +644,12 @@ mod tests {
         assert_eq!(d.changed, 0);
         assert!(d.unchanged >= 90 - 3, "{}", d.text);
         let ratio = d.text.len() as f64 / full.len() as f64;
+        eprintln!(
+            "since diff: {} of {} chars = {:.1}%",
+            d.text.len(),
+            full.len(),
+            ratio * 100.0
+        );
         assert!(
             ratio <= 0.30,
             "diff {} chars vs full {} chars = {:.0}%",

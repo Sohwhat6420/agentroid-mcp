@@ -1,0 +1,83 @@
+== ui_tree, level full ==
+[0] ScreenView "Clock / 1:07 / Tuesday, 20 Oct" [label from child] id=workspace scrollable @(610,1332) rccbccd
+[1] FrameLayout "Clock" clickable,long-clickable @(610,476) r2bb170
+[2] FrameLayout "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r37be77
+[3] View "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r941e62
+[4] View "1:07" @(324,275)
+[5] View "Tuesday, 20 Oct" @(344,395)
+[6] View "No data" @(946,335)
+[7] RelativeLayout "Search / Google Search / Google app" [label from child] long-clickable @(610,1191) r2645e5
+[8] AppWidgetHostView "Search" @(610,1166)
+[9] FrameLayout "googleapp_search_widget_ghost_google_logo" clickable @(163,1166) re1ea72
+[10] FrameLayout "googleapp_search_widget_ghost_text_search" clickable @(538,1166) rc125ac
+[11] FrameLayout "googleapp_search_widget_ghost_voice_search" clickable @(913,1166) ra06a82
+[12] FrameLayout "googleapp_search_widget_ghost_lens" clickable @(1057,1166) re6519e
+[13] ImageView "Google Search" id=googleapp_search_widget_background clickable @(610,1166) r0dc6ef
+[14] ImageButton "Google app" id=googleapp_search_widget_google_logo clickable @(163,1166) ra75aca
+[15] ImageButton "Voice search" id=googleapp_search_widget_voice_btn clickable @(913,1166) r51c012
+[16] ImageButton "Camera search" id=googleapp_search_widget_lens_btn clickable @(1057,1166) r7dc530
+[17] TextView "Gallery" clickable,long-clickable @(181,1477) r1f043e
+[18] RelativeLayout "Google" clickable,long-clickable @(467,1477) r33578d
+[19] ImageView "Google" id=icon_icon @(467,1447)
+[20] TextView "Google" id=icon_title @(467,1583)
+[21] TextView "Play Store" clickable,long-clickable @(753,1477) rd47592
+[22] TextView "Themes" clickable,long-clickable @(1039,1477) rda65b2
+[23] TextView "Security" desc="1 unread from Security" clickable,long-clickable @(181,1763) r557e2b
+[24] TextView "Settings" desc="1 unread from Settings" clickable,long-clickable @(467,1763) r352116
+[25] TextView "Cleaner" clickable,long-clickable @(753,1763) r653a51
+[26] SeekBar "Page 1. Total pages: 2" scrollable @(610,2260) rff2766
+[27] ImageView "Open App drawer" clickable @(610,2260) r2b26e6
+[28] ScreenView "Phone / Messages / Chrome" [label from child] id=hotseat_content_screen scrollable @(610,2472) r25bfbd
+[29] TextView "Phone" clickable,long-clickable @(181,2472) rf642c8
+[30] TextView "Messages" clickable,long-clickable @(467,2472) rd7243f
+[31] TextView "Chrome" clickable,long-clickable @(753,2472) r9ff1f0
+[32] TextView "Camera" clickable,long-clickable @(1039,2472) r22466f
+
+== ui_tree, interactive_only ==
+[0] ScreenView "Clock / 1:07 / Tuesday, 20 Oct" [label from child] id=workspace scrollable @(610,1332) rccbccd
+[1] FrameLayout "Clock" clickable,long-clickable @(610,476) r2bb170
+[2] FrameLayout "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r37be77
+[3] View "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r941e62
+[4] RelativeLayout "Search / Google Search / Google app" [label from child] long-clickable @(610,1191) r2645e5
+[5] FrameLayout "googleapp_search_widget_ghost_google_logo" clickable @(163,1166) re1ea72
+[6] FrameLayout "googleapp_search_widget_ghost_text_search" clickable @(538,1166) rc125ac
+[7] FrameLayout "googleapp_search_widget_ghost_voice_search" clickable @(913,1166) ra06a82
+[8] FrameLayout "googleapp_search_widget_ghost_lens" clickable @(1057,1166) re6519e
+[9] ImageView "Google Search" id=googleapp_search_widget_background clickable @(610,1166) r0dc6ef
+[10] ImageButton "Google app" id=googleapp_search_widget_google_logo clickable @(163,1166) ra75aca
+[11] ImageButton "Voice search" id=googleapp_search_widget_voice_btn clickable @(913,1166) r51c012
+[12] ImageButton "Camera search" id=googleapp_search_widget_lens_btn clickable @(1057,1166) r7dc530
+[13] TextView "Gallery" clickable,long-clickable @(181,1477) r1f043e
+[14] RelativeLayout "Google" clickable,long-clickable @(467,1477) r33578d
+[15] TextView "Play Store" clickable,long-clickable @(753,1477) rd47592
+[16] TextView "Themes" clickable,long-clickable @(1039,1477) rda65b2
+[17] TextView "Security" desc="1 unread from Security" clickable,long-clickable @(181,1763) r557e2b
+[18] TextView "Settings" desc="1 unread from Settings" clickable,long-clickable @(467,1763) r352116
+[19] TextView "Cleaner" clickable,long-clickable @(753,1763) r653a51
+[20] SeekBar "Page 1. Total pages: 2" scrollable @(610,2260) rff2766
+[21] ImageView "Open App drawer" clickable @(610,2260) r2b26e6
+[22] ScreenView "Phone / Messages / Chrome" [label from child] id=hotseat_content_screen scrollable @(610,2472) r25bfbd
+[23] TextView "Phone" clickable,long-clickable @(181,2472) rf642c8
+[24] TextView "Messages" clickable,long-clickable @(467,2472) rd7243f
+[25] TextView "Chrome" clickable,long-clickable @(753,2472) r9ff1f0
+[26] TextView "Camera" clickable,long-clickable @(1039,2472) r22466f
+
+== ui_tree, level digest (the default) ==
+[0] ScreenView "Clock / 1:07 / Tuesday, 20 Oct" [label from child] id=workspace scrollable @(610,1332) rccbccd
+[1] FrameLayout "Clock" clickable,long-clickable @(610,476) r2bb170
+[2] FrameLayout "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r37be77
+[3] View "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r941e62
+[4] View "1:07" @(324,275)
+[5]
+[cut: 2150 more characters; ask for level "default"]
+
+== ui_tree since=s1, same screen ==
+snapshot s2 since s1: 0 added, 0 changed, 0 removed, 33 unchanged
+
+== sizes (characters) ==
+raw uiautomator dump                30910  100.0% of the raw dump
+ui_tree full listing                 2550    8.2% of the raw dump
+ui_tree interactive_only             2310    7.5% of the raw dump
+ui_tree digest (default)              453    1.5% of the raw dump
+ui_tree since=, nothing changed        65    0.2% of the raw dump
+elements: 33 listed, 27 interactive
