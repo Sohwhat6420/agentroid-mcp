@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dot clock (row): [ 06:27 ] ( 14 ) ( SAT ). Each pill holds a bitmap of DotoClock text drawn by ClockWidget and
+     scaled to fit. Weights 2:1:1 match the reference widget's proportions. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/w_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:gravity="center_vertical">
+
+    <ImageView
+        android:id="@+id/w_time"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="2"
+        android:layout_marginEnd="3dp"
+        android:background="@drawable/w_pill"
+        android:padding="16dp"
+        android:scaleType="fitCenter" />
+
+    <ImageView
+        android:id="@+id/w_date"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:layout_marginEnd="3dp"
+        android:background="@drawable/w_pill_red"
+        android:padding="16dp"
+        android:scaleType="fitCenter" />
+
+    <ImageView
+        android:id="@+id/w_day"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:background="@drawable/w_pill"
+        android:padding="16dp"
+        android:scaleType="fitCenter"
+        android:importantForAccessibility="no" />
+</LinearLayout>

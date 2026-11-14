@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Agentroid Bank Guard. Switches USB and Wireless debugging off while a banking app is open, and back on after.
+     Foreground app from Usage Access (UsageStatsManager); there is NO AccessibilityService, on purpose: Singapore banks
+     block sideloaded apps that have Accessibility on. No INTERNET permission: it never sends anything anywhere.
+     Remove with: adb -s "$SERIAL" uninstall dev.agentroid.bankguard
+     Built without Gradle (aapt2 + javac + d8, see build.sh). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.agentroid.bankguard"
+    android:versionCode="1"
+    android:versionName="0.1-bankguard">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
+
+    <!-- Granted over adb at setup: `pm grant` and `appops set ... GET_USAGE_STATS allow`. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Home Wi-Fi mode only: Android shows a Wi-Fi network's name and access point only to an app with location
+         access, and to a background service only with background location. Granted over adb at setup; nothing here
+         reads a location. Without them the home network is never recognised, and Wireless debugging stays off. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- To list the apps the owner can tick or put in the dock, to open them, and to open the clock app. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SHOW_ALARMS" />
+        </intent>
+    </queries>
+
+    <!-- "Agentroid Companion": the bank guard and the home-screen widgets (dot clocks, app dock) in one small app.
+         The widget picker lists them under this name. -->
+    <application
+        android:label="Agentroid Companion"
+        android:icon="@android:drawable/ic_lock_lock"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- NOT exported: only this app's pinned shortcuts reach it (the launcher starts them on this app's behalf). -->
+        <activity
+            android:name=".OpenSafely"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- EXPORTED so `adb shell am start` can open it in tests, behind DUMP: only the adb shell (and this app)
+             can start it, so no other app can use a listed test bank to cut debugging. It is a screen that closes
+             itself; it is a bank only on a list that names it. -->
+        <activity
+            android:name=".TestBank"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:excludeFromRecents="true" />
+
+        <!-- EXPORTED only so `adb shell am start-foreground-service` can start it at setup: only a caller holding
+             DUMP (the adb shell) reaches it. This app's own notification buttons are the same uid. -->
+        <service
+            android:name=".GuardService"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:directBootAware="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Switches USB and Wireless debugging off while a banking app the owner chose is open, and back on after" />
+        </service>
+
+        <!-- NOT exported: BOOT_COMPLETED, LOCKED_BOOT_COMPLETED and MY_PACKAGE_REPLACED are protected broadcasts. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- EXPORTED for `adb shell am broadcast`, but only a sender holding DUMP (the adb shell) reaches it. -->
+        <receiver
+            android:name=".ConfigReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="dev.agentroid.bankguard.SET" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Home-screen widgets. Exported: the launcher's AppWidget service sends them APPWIDGET_UPDATE. None has a
+             timer (updatePeriodMillis 0) and none sets an alarm. The clocks are bitmaps redrawn on the system's
+             minute tick by GuardService while the screen is on (see ClockWidget). A clock change, timezone or
+             locale (broadcasts a manifest may still receive) redraws all three clocks through the first receiver. -->
+        <receiver
+            android:name=".ClockWidget$Greeting"
+            android:label="@string/clock_greeting_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.intent.action.LOCALE_CHANGED" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/clock_greeting_info" />
+        </receiver>
+        <receiver
+            android:name=".ClockWidget$Row"
+            android:label="@string/clock_row_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/clock_row_info" />
+        </receiver>
+        <receiver
+            android:name=".ClockWidget$Large"
+            android:label="@string/clock_large_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/clock_large_info" />
+        </receiver>
+        <receiver
+            android:name=".DockWidget"
+            android:label="@string/dock_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/dock_info" />
+        </receiver>
+        <!-- EXPORTED for the launcher (APPWIDGET_CONFIGURE). It only edits a dock widget of THIS app: it checks that
+             the widget id belongs to DockWidget and closes otherwise. -->
+        <activity
+            android:name=".DockConfigActivity"
+            android:exported="true"
+            android:label="@string/dock_label"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
+        <!-- EXPORTED and read-only: the keeper asks it before switching Wireless debugging back on. It answers
+             held=1/0 and nothing else (see HoldProvider). -->
+        <provider
+            android:name=".HoldProvider"
+            android:authorities="dev.agentroid.bankguard.hold"
+            android:exported="true"
+            android:directBootAware="true" />
+    </application>
+</manifest>

@@ -218,8 +218,31 @@ public class KeeperService extends Service {
 
     private boolean paused() { return System.currentTimeMillis() < prefs().getLong(KEY_PAUSE_UNTIL, 0); }
 
+    private static final android.net.Uri BANK_HOLD = android.net.Uri.parse("content://dev.agentroid.bankguard.hold");
+
+    /** Asks the Agentroid bank guard (apps/bankguard), if installed, whether to leave Wireless debugging off now. */
+    private boolean bankGuardHolds() {
+        Integer held = null;
+        // Unstable: if the bank guard's process dies mid-query, this query fails instead of the keeper dying with it.
+        android.content.ContentProviderClient cp = null;
+        try {
+            cp = getContentResolver().acquireUnstableContentProviderClient(BANK_HOLD);
+            if (cp != null) {
+                try (android.database.Cursor c = cp.query(BANK_HOLD, null, null, null, null)) {
+                    if (c != null && c.moveToFirst()) held = c.getInt(0);
+                }
+            }
+        } catch (Throwable t) {
+            // not installed, or not answering: no hold
+        } finally {
+            if (cp != null) cp.close();
+        }
+        return KeeperLogic.bankGuardHolds(held);
+    }
+
     private void doKeeperLoop(String why) {
         if (KeeperLogic.shouldSkipRun(paused())) { L.i("loop why=" + why + " SKIPPED (paused)"); return; }
+        if (KeeperLogic.shouldSkipRun(false, bankGuardHolds())) { L.i("loop why=" + why + " SKIPPED (bank guard holds)"); return; }
         int before = readAdbWifi();
         if (KeeperLogic.shouldWriteEnable(before)) writeAdbWifi(1);
         int after = before;
