@@ -15,8 +15,9 @@
 //!   within the ask window, 10 min by default) and is refused as `lease:pending`; the agent retries
 //!   once the owner has tapped Allow. The Allow is followed by one quiet notice ("open until
 //!   HH:MM SGT") with a Deny button. An Allowed lease also satisfies the screen lock's in-use check,
-//!   so one Allow is never asked for twice; an `ask-screen` No still refuses. An Allow that comes
-//!   after the ask window has closed opens nothing.
+//!   so one Allow is never asked for twice; an `ask-screen` No still refuses. An Allow dated after
+//!   the ask window has closed opens nothing; one dated inside it opens however late the agent
+//!   calls again.
 //! * **One ask per phone.** At most one ask is out at a time, whoever it is for; another holder is
 //!   refused without a push, and no new ask goes out within the ask window of the last one.
 //! * **Overnight.** When a presence file signed with the owner's key (HMAC-SHA256), written in the
@@ -35,7 +36,12 @@
 //!   it with a fresh `allow <id>` within the ask window of the Deny; an ask nobody answered cannot
 //!   be lifted that way. The Deny events already seen are kept with the holds, so an old Deny
 //!   never closes a lease allowed after a restart. A channel that cannot be read for 2 min closes
-//!   the lease.
+//!   the lease. The pushes whose Deny may still be in the owner's shade (every overnight notice and
+//!   every Allowed ask, for a day, at most 64) are kept too and polled with the lease's own: a Deny
+//!   on any of them holds (an overnight one until the owner is awake), lease open or not, one
+//!   posted while the daemon was down included, and no overnight lease opens before they are read.
+//!   The pending ask and the last ask's time are kept as well: after a restart the ask is nobody's,
+//!   its Deny holds, and no new ask goes out within its window.
 //! * **Logged first.** Every lease is written to the audit log before it opens (a failed write
 //!   opens nothing), and every close is logged with its reason. A close that cannot be written
 //!   stays queued, and every call on the protected phone is refused until it is written.
@@ -349,14 +355,21 @@ pub fn digit_key(name: &str) -> bool {
     n.len() == 1 && n.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Does `call` need the PIN check before it is sent (it could enter a digit)? Typing, a key other
-/// than an exit key, a tap, a long press and a swipe; reads and launches do not.
+/// The paste key (`paste`, `KEYCODE_PASTE`): it could enter digits from the clipboard.
+pub fn paste_key(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n.strip_prefix("keycode_").unwrap_or(&n) == "paste"
+}
+
+/// Does `call` need the PIN check before it is sent (it could enter a digit)? Typing, a digit key,
+/// the paste key, a tap, a long press and a swipe; reads, launches and every other key (`wake`,
+/// `back`, `enter`...) do not, so a dark screen never stops a wake key (review round 4, item 2).
 pub fn needs_pin_check(call: &Call) -> bool {
     match call {
         Call::TypeText { .. } | Call::Tap { .. } | Call::LongPress { .. } | Call::Swipe { .. } => {
             true
         }
-        Call::Key { name } => !exit_key(name),
+        Call::Key { name } => digit_key(name) || paste_key(name),
         _ => false,
     }
 }
@@ -378,7 +391,8 @@ pub fn pin_refusal(
     }
     let digits = match call {
         Call::TypeText { text, .. } => text.chars().any(|c| c.is_ascii_digit()),
-        Call::Key { name } => digit_key(name),
+        // a paste may carry digits: never on a PIN prompt (review round 4, item 2)
+        Call::Key { name } => digit_key(name) || paste_key(name),
         _ => false,
     };
     let on_digit = at.is_some_and(|(x, y)| {
@@ -435,7 +449,27 @@ pub type HolderFn = Box<dyn Fn(&DeviceInfo) -> Option<Holder> + Send>;
 struct Pending {
     req: Request,
     holder: Holder,
+    /// Read back from the holds file after a restart: it is nobody's now (daemon lease epochs
+    /// start again), so its Allow opens nothing, while its Deny still holds (review round 4,
+    /// item 4).
+    restored: bool,
 }
+
+/// A push whose Deny still counts once its lease has ended: an overnight notice, or an Allowed
+/// ask (its lease-open notice has the same id). Kept for [`NOTICES_KEPT_MS`], at most
+/// [`NOTICES_KEPT`], in the holds file, so a Deny on one still in the owner's shade is seen, even
+/// one posted while the daemon was down (review round 4, item 1).
+#[derive(Debug, Clone)]
+struct Kept {
+    req: Request,
+    /// An overnight notice: a Deny on it holds until the owner is awake.
+    overnight: bool,
+}
+
+/// How long a push's Deny is looked for after the push was made.
+pub const NOTICES_KEPT_MS: u64 = 24 * 60 * 60 * 1000;
+/// How many pushes' Denies are looked for (the newest).
+pub const NOTICES_KEPT: usize = 64;
 
 /// What a hold lasts until.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,9 +502,10 @@ struct Running {
     fail_since: Option<u64>,
 }
 
-/// The holds file's format version (2 adds `reallow` and the Deny events seen; a version-1 file
-/// is still read, its hold not re-allowable).
-pub const HOLDS_VERSION: u64 = 2;
+/// The holds file's format version (2 adds `reallow` and the Deny events seen; 3 adds the pushes
+/// whose Denies are still looked for, the pending ask and when the last ask went out). Versions 1
+/// and 2 are still read: a version-1 hold is not re-allowable, and neither keeps pushes or asks.
+pub const HOLDS_VERSION: u64 = 3;
 /// How many Deny event ids the holds file keeps (the newest).
 pub const SEEN_DENIES_KEPT: usize = 64;
 
@@ -491,6 +526,14 @@ pub struct Protected {
     seen_denies: Vec<String>,
     /// `seen_denies` has been handed to the approver since start-up.
     seen_fed: bool,
+    /// The pushes whose Denies are still looked for (oldest first).
+    notices: Vec<Kept>,
+    /// When `notices` were last read for a Deny without an error (`None`: not since start-up).
+    notices_polled_ms: Option<u64>,
+    /// The next ask goes at low priority: an overnight lease ended because the presence file
+    /// could not be trusted, and it has not been trusted since (review round 4, item 5; the
+    /// owner may reverse this default). Not kept across a restart.
+    quiet_ask: bool,
 }
 
 impl std::fmt::Debug for Protected {
@@ -533,9 +576,40 @@ pub fn sgt_hhmm(ms: u64) -> String {
     format!("{:02}:{:02} SGT", m / 60, m % 60)
 }
 
-/// The holds file's text for `held` (`None`: no hold) and the Deny events seen.
-fn holds_json(held: Option<&Held>, seen: &[String]) -> String {
-    let hold = held.map(|h| {
+/// A request read back from the holds file: only its id and times are kept.
+fn bare_request(id: &str, created_ms: u64, expires_ms: u64, style: Style) -> Request {
+    Request {
+        id: id.to_string(),
+        device: String::new(),
+        tool: String::new(),
+        kind: "lease".into(),
+        reason: String::new(),
+        target: String::new(),
+        created_ms,
+        expires_ms,
+        style,
+        quiet: false,
+    }
+}
+
+fn holder_json(h: &Holder) -> serde_json::Value {
+    serde_json::json!({"name": h.name, "epoch": h.epoch})
+}
+
+/// What a holds file says.
+#[derive(Debug, Default)]
+struct Holds {
+    held: Option<Held>,
+    /// The Deny events seen.
+    seen: Vec<String>,
+    notices: Vec<Kept>,
+    pending: Option<Pending>,
+    last_ask_ms: Option<u64>,
+}
+
+/// The holds file's text for `h`.
+fn holds_json(h: &Holds) -> String {
+    let hold = h.held.as_ref().map(|h| {
         let (until, until_ms, state) = match &h.until {
             Until::Window(t) => ("window", Some(*t), None),
             Until::Awake => ("awake", None, None),
@@ -545,7 +619,7 @@ fn holds_json(held: Option<&Held>, seen: &[String]) -> String {
             "request_id": h.req.id,
             "created_ms": h.req.created_ms,
             "expires_ms": h.req.expires_ms,
-            "holder": h.holder.as_ref().map(|x| serde_json::json!({"name": x.name, "epoch": x.epoch})),
+            "holder": h.holder.as_ref().map(holder_json),
             "denied_at_ms": h.at_ms,
             "until": until,
             "until_ms": until_ms,
@@ -553,23 +627,55 @@ fn holds_json(held: Option<&Held>, seen: &[String]) -> String {
             "reallow": h.reallow,
         })
     });
-    serde_json::json!({ "version": HOLDS_VERSION, "hold": hold, "seen_denies": seen }).to_string()
+    let notices: Vec<serde_json::Value> = h
+        .notices
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "request_id": k.req.id,
+                "created_ms": k.req.created_ms,
+                "overnight": k.overnight,
+            })
+        })
+        .collect();
+    let pending = h.pending.as_ref().map(|p| {
+        serde_json::json!({
+            "request_id": p.req.id,
+            "created_ms": p.req.created_ms,
+            "expires_ms": p.req.expires_ms,
+            "holder": holder_json(&p.holder),
+        })
+    });
+    serde_json::json!({
+        "version": HOLDS_VERSION,
+        "hold": hold,
+        "seen_denies": h.seen,
+        "notices": notices,
+        "pending": pending,
+        "last_ask_ms": h.last_ask_ms,
+    })
+    .to_string()
 }
 
-/// What a holds file says: the hold (`None`: none) and the Deny events seen.
-type Holds = (Option<Held>, Vec<String>);
+fn parse_holder(x: &serde_json::Value) -> Option<Holder> {
+    Some(Holder {
+        name: x.get("name")?.as_str()?.to_string(),
+        epoch: x.get("epoch")?.as_u64()?,
+    })
+}
 
 /// Read a holds file's text. `Err`: it could not be read as one (the caller holds until the
 /// presence state changes).
 fn parse_holds(text: &str) -> Result<Holds, String> {
     let v: serde_json::Value =
         serde_json::from_str(text.trim()).map_err(|_| "the holds file is not JSON".to_string())?;
-    let version = v.get("version").and_then(serde_json::Value::as_u64);
-    if version != Some(HOLDS_VERSION) && version != Some(1) {
-        return Err("the holds file has another version".into());
-    }
-    let seen = match v.get("seen_denies") {
-        None if version == Some(1) => vec![],
+    let version = match v.get("version").and_then(serde_json::Value::as_u64) {
+        Some(n @ 1..=HOLDS_VERSION) => n,
+        _ => return Err("the holds file has another version".into()),
+    };
+    let mut out = Holds::default();
+    out.seen = match v.get("seen_denies") {
+        None if version == 1 => vec![],
         Some(serde_json::Value::Array(a)) => a
             .iter()
             .map(|x| x.as_str().map(str::to_string))
@@ -577,8 +683,54 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
             .ok_or_else(|| "the holds file's seen Deny events are malformed".to_string())?,
         _ => return Err("the holds file's seen Deny events are malformed".into()),
     };
+    if version >= 3 {
+        let bad = || "the holds file's pushes or pending ask are malformed".to_string();
+        let Some(serde_json::Value::Array(ns)) = v.get("notices") else {
+            return Err(bad());
+        };
+        for n in ns {
+            let id = n
+                .get("request_id")
+                .and_then(|x| x.as_str())
+                .ok_or_else(bad)?;
+            let created = n
+                .get("created_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(bad)?;
+            let overnight = n
+                .get("overnight")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(bad)?;
+            out.notices.push(Kept {
+                req: bare_request(id, created, created, Style::Notice),
+                overnight,
+            });
+        }
+        out.pending = match v.get("pending") {
+            Some(serde_json::Value::Null) => None,
+            Some(p) => {
+                let id = p
+                    .get("request_id")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(bad)?;
+                let num = |k: &str| p.get(k).and_then(serde_json::Value::as_u64).ok_or_else(bad);
+                let holder = p.get("holder").and_then(parse_holder).ok_or_else(bad)?;
+                Some(Pending {
+                    req: bare_request(id, num("created_ms")?, num("expires_ms")?, Style::Lease),
+                    holder,
+                    restored: true,
+                })
+            }
+            None => return Err(bad()),
+        };
+        out.last_ask_ms = match v.get("last_ask_ms") {
+            Some(serde_json::Value::Null) => None,
+            Some(x) => Some(x.as_u64().ok_or_else(bad)?),
+            None => return Err(bad()),
+        };
+    }
     let h = match v.get("hold") {
-        Some(serde_json::Value::Null) => return Ok((None, seen)),
+        Some(serde_json::Value::Null) => return Ok(out),
         Some(h) => h,
         None => return Err("the holds file has no hold".into()),
     };
@@ -591,17 +743,7 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
     let (created, expires, at) = (num("created_ms")?, num("expires_ms")?, num("denied_at_ms")?);
     let holder = match h.get("holder") {
         Some(serde_json::Value::Null) | None => None,
-        Some(x) => Some(Holder {
-            name: x
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(bad)?
-                .to_string(),
-            epoch: x
-                .get("epoch")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(bad)?,
-        }),
+        Some(x) => Some(parse_holder(x).ok_or_else(bad)?),
     };
     let until = match h.get("until").and_then(|x| x.as_str()) {
         Some("window") => Until::Window(num("until_ms")?),
@@ -616,27 +758,17 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
     // version 1 kept no `reallow`: its hold is not lifted by an Allow
     let reallow = match h.get("reallow") {
         Some(serde_json::Value::Bool(b)) => *b,
-        None if version == Some(1) => false,
+        None if version == 1 => false,
         _ => return Err(bad()),
     };
-    let held = Held {
-        req: Request {
-            id: id.to_string(),
-            device: String::new(),
-            tool: String::new(),
-            kind: "lease".into(),
-            reason: String::new(),
-            target: String::new(),
-            created_ms: created,
-            expires_ms: expires,
-            style: Style::Lease,
-        },
+    out.held = Some(Held {
+        req: bare_request(id, created, expires, Style::Lease),
         holder,
         at_ms: at,
         until,
         reallow,
-    };
-    Ok((Some(held), seen))
+    });
+    Ok(out)
 }
 
 /// Write `text` to `path` atomically: a temporary file beside it, then a rename over it.
@@ -668,14 +800,22 @@ impl Protected {
             last_ask_ms: None,
             seen_denies: vec![],
             seen_fed: false,
+            notices: vec![],
+            notices_polled_ms: None,
+            quiet_ask: false,
         };
-        (p.held, p.seen_denies) = p.load_holds();
+        let h = p.load_holds();
+        p.held = h.held;
+        p.seen_denies = h.seen;
+        p.notices = h.notices;
+        p.pending = h.pending;
+        p.last_ask_ms = h.last_ask_ms;
         p
     }
 
     fn load_holds(&self) -> Holds {
         let Some(path) = self.cfg.holds_file.as_ref() else {
-            return (None, vec![]);
+            return Holds::default();
         };
         let unknown = |why: String| {
             let now = self.book.now_ms().unwrap_or(0);
@@ -683,44 +823,49 @@ impl Protected {
                 Presence::Untrusted(_) => None,
                 p => Some(p.to_string()),
             };
-            let hold = Held {
-                req: Request {
-                    id: format!("unknown hold ({why})"),
-                    device: String::new(),
-                    tool: String::new(),
-                    kind: "lease".into(),
-                    reason: String::new(),
-                    target: String::new(),
-                    created_ms: 0,
-                    expires_ms: 0,
-                    style: Style::Lease,
-                },
-                holder: None,
-                at_ms: now,
-                until: Until::Unknown(state),
-                reallow: false,
-            };
-            (Some(hold), vec![])
+            Holds {
+                held: Some(Held {
+                    req: bare_request(&format!("unknown hold ({why})"), 0, 0, Style::Lease),
+                    holder: None,
+                    at_ms: now,
+                    until: Until::Unknown(state),
+                    reallow: false,
+                }),
+                ..Holds::default()
+            }
         };
         match std::fs::read_to_string(path) {
             Ok(text) => parse_holds(&text).unwrap_or_else(unknown),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, vec![]),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Holds::default(),
             Err(e) => unknown(format!("the holds file could not be read: {}", e.kind())),
         }
     }
 
-    /// Set (or clear) the hold, and write it to the holds file when one is configured. `Err`: the
-    /// file could not be written (the hold stands in memory either way).
-    fn set_held(&mut self, h: Option<Held>) -> Result<(), String> {
-        self.held = h;
-        match &self.cfg.holds_file {
-            Some(path) => write_atomic(path, &holds_json(self.held.as_ref(), &self.seen_denies))
-                .map_err(|e| format!("the holds file could not be written: {}", e.kind())),
-            None => Ok(()),
-        }
+    /// Write the hold, the Deny events seen, the kept pushes, the pending ask and when the last
+    /// ask went out to the holds file, when one is configured. `Err`: it could not be written
+    /// (the state stands in memory either way).
+    fn save(&self) -> Result<(), String> {
+        let Some(path) = &self.cfg.holds_file else {
+            return Ok(());
+        };
+        let h = Holds {
+            held: self.held.clone(),
+            seen: self.seen_denies.clone(),
+            notices: self.notices.clone(),
+            pending: self.pending.clone(),
+            last_ask_ms: self.last_ask_ms,
+        };
+        write_atomic(path, &holds_json(&h))
+            .map_err(|e| format!("the holds file could not be written: {}", e.kind()))
     }
 
-    /// Keep a Deny event as applied (written with the next [`Self::set_held`]).
+    /// Set (or clear) the hold, and write it to the holds file ([`Self::save`]).
+    fn set_held(&mut self, h: Option<Held>) -> Result<(), String> {
+        self.held = h;
+        self.save()
+    }
+
+    /// Keep a Deny event as applied (written with the next [`Self::save`]).
     fn note_deny(&mut self, event_id: &str) {
         if event_id.is_empty() || self.seen_denies.iter().any(|e| e == event_id) {
             return;
@@ -730,6 +875,110 @@ impl Protected {
             let extra = self.seen_denies.len() - SEEN_DENIES_KEPT;
             self.seen_denies.drain(..extra);
         }
+    }
+
+    /// Drop the kept pushes made more than [`NOTICES_KEPT_MS`] before `now`.
+    fn prune_notices(&mut self, now: u64) {
+        self.notices
+            .retain(|k| k.req.created_ms.saturating_add(NOTICES_KEPT_MS) > now);
+    }
+
+    /// Keep `req`'s Deny looked for (an overnight notice, or an Allowed ask); written with the
+    /// next [`Self::save`].
+    fn keep_notice(&mut self, req: &Request, overnight: bool, now: u64) {
+        self.prune_notices(now);
+        match self.notices.iter_mut().find(|k| k.req.id == req.id) {
+            Some(k) => k.overnight |= overnight,
+            None => {
+                self.notices.push(Kept {
+                    req: bare_request(&req.id, req.created_ms, req.expires_ms, Style::Notice),
+                    overnight,
+                });
+                if self.notices.len() > NOTICES_KEPT {
+                    let extra = self.notices.len() - NOTICES_KEPT;
+                    self.notices.drain(..extra);
+                }
+            }
+        }
+    }
+
+    /// Read the channel once for a Deny on any kept push or on the open lease's own ask.
+    /// `Ok(Some((push, event id)))` on one.
+    fn poll_kept(&mut self, a: &mut Approver, now: u64) -> Result<Option<(Kept, String)>, String> {
+        self.prune_notices(now);
+        let mut kept = self.notices.clone();
+        if let Some(run) = &self.running {
+            if !kept.iter().any(|k| k.req.id == run.req.id) {
+                kept.push(Kept {
+                    req: run.req.clone(),
+                    overnight: false,
+                });
+            }
+        }
+        let reqs: Vec<Request> = kept.iter().map(|k| k.req.clone()).collect();
+        let hit = a.poll_denies(&reqs)?;
+        self.notices_polled_ms = Some(now);
+        Ok(hit.map(|(i, ev)| (kept[i].clone(), ev)))
+    }
+
+    /// Close the open lease through the book's close queue, so the close is written to the audit
+    /// log like every other one and never dropped (review round 4, item 6). `Err`: it could not
+    /// be written (it stays queued, and the protected phone is refused until it is).
+    fn close_lease(
+        &mut self,
+        why: &'static str,
+        audit: Option<&mut AuditLog>,
+        tool: &'static str,
+    ) -> Result<(), Refusal> {
+        self.book.close_for(why);
+        self.running = None;
+        self.audit_closes(audit, tool)
+    }
+
+    /// The owner tapped Deny (`event_id`) on kept push `k`: the open lease `lease`, if any, is
+    /// closed through the queue, and the phone is held for every holder. The hold lasts until a
+    /// trusted presence file says the owner is awake when the push was an overnight notice, the
+    /// lease was an overnight one, or the presence file says asleep; else for the ask window. A
+    /// stronger hold already standing is kept. Only a Deny on an open lease may be re-allowed, by
+    /// its holder. The first `Err` is the audit log's; the inner one says the holds file could not
+    /// be written.
+    fn apply_deny(
+        &mut self,
+        k: &Kept,
+        event_id: &str,
+        lease: Option<&Lease>,
+        now: u64,
+        audit: Option<&mut AuditLog>,
+        tool: &'static str,
+    ) -> Result<Result<(), String>, Refusal> {
+        self.note_deny(event_id);
+        let closed = match lease {
+            Some(_) => self.close_lease("denied", audit, tool),
+            None => Ok(()),
+        };
+        let asleep = k.overnight
+            || lease.is_some_and(|l| l.granted == Granted::Overnight)
+            || self.presence(now).asleep();
+        let until = if asleep {
+            Until::Awake
+        } else {
+            Until::Window(now.saturating_add(self.cfg.ask_window_ms))
+        };
+        let saved = match (&self.held, &until) {
+            // an overnight hold (or one from an unreadable holds file) is never cut short
+            (Some(h), Until::Window(_)) if !matches!(h.until, Until::Window(_)) => self.save(),
+            (Some(h), Until::Window(t)) if matches!(h.until, Until::Window(old) if old > *t) => {
+                self.save()
+            }
+            _ => self.set_held(Some(Held {
+                req: k.req.clone(),
+                holder: lease.map(|l| l.holder.clone()),
+                at_ms: now,
+                until,
+                reallow: lease.is_some(),
+            })),
+        };
+        closed.map(|()| saved)
     }
 
     /// How core learns who holds the protected phone (the daemon's registry, for the caller's own
@@ -926,94 +1175,87 @@ impl Protected {
         // 1. the open lease
         if let Some(lease) = self.book.active() {
             if lease.holder != holder {
-                self.book.close();
-                self.running = None;
-                log(
-                    audit.as_deref_mut(),
-                    "blocked",
-                    "lease:closed",
-                    format!(
-                        "lease {} was opened for {} (epoch {}), not for {} (epoch {}): closed",
-                        reference(&lease.id),
-                        lease.holder.name,
-                        lease.holder.epoch,
-                        holder.name,
-                        holder.epoch
-                    ),
-                )?;
+                self.close_lease("another holder called", audit.as_deref_mut(), tool)?;
             } else {
-                // a Deny, or a Deny channel down too long, closes it
-                if let Some(run) = self.running.as_mut() {
-                    if now.saturating_sub(run.last_poll_ms) >= self.cfg.deny_poll_ms {
+                // a Deny (on this lease's push or on any kept one), or a Deny channel down too
+                // long, closes it; a clock that went back polls at once (review round 4, item 7)
+                let due = self.running.as_ref().is_some_and(|run| {
+                    now < run.last_poll_ms
+                        || now.saturating_sub(run.last_poll_ms) >= self.cfg.deny_poll_ms
+                });
+                if due {
+                    if let Some(run) = self.running.as_mut() {
                         run.last_poll_ms = now;
-                        let polled = match approver.as_deref_mut() {
-                            Some(a) => a.poll_deny(&run.req),
-                            None => Err("no approval channel".into()),
-                        };
-                        match polled {
-                            Ok(None) => run.fail_since = None,
-                            Ok(Some(event_id)) => {
-                                let req = run.req.clone();
-                                self.running = None;
-                                self.note_deny(&event_id);
-                                self.book.close();
-                                let asleep = lease.granted == Granted::Overnight
-                                    || self.presence(now).asleep();
-                                let saved = self.set_held(Some(Held {
-                                    req,
-                                    holder: Some(lease.holder.clone()),
-                                    at_ms: now,
-                                    until: if asleep {
-                                        Until::Awake
-                                    } else {
-                                        Until::Window(now.saturating_add(self.cfg.ask_window_ms))
-                                    },
-                                    reallow: true,
-                                }));
+                    }
+                    let polled = match approver.as_deref_mut() {
+                        Some(a) => self.poll_kept(a, now),
+                        None => Err("no approval channel".into()),
+                    };
+                    match polled {
+                        Ok(None) => {
+                            if let Some(run) = self.running.as_mut() {
+                                run.fail_since = None;
+                            }
+                        }
+                        Ok(Some((k, event_id))) => {
+                            let saved = self.apply_deny(
+                                &k,
+                                &event_id,
+                                Some(&lease),
+                                now,
+                                audit.as_deref_mut(),
+                                tool,
+                            )?;
+                            log(
+                                audit.as_deref_mut(),
+                                "blocked",
+                                "lease:denied",
+                                format!(
+                                    "the owner tapped Deny on push {}: lease {} closed and held{}",
+                                    reference(&k.req.id),
+                                    reference(&lease.id),
+                                    saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                                ),
+                            )?;
+                            return Err(refused(
+                                "the owner tapped Deny, so the lease was closed".into(),
+                            ));
+                        }
+                        Err(e) => {
+                            let since = self
+                                .running
+                                .as_mut()
+                                .map_or(now, |run| *run.fail_since.get_or_insert(now));
+                            if now.saturating_sub(since) >= self.cfg.deny_poll_fail_ms {
+                                self.close_lease(
+                                    "deny channel unreadable",
+                                    audit.as_deref_mut(),
+                                    tool,
+                                )?;
                                 log(
                                     audit.as_deref_mut(),
                                     "blocked",
-                                    "lease:denied",
+                                    "lease:deny_unreadable",
                                     format!(
-                                        "the owner tapped Deny on lease {}: closed and held{}",
-                                        reference(&lease.id),
-                                        saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                                        "the Deny channel could not be read for {} s ({e}): lease {} closed",
+                                        self.cfg.deny_poll_fail_ms / 1000,
+                                        reference(&lease.id)
                                     ),
                                 )?;
-                                return Err(refused(
-                                    "the owner tapped Deny, so the lease was closed".into(),
-                                ));
+                                return Err(refused(format!(
+                                    "the owner's Deny could not be checked for {} s, so the lease was closed",
+                                    self.cfg.deny_poll_fail_ms / 1000
+                                )));
                             }
-                            Err(e) => {
-                                let since = *run.fail_since.get_or_insert(now);
-                                if now.saturating_sub(since) >= self.cfg.deny_poll_fail_ms {
-                                    self.running = None;
-                                    self.book.close();
-                                    log(
-                                        audit.as_deref_mut(),
-                                        "blocked",
-                                        "lease:deny_unreadable",
-                                        format!(
-                                            "the Deny channel could not be read for {} s ({e}): lease {} closed",
-                                            self.cfg.deny_poll_fail_ms / 1000,
-                                            reference(&lease.id)
-                                        ),
-                                    )?;
-                                    return Err(refused(format!(
-                                        "the owner's Deny could not be checked for {} s, so the lease was closed",
-                                        self.cfg.deny_poll_fail_ms / 1000
-                                    )));
-                                }
-                                log(
-                                    audit.as_deref_mut(),
-                                    "blocked",
-                                    "lease:deny_poll",
-                                    format!(
-                                        "the Deny channel could not be read ({e}); the lease closes if this lasts {} s",
-                                        self.cfg.deny_poll_fail_ms / 1000
-                                    ),
-                                )?;
-                            }
+                            log(
+                                audit.as_deref_mut(),
+                                "blocked",
+                                "lease:deny_poll",
+                                format!(
+                                    "the Deny channel could not be read ({e}); the lease closes if this lasts {} s",
+                                    self.cfg.deny_poll_fail_ms / 1000
+                                ),
+                            )?;
                         }
                     }
                 }
@@ -1027,17 +1269,48 @@ impl Protected {
                     self.book.bind(&d.serial);
                     return Ok(lease);
                 }
-                self.book.close();
-                self.running = None;
+                // it was asleep at the last trusted reading: an unreadable presence file is a
+                // hiccup at night, so the ask that follows goes quietly (review round 4, item 5)
+                self.quiet_ask = matches!(p, Presence::Untrusted(_));
+                self.close_lease("presence ended", audit.as_deref_mut(), tool)?;
                 log(
                     audit.as_deref_mut(),
                     "blocked",
-                    "lease:closed",
+                    "lease:overnight_ended",
                     format!(
                         "the overnight lease {} ended: the presence file says {p}",
                         reference(&lease.id)
                     ),
                 )?;
+            }
+        }
+
+        // 1b. no lease open: a Deny on a kept push (an older overnight notice, an earlier lease's
+        // notice) still holds the phone, one posted while the daemon was down included: the
+        // first call after start-up looks at once (review round 4, item 1)
+        if let Some(a) = approver.as_deref_mut() {
+            let due = self
+                .notices_polled_ms
+                .is_none_or(|t| now < t || now.saturating_sub(t) >= self.cfg.deny_poll_ms);
+            if due && !self.notices.is_empty() {
+                if let Ok(Some((k, event_id))) = self.poll_kept(a, now) {
+                    let saved =
+                        self.apply_deny(&k, &event_id, None, now, audit.as_deref_mut(), tool)?;
+                    log(
+                        audit.as_deref_mut(),
+                        "blocked",
+                        "lease:denied",
+                        format!(
+                            "the owner tapped Deny on push {} of an earlier lease: held{}",
+                            reference(&k.req.id),
+                            saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                        ),
+                    )?;
+                    return Err(refused(
+                        "the owner tapped Deny on an earlier lease's push, so the phone is held"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -1052,6 +1325,7 @@ impl Protected {
                 .filter(|_| own)
                 .and_then(|a| a.reallowed(&h.req, h.at_ms, until))
             {
+                self.keep_notice(&h.req, false, now);
                 let saved = self.set_held(None);
                 if let Err(e) = log(
                     audit.as_deref_mut(),
@@ -1152,7 +1426,8 @@ impl Protected {
                 self.pending = Some(p);
                 return Err(refused("no approval channel is configured".into()));
             };
-            let mine = p.holder == holder;
+            // an ask read back after a restart is nobody's (review round 4, item 4)
+            let mine = !p.restored && p.holder == holder;
             match a.check(&p.req, now) {
                 None if mine => {
                     let r = reference(&p.req.id);
@@ -1169,16 +1444,20 @@ impl Protected {
                     )));
                 }
                 Some(Answer::Approved { event_id }) if mine => {
+                    // its lease-open notice has the ask's id: a Deny on it counts after the lease
+                    self.keep_notice(&p.req, false, now);
+                    let saved = self.save();
                     log(
                         audit.as_deref_mut(),
                         "allowed",
                         "lease:opened",
                         format!(
-                            "the owner allowed ask {} (answer {event_id}): lease open for {} min for {} (epoch {})",
+                            "the owner allowed ask {} (answer {event_id}): lease open for {} min for {} (epoch {}){}",
                             reference(&p.req.id),
                             self.cfg.lease_ms / 60_000,
                             holder.name,
-                            holder.epoch
+                            holder.epoch,
+                            saved.err().map_or(String::new(), |e| format!(" ({e})"))
                         ),
                     )?;
                     let notice = self.send_open_notice(a, &p.req, now, tool);
@@ -1202,17 +1481,20 @@ impl Protected {
                     return Ok(lease);
                 }
                 Some(Answer::Approved { .. }) => {
+                    let saved = self.save();
                     log(
                         audit.as_deref_mut(),
                         "blocked",
                         "lease:stale",
                         format!(
-                            "ask {} was allowed for {} (epoch {}), which no longer holds the phone: nothing opened for {} (epoch {})",
+                            "ask {} was allowed for {} (epoch {}{}), which no longer holds the phone: nothing opened for {} (epoch {}){}",
                             reference(&p.req.id),
                             p.holder.name,
                             p.holder.epoch,
+                            if p.restored { ", before a restart" } else { "" },
                             holder.name,
-                            holder.epoch
+                            holder.epoch,
+                            saved.err().map_or(String::new(), |e| format!(" ({e})"))
                         ),
                     )?;
                 }
@@ -1270,6 +1552,9 @@ impl Protected {
             return Err(refused("no approval channel is configured".into()));
         };
         let presence = self.presence(now);
+        if !matches!(presence, Presence::Untrusted(_)) {
+            self.quiet_ask = false;
+        }
         let minutes = self.cfg.lease_ms / 60_000;
         let who = push_holder(&holder.name);
         let job = self
@@ -1277,6 +1562,34 @@ impl Protected {
             .get(&holder.epoch)
             .map_or(String::new(), |j| format!(", job {j}"));
         if presence.asleep() {
+            // the Denies on the earlier pushes are looked for first, every time: one found holds,
+            // and an unreadable channel opens nothing (review round 4, item 1)
+            match self.poll_kept(a, now) {
+                Ok(None) => {}
+                Ok(Some((k, event_id))) => {
+                    let saved =
+                        self.apply_deny(&k, &event_id, None, now, audit.as_deref_mut(), tool)?;
+                    log(
+                        audit.as_deref_mut(),
+                        "blocked",
+                        "lease:denied",
+                        format!(
+                            "the owner tapped Deny on push {} of an earlier lease: held{}",
+                            reference(&k.req.id),
+                            saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                        ),
+                    )?;
+                    return Err(refused(
+                        "the owner tapped Deny on an earlier lease's push, so the phone is held"
+                            .into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(refused(format!(
+                        "the overnight rule opens a lease only once the Denies on the earlier pushes have been checked, and the channel could not be read ({e})"
+                    )));
+                }
+            }
             let mut req = a.request(
                 now,
                 &device,
@@ -1295,15 +1608,18 @@ impl Protected {
                 )));
             }
             let id = req.id.clone();
+            self.keep_notice(&req, true, now);
+            let saved = self.save();
             log(
                 audit.as_deref_mut(),
                 "allowed",
                 "lease:overnight",
                 format!(
-                    "a signed, fresh presence file says asleep: lease {} open for {minutes} min for {} (epoch {}), notice sent",
+                    "a signed, fresh presence file says asleep: lease {} open for {minutes} min for {} (epoch {}), notice sent{}",
                     reference(&id),
                     holder.name,
-                    holder.epoch
+                    holder.epoch,
+                    saved.err().map_or(String::new(), |e| format!(" ({e})"))
                 ),
             )?;
             let lease = self.open(now, &holder, Granted::Overnight, req);
@@ -1333,24 +1649,33 @@ impl Protected {
         );
         req.style = Style::Lease;
         req.expires_ms = now.saturating_add(self.cfg.ask_window_ms);
+        // at night, after an overnight lease ended on an unreadable presence file, the ask waits
+        // quietly in the shade, answerable in the morning (review round 4, item 5)
+        req.quiet = self.quiet_ask && matches!(presence, Presence::Untrusted(_));
         if let Err(e) = a.send(&req) {
             return Err(refused(format!("the ask could not be sent ({e})")));
         }
         self.last_ask_ms = Some(now);
         let r = reference(&req.id);
+        let quiet = req.quiet;
         self.pending = Some(Pending {
             req,
             holder: holder.clone(),
+            restored: false,
         });
+        // the ask and the throttle survive a restart (review round 4, item 4)
+        let saved = self.save();
         log(
             audit,
             "asked",
             "lease:asked",
             format!(
-                "asked the owner for a {minutes}-minute lease for {} (epoch {}), ask {r}, {} min to answer; overnight rule: {presence}",
+                "asked the owner for a {minutes}-minute lease for {} (epoch {}), ask {r}, {} min to answer{}; overnight rule: {presence}{}",
                 holder.name,
                 holder.epoch,
-                self.cfg.ask_window_ms / 60_000
+                self.cfg.ask_window_ms / 60_000,
+                if quiet { ", sent quietly" } else { "" },
+                saved.err().map_or(String::new(), |e| format!(" ({e})"))
             ),
         )?;
         Err(Refusal::LeasePending { tool, reference: r })
@@ -1613,6 +1938,8 @@ mod tests {
         assert_eq!(f.digit_bounds, vec![(20, 0, 30, 10)]);
     }
 
+    /// Review round 4, item 2: only a key that could enter a digit (a digit, or paste) is
+    /// checked; `wake`, `enter` and the rest go without a screen read.
     #[test]
     fn only_calls_that_could_enter_a_digit_need_the_pin_check() {
         for c in [
@@ -1620,7 +1947,13 @@ mod tests {
             typed("a"),
             Call::Key { name: "5".into() },
             Call::Key {
-                name: "KEYCODE_ENTER".into(),
+                name: "KEYCODE_NUMPAD_5".into(),
+            },
+            Call::Key {
+                name: "paste".into(),
+            },
+            Call::Key {
+                name: "KEYCODE_PASTE".into(),
             },
             Call::LongPress {
                 target: crate::gate::Target::Index(0),
@@ -1645,6 +1978,18 @@ mod tests {
             Call::Key {
                 name: "home".into(),
             },
+            Call::Key {
+                name: "wake".into(),
+            },
+            Call::Key {
+                name: "KEYCODE_WAKEUP".into(),
+            },
+            Call::Key {
+                name: "KEYCODE_ENTER".into(),
+            },
+            Call::Key {
+                name: "KEYCODE_PASTE_X".into(),
+            },
             Call::OpenApp {
                 package: "com.android.settings".into(),
             },
@@ -1652,6 +1997,7 @@ mod tests {
         ] {
             assert!(!needs_pin_check(&c), "{c:?}");
         }
+        assert!(paste_key(" Paste ") && paste_key("keycode_paste") && !paste_key("pastel"));
         assert!(digit_key("KEYCODE_NUMPAD_7") && digit_key(" 3 ") && !digit_key("12"));
         assert!(exit_key("KEYCODE_HOME") && !exit_key("KEYCODE_ENTER"));
     }
@@ -1693,17 +2039,7 @@ mod tests {
 
     fn held(reallow: bool) -> Held {
         Held {
-            req: Request {
-                id: "abcdefghijklmnopqrst".into(),
-                device: String::new(),
-                tool: String::new(),
-                kind: "lease".into(),
-                reason: String::new(),
-                target: String::new(),
-                created_ms: 1,
-                expires_ms: 2,
-                style: Style::Lease,
-            },
+            req: bare_request("abcdefghijklmnopqrst", 1, 2, Style::Lease),
             holder: Some(Holder {
                 name: "lane".into(),
                 epoch: 4,
@@ -1714,41 +2050,131 @@ mod tests {
         }
     }
 
-    /// Review round 3, items 8 and 9: the holds file keeps whether the hold may be re-allowed
-    /// and the Deny events seen; a version-1 file is read with neither.
+    /// Review round 3, items 8 and 9, and round 4, items 1 and 4: the holds file keeps whether
+    /// the hold may be re-allowed, the Deny events seen, the pushes whose Denies are looked for,
+    /// the pending ask (read back as nobody's) and when the last ask went out; versions 1 and 2
+    /// are read without what they never kept.
     #[test]
-    fn the_holds_file_keeps_reallow_and_the_denies_seen() {
+    fn the_holds_file_keeps_reallow_the_denies_seen_the_pushes_and_the_ask() {
         let seen = vec!["e1".to_string(), "e2".to_string()];
+        let holds = |held: Option<Held>| Holds {
+            held,
+            seen: seen.clone(),
+            notices: vec![
+                Kept {
+                    req: bare_request("bbbbbbbbbbbbbbbbbbbb", 5, 6, Style::Notice),
+                    overnight: true,
+                },
+                Kept {
+                    req: bare_request("cccccccccccccccccccc", 7, 8, Style::Notice),
+                    overnight: false,
+                },
+            ],
+            pending: Some(Pending {
+                req: bare_request("dddddddddddddddddddd", 10, 11, Style::Lease),
+                holder: Holder {
+                    name: "lane".into(),
+                    epoch: 2,
+                },
+                restored: false,
+            }),
+            last_ask_ms: Some(10),
+        };
         for r in [true, false] {
-            let (h, s) = parse_holds(&holds_json(Some(&held(r)), &seen)).unwrap();
-            let h = h.unwrap();
-            assert_eq!((h.reallow, h.until, h.at_ms), (r, Until::Window(9), 3));
-            assert_eq!(s, seen);
+            let h = parse_holds(&holds_json(&holds(Some(held(r))))).unwrap();
+            let held = h.held.unwrap();
+            assert_eq!(
+                (held.reallow, held.until, held.at_ms),
+                (r, Until::Window(9), 3)
+            );
+            assert_eq!(h.seen, seen);
         }
-        let (h, s) = parse_holds(&holds_json(None, &seen)).unwrap();
-        assert!(h.is_none());
-        assert_eq!(s, seen);
+        let h = parse_holds(&holds_json(&holds(None))).unwrap();
+        assert!(h.held.is_none());
+        assert_eq!(h.seen, seen);
+        let pushes: Vec<(String, u64, bool)> = h
+            .notices
+            .iter()
+            .map(|k| (k.req.id.clone(), k.req.created_ms, k.overnight))
+            .collect();
+        assert_eq!(
+            pushes,
+            vec![
+                ("bbbbbbbbbbbbbbbbbbbb".to_string(), 5, true),
+                ("cccccccccccccccccccc".to_string(), 7, false)
+            ]
+        );
+        let p = h.pending.unwrap();
+        assert_eq!(
+            (
+                p.req.id.as_str(),
+                p.req.created_ms,
+                p.req.expires_ms,
+                p.holder.epoch
+            ),
+            ("dddddddddddddddddddd", 10, 11, 2)
+        );
+        assert!(p.restored, "an ask read back is nobody's");
+        assert_eq!(h.last_ask_ms, Some(10));
+        let empty = parse_holds(&holds_json(&Holds::default())).unwrap();
+        assert!(empty.pending.is_none() && empty.last_ask_ms.is_none() && empty.notices.is_empty());
         // version 1 (round 2): no reallow, no seen list
         let v1 = r#"{"version":1,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"window","until_ms":9}}"#;
-        let (h, s) = parse_holds(v1).unwrap();
-        assert!(!h.unwrap().reallow);
-        assert!(s.is_empty());
+        let h = parse_holds(v1).unwrap();
+        assert!(!h.held.unwrap().reallow);
+        assert!(h.seen.is_empty());
         assert!(parse_holds(r#"{"version":1,"hold":null}"#)
             .unwrap()
-            .0
+            .held
             .is_none());
-        // version 2 needs both
+        // version 2 (round 3): no pushes, no ask
+        let v2 = parse_holds(r#"{"version":2,"hold":null,"seen_denies":["e1"]}"#).unwrap();
+        assert!(v2.notices.is_empty() && v2.pending.is_none() && v2.last_ask_ms.is_none());
+        // version 2 needs both; version 3 needs its three
         for bad in [
             r#"{"version":2,"hold":null}"#,
             r#"{"version":2,"hold":null,"seen_denies":"e1"}"#,
             r#"{"version":2,"hold":null,"seen_denies":[1]}"#,
             r#"{"version":2,"seen_denies":[]}"#,
+            r#"{"version":4,"hold":null,"seen_denies":[]}"#,
+            r#"{"version":0,"hold":null,"seen_denies":[]}"#,
             r#"{"version":3,"hold":null,"seen_denies":[]}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[],"notices":[],"pending":null}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[],"notices":[],"last_ask_ms":null}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[],"pending":null,"last_ask_ms":null}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[],"notices":[{"request_id":"a","created_ms":1}],"pending":null,"last_ask_ms":null}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[],"notices":[],"pending":{"request_id":"a","created_ms":1,"expires_ms":2},"last_ask_ms":null}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[],"notices":[],"pending":null,"last_ask_ms":"x"}"#,
             r#"{"version":2,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"window","until_ms":9},"seen_denies":[]}"#,
             r#"{"version":2,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"window","until_ms":9,"reallow":"yes"},"seen_denies":[]}"#,
         ] {
             assert!(parse_holds(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Review round 4, item 1: at most [`NOTICES_KEPT`] pushes, for at most a day, each once.
+    #[test]
+    fn the_pushes_kept_are_bounded_by_count_and_age() {
+        let book = Arc::new(LeaseBook::new(Arc::new(leasebook::ManualClock::new(NOW))));
+        let mut p = Protected::new(ProtectedConfig::new(30, 10, None), book);
+        let r = |i: usize, at: u64| bare_request(&format!("{i:020}"), at, at, Style::Notice);
+        p.keep_notice(&r(0, NOW), false, NOW);
+        p.keep_notice(&r(0, NOW), true, NOW);
+        assert_eq!(p.notices.len(), 1, "once");
+        assert!(p.notices[0].overnight, "an overnight mark is never lost");
+        for i in 1..=NOTICES_KEPT + 3 {
+            p.keep_notice(&r(i, NOW + i as u64), false, NOW + i as u64);
+        }
+        assert_eq!(p.notices.len(), NOTICES_KEPT);
+        assert_eq!(p.notices[0].req.id, format!("{:020}", 4), "the oldest go");
+        let later = NOW + NOTICES_KEPT_MS + 10;
+        p.keep_notice(&r(999, later), false, later);
+        let ids: Vec<&str> = p.notices.iter().map(|k| k.req.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            NOTICES_KEPT - 6,
+            "made a day before, gone: {ids:?}"
+        );
     }
 
     #[test]

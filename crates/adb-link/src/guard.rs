@@ -86,9 +86,12 @@ const CODE_SUFFIXES: [&str; 12] = [
 ];
 
 /// A path as the phone resolves it, for the code-push rule: lower case, `\` as `/`, empty and `.`
-/// segments dropped and `..` taken off the segment before it.
+/// segments dropped, `..` taken off the segment before it, and a leading `/proc/<any>/root` or
+/// `/proc/<any>/cwd` (a process's view of `/`, as in `/proc/self/root/data/local/tmp`) taken off,
+/// however often it repeats (review round 4, item 8).
 fn normalise_phone_path(p: &str) -> String {
     let p = p.trim().to_lowercase().replace('\\', "/");
+    let lead = if p.starts_with('/') { "/" } else { "" };
     let mut out: Vec<&str> = vec![];
     for seg in p.split('/') {
         match seg {
@@ -98,8 +101,10 @@ fn normalise_phone_path(p: &str) -> String {
             }
             s => out.push(s),
         }
+        if !lead.is_empty() && matches!(out.as_slice(), ["proc", _, "root" | "cwd"]) {
+            out.clear();
+        }
     }
-    let lead = if p.starts_with('/') { "/" } else { "" };
     format!("{lead}{}", out.join("/"))
 }
 
@@ -582,9 +587,12 @@ fn int_word(w: &str) -> bool {
 /// Is `line` (the words after `shell` or `exec-out`) one of the exact shapes core and the live
 /// transport send to the protected phone? An allowlist: `input` taps, long presses, swipes, key
 /// events and escaped text; the screen size, rotation, wakefulness and package reads; `getprop` of
-/// one key; a launcher `monkey` of one package; `am start -W` with quoted arguments; the file
-/// tools' `sha256sum <path>`, `ls -1tp <dir>` and `stat -c %s <path>` (one path word, never a
-/// flag); and, as `exec-out`, `screencap -p`, `uiautomator dump /dev/tty` and the fallback reader.
+/// one key; a launcher `monkey` of one package; `am start -W` in the two shapes core builds
+/// (`open_url_args`: `-a android.intent.action.VIEW -d <uri> [-p <package>]`;
+/// `start_activity_args`: `-n <package/activity> [-a <action>] [-d <data>]`, values never a flag);
+/// the file tools' `sha256sum <path>`, `ls -1tp <dir>` and `stat -c %s <path>` (one path word,
+/// never a flag); and, as `exec-out`, `screencap -p`, `uiautomator dump /dev/tty` and the fallback
+/// reader.
 pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
     if sub == "exec-out" {
         return PROTECTED_EXACT_EXEC_OUT.contains(&line);
@@ -616,6 +624,24 @@ pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
     };
     // one path word (plain_words has already refused metacharacters outside quotes): never a flag
     let path = |p: &str| !p.is_empty() && p.len() <= 1024 && !p.starts_with('-');
+    // an intent's data or link: one word, never a flag
+    let value = |v: &str| !v.is_empty() && v.len() <= 2048 && !v.starts_with('-');
+    let action = |a: &str| {
+        !a.is_empty()
+            && a.len() <= 128
+            && a.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    };
+    // `package/activity` (`com.android.settings/.Settings`, `a.b/.C$D`)
+    let component = |c: &str| {
+        c.split_once('/').is_some_and(|(p, a)| {
+            pkg(p)
+                && !a.is_empty()
+                && a.len() <= 256
+                && a.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'$'))
+        })
+    };
     let input = match w.as_slice() {
         ["input", "-d", d, rest @ ..] if d.bytes().all(|b| b.is_ascii_digit()) && !d.is_empty() => {
             rest
@@ -639,7 +665,16 @@ pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         }
         ["monkey", "-p", p, "-c", "android.intent.category.LAUNCHER", "1"] => pkg(p),
-        ["am", "start", "-W", args @ ..] => !args.is_empty() && args.len() <= 16,
+        // `am start -W` exactly as `open_url_args` and `start_activity_args` build it (review
+        // round 4, item 8)
+        ["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", uri] => value(uri),
+        ["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", uri, "-p", p] => {
+            value(uri) && pkg(p)
+        }
+        ["am", "start", "-W", "-n", c] => component(c),
+        ["am", "start", "-W", "-n", c, "-a", x] => component(c) && action(x),
+        ["am", "start", "-W", "-n", c, "-d", d] => component(c) && value(d),
+        ["am", "start", "-W", "-n", c, "-a", x, "-d", d] => component(c) && action(x) && value(d),
         // the file tools' reads: push's read-back, and pull_new's listing, size and hash
         ["sha256sum", p] | ["ls", "-1tp", p] | ["stat", "-c", "%s", p] => path(p),
         _ => false,
@@ -2297,6 +2332,17 @@ mod tests {
                 "shell",
                 "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://example.com/it'\\''s'",
             ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://example.com/' '-p' 'com.android.chrome'",
+            ),
+            ("shell", "am start -W '-n' 'com.android.settings/.Settings'"),
+            (
+                "shell",
+                "am start -W '-n' 'a.b/.C$D' '-a' 'android.intent.action.MAIN' '-d' 'd:1'",
+            ),
+            ("shell", "am start -W '-n' 'a.b/.C' '-a' 'act'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-d' 'content://x/1'"),
             ("exec-out", "screencap -p"),
             ("exec-out", "uiautomator dump /dev/tty"),
             ("exec-out", IDLE_FREE_READ),
@@ -2320,6 +2366,33 @@ mod tests {
             ),
             ("shell", "am start -W $(id)"),
             ("shell", "am start -W"),
+            // review round 4, item 8: only the two shapes core builds, never a flag for a value
+            ("shell", "am start -W '-a' 'android.intent.action.VIEW'"),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.CALL' '-d' 'tel:1'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' '--user' '-p' 'a.b'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://x' '-p' 'a;b'",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://x' '--es' 'k' 'v'",
+            ),
+            ("shell", "am start -W '-n' 'com.android.settings'"),
+            ("shell", "am start -W '-n' '/.Settings'"),
+            ("shell", "am start -W '-n' 'a.b/'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '--ez' 'k' 'true'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-d' '-x'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-a' 'a b'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-d' 'x' '-a' 'act'"),
+            ("shell", "am start -W '--user' '0' '-n' 'a.b/.C'"),
+            ("shell", "am start -W '-n' 'a.b/.C' '-f' '0x10000000'"),
             ("shell", "settings put global adb_enabled 0"),
             ("shell", "uiautomator dump /sdcard/x.xml"),
             ("exec-out", "uiautomator dump /dev/tty; cat /sdcard/x"),
@@ -2387,6 +2460,22 @@ mod tests {
             ("C:/outbox/note.txt", "//data//local/./tmp/x"),
             ("C:/outbox/note.txt", "/sdcard/../data/local/tmp/x"),
             ("C:/outbox/note.txt", "\\data\\local\\tmp\\x"),
+            // review round 4, item 8: through a process's view of `/`
+            ("C:/outbox/note.txt", "/proc/self/root/data/local/tmp/x"),
+            ("C:/outbox/note.txt", "/proc/1/root/data/local/tmp"),
+            (
+                "C:/outbox/note.txt",
+                "/proc/thread-self/root/./data/local/tmp/x",
+            ),
+            (
+                "C:/outbox/note.txt",
+                "/PROC/self/ROOT/proc/self/root/data/local/tmp/x",
+            ),
+            ("C:/outbox/note.txt", "/proc/self/cwd/data/local/tmp/x"),
+            (
+                "C:/outbox/note.txt",
+                "/sdcard/../proc/self/root/data/local/tmp/x",
+            ),
             ("C:/outbox/note.txt", DUMP_HELPER_REMOTE),
             ("C:\\outbox\\a.DeX", "/sdcard/a"),
         ] {
@@ -2402,6 +2491,8 @@ mod tests {
             ("C:/outbox/a", "/data/local/tmpx/a"),
             ("C:/outbox/a", "/data/local/tm"),
             ("C:/outbox/a", "/sdcard/tmp/x"),
+            ("C:/outbox/a", "/sdcard/proc/self/root/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/rootx/data/local/tmp/x"),
         ] {
             assert!(
                 code_push_refusal(local, remote).is_none(),

@@ -118,7 +118,8 @@ pub struct Lease {
 
 impl Lease {
     /// Whole seconds left at `now_ms`.
-    pub fn seconds_left(&self, now_ms: u64) -> u64 {
+    #[cfg(test)]
+    fn seconds_left(&self, now_ms: u64) -> u64 {
         self.expires_at_ms.saturating_sub(now_ms) / 1000
     }
 }
@@ -183,9 +184,15 @@ impl LeaseBook {
         }
     }
 
-    /// Close the lease at once. Returns the one that was open.
-    pub fn close(&self) -> Option<Lease> {
-        self.lock().take()
+    /// Close the lease at once, `why` saying why for the audit log: the close goes in the same
+    /// queue as every other ([`LeaseBook::take_ended`]), so core writes it like the rest and
+    /// never drops one (review round 4, item 6). Returns the one that was open.
+    pub fn close_for(&self, why: &'static str) -> Option<Lease> {
+        let l = self.lock().take();
+        if let Some(l) = &l {
+            self.ended_push(l.clone(), why);
+        }
+        l
     }
 
     /// Close the lease if it belongs to the daemon lease of `epoch` (its holder's connection went,
@@ -231,7 +238,8 @@ impl LeaseBook {
     }
 
     /// Is a close waiting to be written to the audit log?
-    pub fn has_ended(&self) -> bool {
+    #[cfg(test)]
+    fn has_ended(&self) -> bool {
         !self
             .ended
             .lock()
@@ -350,6 +358,20 @@ mod tests {
             .collect();
         book.requeue_ended(many);
         assert_eq!(book.take_ended().len(), ENDED_KEPT + 5);
+    }
+
+    /// Review round 4, item 6: core's own closes go in the same queue as the others.
+    #[test]
+    fn a_close_by_core_is_queued_like_every_other() {
+        let book = LeaseBook::new(Arc::new(ManualClock::new(T0)));
+        assert!(book.close_for("denied").is_none());
+        assert!(!book.has_ended(), "nothing open, nothing queued");
+        book.open(lease(3));
+        assert_eq!(book.close_for("denied").map(|l| l.holder.epoch), Some(3));
+        assert!(book.active().is_none());
+        let ended = book.take_ended();
+        assert_eq!(ended.len(), 1);
+        assert_eq!((ended[0].0.holder.epoch, ended[0].1), (3, "denied"));
     }
 
     #[test]

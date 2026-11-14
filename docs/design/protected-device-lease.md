@@ -46,7 +46,11 @@ Its other flags need `--protected-lease`; on their own the daemon refuses them.
 | `--presence-ttl-min` (how fresh the presence file must be) | 15 | 1 to 60 |
 
 Asks go to the push channel at priority 4; the quiet notices (the lease-open notice and the
-overnight notice) at priority 2.
+overnight notice) at priority 2. One ask goes at priority 2 too: the ask that follows an overnight
+lease that ended because the presence file could no longer be trusted (stale, missing or badly
+signed), while it still cannot be. The last trusted reading said asleep, so this is a hiccup at
+night, and the ask waits quietly in the shade, answerable in the morning (round 4; the owner may
+reverse this default). That mark is not kept across a restart.
 
 The code: `crates/core/src/protected.rs` (the lease, the PIN rule, the holds file and the presence
 file), `crates/adb-link/src/lease.rs` (the lease book that core and the adb guard share),
@@ -73,8 +77,9 @@ The checks run in this order, and the first one that refuses ends the call:
      ends in `.dex`, `.apk`, `.apks`, `.apex`, `.jar`, `.so`, `.odex`, `.vdex`, `.oat`, `.art`,
      `.xapk` or `.aab` (any case), and any push into `/data/local/tmp` (where `app_process` and the
      shell run code from) or onto the dump helper's path. The path is normalised first (`\`
-     becomes `/`; empty, `.` and `..` segments are resolved), so `/sdcard/../data/local/tmp/x` is
-     caught. Core checks the phone path; the adb guard checks both sides again. Pulls are reads and
+     becomes `/`; empty, `.` and `..` segments are resolved; a leading `/proc/<any>/root` or
+     `/proc/<any>/cwd`, a process's view of `/`, is taken off, however often it repeats), so
+     `/sdcard/../data/local/tmp/x` and `/proc/self/root/data/local/tmp/x` are caught. Core checks the phone path; the adb guard checks both sides again. Pulls are reads and
      are not refused.
 3. **The daemon lease.** The caller must hold the daemon's device lease on the protected phone
    (`lease.acquire`). The protected lease's holder is **the caller's own** daemon lease (its
@@ -87,15 +92,25 @@ The checks run in this order, and the first one that refuses ends the call:
      stays queued, with every later one behind it, and the call is refused (`Refusal::Audit`)
      until it is written.
    - **An open lease** admits the call when it belongs to this holder. A lease of another holder
-     is closed (and logged), and the new holder starts from nothing. Every 10 seconds the lease's
-     push is polled for a Deny.
+     is closed (through the same close queue as every other close), and the new holder starts
+     from nothing. Every 10 seconds the channel is read for a Deny on the lease's push **or on any
+     kept push** (see "Deny, holds and re-allow"); a clock that has gone back reads at once.
+   - **No lease open:** the kept pushes are read for a Deny every 10 seconds, and at once on the
+     first call after a start-up, so a Deny posted while the daemon was down is seen.
    - **A hold** (after a Deny, or an ask that ended unanswered) refuses without asking, **whoever
      holds the phone**: a new holder inherits it.
    - **The pending ask.** At most one ask is out per phone, whoever it is for. It is checked
-     without waiting. For its own holder: Allow opens the lease and Deny starts a hold. For
-     another holder: while it is open the call is refused without a push; an Allow meant for a
-     holder that no longer holds the phone opens nothing (`lease:stale`).
-   - **Overnight** (only with a signed, fresh presence file saying `asleep`): a lease opens at
+     without waiting, and the channel is read even once its window has closed: an answer DATED
+     inside the window counts however late the agent calls again, and one dated after it never
+     does. For its own holder: Allow opens the lease and Deny starts a hold. For another holder:
+     while it is open the call is refused without a push; an Allow meant for a holder that no
+     longer holds the phone opens nothing (`lease:stale`). The pending ask and the time of the
+     last ask are kept in the holds file: after a restart the ask is **nobody's** (daemon lease
+     epochs start again, so the same name and epoch are not the asker), so its Allow opens nothing,
+     its Deny holds, and no new ask goes out within the ask window of the old one.
+   - **Overnight** (only with a signed, fresh presence file saying `asleep`): first the channel is
+     read for a Deny on every kept push; one found holds (until the owner is awake, when it was an
+     overnight notice), and a channel that cannot be read opens nothing. Then a lease opens at
      once, with no ask. The owner gets a notice that has only a **Deny** button: "Overnight: Agent
      session: NAME took over the protected phone for N min (the presence file says asleep). Tap
      Deny to end it." If the notice cannot be sent, no lease opens.
@@ -111,10 +126,13 @@ The checks run in this order, and the first one that refuses ends the call:
      owner allowed it) and `lease:notice_unsent` is logged; the owner can still reply `deny <id>`.
 5. **The screen lock** (`crates/core/src/screenlock.rs`), for acting calls: see "One Allow, both
    leases" below.
-6. **The PIN rule.** While a PIN or passcode prompt is on screen, every digit key, every typed
-   digit and every touch on a digit key is refused, one at a time, so "12" and then "34" is
-   refused as well as "1234". This is the one screen rule left, and it guards the owner's PIN, not
-   what the screen shows.
+6. **The PIN rule.** While a PIN or passcode prompt is on screen, every digit key, the paste key,
+   every typed digit and every touch on a digit key is refused, one at a time, so "12" and then
+   "34" is refused as well as "1234". This is the one screen rule left, and it guards the owner's
+   PIN, not what the screen shows. A screen that is off or dozing shows no prompt to touch: when
+   its tree cannot be read, a tap, long press or swipe goes on to the usual guards; only a screen
+   that is on (or whose state cannot be read) and cannot be read is refused (`protected:screen`).
+   Overnight, with the screen off, `key wake` and then a swipe go.
 7. **The usual guards.** The screen guard (D3) and the file guard run as on any phone. An action
    the screen guard would ask about is asked as usual under a daytime lease. Under an overnight
    lease it is refused, because nobody is awake to answer.
@@ -129,8 +147,8 @@ words. A name with nothing left reads "Agent session: (no name)".
 
 ### Screen reads per call
 
-Only a call that could enter a digit (`type_text`, `tap`, `long_press`, `swipe`, and a `key` that is
-not back, home or escape) reads the screen for the PIN check, and it uses the stored tree when that
+Only a call that could enter a digit (`type_text`, `tap`, `long_press`, `swipe`, and a digit or
+paste `key`; `wake`, `enter` and the other keys do not) reads the screen for the PIN check, and it uses the stored tree when that
 is fresh (within the screen guard's tree age) and nothing has acted since. The screen guard and a
 selector then use the same tree. So:
 
@@ -162,8 +180,10 @@ the protected policy (`protected_policy`):
   - word for word: the screen size and rotation read, the wakefulness read, `pm list packages`,
     `screencap -p`, `uiautomator dump /dev/tty`, and the fallback screen read;
   - `input [-d N] tap|swipe|keyevent` with plain words, `input text` with core's escaped text,
-    `getprop KEY`, `monkey -p PKG -c android.intent.category.LAUNCHER 1`, and `am start -W` with
-    1 to 16 quoted arguments;
+    `getprop KEY`, `monkey -p PKG -c android.intent.category.LAUNCHER 1`, and `am start -W` in
+    exactly the two shapes core builds: `-a android.intent.action.VIEW -d <link> [-p <package>]`
+    (`open_url_args`) and `-n <package/activity> [-a <action>] [-d <data>]`
+    (`start_activity_args`), in that order, a value never a flag;
   - the file tools' reads (push's read-back and `pull_new`'s listing, size and hash), each with
     one path word that is not empty, at most 1024 characters and does not start with `-`:
     `sha256sum <path>`, `ls -1tp <dir>` and `stat -c %s <path>`.
@@ -210,7 +230,10 @@ Allow again for the screen lock. So:
   protected phone. Core records the lease as the screen lock's lease for that phone (so the
   screen lock counts the agent's own actions as the agent's, not the owner's), and it drops that
   phone's pending tails. One Allow covers both. **An `ask-screen` No still refuses**: while the
-  owner's last `ask-screen` answer was No, no screen-changing call goes, Allow or not.
+  owner's last `ask-screen` answer was No, no screen-changing call goes, Allow or not. Each acting
+  call under the Allow is recorded as the agent's own action for the screen lock (round 4), so an
+  overnight lease straight after carries on as the agent's burst, as long as nobody else has
+  touched the phone since, instead of waiting out the idle limit.
 - **An overnight lease never skips it.** Overnight the owner allowed nothing, so the screen lock's
   own check runs on every acting call: the moment the owner picks the phone up (in use: a focused
   app, the keyboard, a recent touch), the agent stops.
@@ -248,26 +271,40 @@ lease's answer comes over the approval channel's separate inbound topic.
 - **If the push channel cannot be read** while a lease is open, that is not taken as "no Deny".
   The failure is audited (`lease:deny_poll`). After 2 minutes without a successful read, the lease
   closes (`lease:deny_unreadable`).
+- **A Deny on an older push still counts** (round 4). The pushes whose Deny buttons may still be in
+  the owner's shade are kept: every overnight notice, and every Allowed ask (its lease-open notice
+  has the same id), for 24 hours, at most the newest 64, in the holds file. A Deny on any of them
+  closes the open lease (whichever push it was on) and holds; with no lease open it holds too. A
+  Deny on an overnight notice is an overnight Deny: it holds until the owner is awake. All kept
+  pushes are read in one poll, from the oldest one's time. A hold already standing is never cut
+  short by a weaker one. A Deny found with no lease open cannot be re-allowed (its holder is not
+  known); it ends like any hold.
 
 ### The holds file
 
-A hold outlives a restart. It is written to `protected-holds.json` in the daemon's `--state-dir`
-whenever it starts or ends, by writing a temporary file beside it and renaming
-it over the old one, and it is read when the daemon starts:
+A hold outlives a restart, and so do the kept pushes, the pending ask and the time of the last
+ask. They are written to `protected-holds.json` in the daemon's `--state-dir` whenever one of them
+changes, by writing a temporary file beside it and renaming it over the old one, and read when the
+daemon starts:
 
 ```json
-{"version": 2, "hold": {"request_id": "...", "created_ms": 0, "expires_ms": 0,
+{"version": 3, "hold": {"request_id": "...", "created_ms": 0, "expires_ms": 0,
   "holder": {"name": "lane-a", "epoch": 7}, "denied_at_ms": 0,
   "until": "window" | "awake" | "presence_change", "until_ms": 0, "presence_state": null,
   "reallow": true},
- "seen_denies": ["..."]}
+ "seen_denies": ["..."],
+ "notices": [{"request_id": "...", "created_ms": 0, "overnight": true}],
+ "pending": {"request_id": "...", "created_ms": 0, "expires_ms": 0,
+   "holder": {"name": "lane-a", "epoch": 7}} | null,
+ "last_ask_ms": 0 | null}
 ```
 
 `"hold": null` is no hold. `until` says what ends it: `window` at `until_ms`, `awake` when a
 trusted presence file says a state other than `asleep`, `presence_change` when a trusted presence
 file's state differs from `presence_state` (the first trusted state seen, if none was known).
 `reallow` is true only for a hold after a Deny. A version-1 file (round 2) is still read: its hold
-cannot be re-allowed, and it lists no Deny events.
+cannot be re-allowed, and it lists no Deny events. A version-2 file (round 3) is still read too:
+it keeps no pushes, pending ask or last ask time.
 
 **A holds file that cannot be read** (not JSON, another version, a malformed hold or Deny list, or
 an I/O error other than "not found") fails closed: the phone is held until a trusted presence
@@ -345,15 +382,16 @@ the job ends.
 Every lease event is an audit entry (`allowed`, `blocked` or `asked`), with these rules:
 
 `lease:asked`, `lease:opened`, `lease:overnight`, `lease:reallowed`, `lease:denied`,
-`lease:expired`, `lease:closed`, `lease:stale`, `lease:hold_ended`, `lease:notice_unsent`,
-`lease:deny_poll`, `lease:deny_unreadable`.
+`lease:expired`, `lease:closed`, `lease:overnight_ended`, `lease:stale`, `lease:hold_ended`,
+`lease:notice_unsent`, `lease:deny_poll`, `lease:deny_unreadable`.
 
 - **Before it opens.** `lease:opened`, `lease:overnight` and `lease:reallowed` are written before
   the lease opens. If the write fails, the call is refused and no lease opens (a failed re-allow
   write leaves the hold in place).
-- **Every close**, with its reason: `released`, `connection closed` and `expired` (from the lease
-  book's queue of closes), another holder, an overnight lease whose presence ended, a Deny, a Deny
-  channel that could not be read. A release is logged at once; a dropped connection at once when
+- **Every close**, with its reason, all through the lease book's one queue of closes: `released`,
+  `connection closed`, `expired`, `another holder called`, `presence ended` (with a
+  `lease:overnight_ended` entry saying what the presence file said), `denied` and `deny channel
+  unreadable`. A release is logged at once; a dropped connection at once when
   the backend is free, else at the next call; an expiry at the next call. **A close is never
   dropped**: one that cannot be written goes back to the front of the queue, and calls on the
   protected phone are refused until it is written.

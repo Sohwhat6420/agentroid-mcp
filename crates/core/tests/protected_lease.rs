@@ -33,6 +33,8 @@ struct Phone {
     screens: VecDeque<String>,
     calls: Vec<String>,
     tree_fails: bool,
+    /// The screen is off (dozing): no tree can be read until a wake key.
+    asleep: bool,
 }
 
 impl Phone {
@@ -89,7 +91,7 @@ impl Transport for Phone {
         Ok((1080, 2400))
     }
     fn screen_state(&mut self, _: &str) -> Result<String, TransportError> {
-        Ok("Awake".into())
+        Ok(if self.asleep { "Dozing" } else { "Awake" }.into())
     }
     fn screenshot(&mut self, serial: &str, _: i32) -> Result<Screenshot, TransportError> {
         self.calls.push(format!("screenshot {serial}"));
@@ -105,7 +107,7 @@ impl Transport for Phone {
     }
     fn tree_xml(&mut self, serial: &str, _: Backend) -> Result<String, TransportError> {
         self.calls.push(format!("tree {serial}"));
-        if self.tree_fails {
+        if self.tree_fails || self.asleep {
             return Err(TransportError("uiautomator dump failed".into()));
         }
         let x = if self.screens.len() > 1 {
@@ -117,6 +119,9 @@ impl Transport for Phone {
     }
     fn input(&mut self, serial: &str, input: &Input) -> Result<(), TransportError> {
         self.calls.push(format!("input {serial} {input:?}"));
+        if matches!(input, Input::Key(k) if k == "KEYCODE_WAKEUP") {
+            self.asleep = false;
+        }
         Ok(())
     }
     fn packages(&mut self, _: &str) -> Result<Vec<String>, TransportError> {
@@ -693,11 +698,21 @@ fn files_go_under_the_lease_but_code_shell_and_link_segments_never_do() {
             .file_gate(Some(PROT), FileOp::Push, "/sdcard/Download/app.apk"),
         Err(CoreError::Refused(Refusal::Protected { rule: "code", .. }))
     ));
-    // raw shell lines never run on it, lease or not
-    assert!(matches!(
-        r.core.shell_gate(Some(PROT), "dumpsys notification"),
-        Err(CoreError::Refused(Refusal::Protected { rule: "shell", .. }))
-    ));
+    // raw shell lines never run on it, lease or not, and the refusal gives no content reason
+    match r.core.shell_gate(Some(PROT), "dumpsys notification") {
+        Err(CoreError::Refused(e @ Refusal::Protected { rule: "shell", .. })) => {
+            let text = e.to_string();
+            assert!(
+                text.contains("raw shell is not allowed on the protected phone"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("notification") && !text.contains("app data"),
+                "{text}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
     // nor do link segments
     assert!(matches!(
         r.core.lock_admit(Some(PROT), "link.segment"),
@@ -1289,7 +1304,7 @@ fn a_deny_is_kept_in_the_holds_file_and_holds_after_a_restart() {
         let path = r.dir.join("protected-holds.json");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["version"], 2);
+        assert_eq!(v["version"], 3);
         assert_eq!(v["hold"]["reallow"], true);
         assert_eq!(v["hold"]["request_id"], ask.id.as_str());
         assert_eq!(v["hold"]["until"], "window");
@@ -1751,28 +1766,27 @@ fn a_close_that_cannot_be_logged_stays_queued_and_refuses_until_it_is_written() 
     // released by its holder while the log cannot be written
     assert!(r.core.protected_mut().unwrap().close_epoch(1).is_some());
     r.core.protected_audit_closes("lease.release");
-    assert!(r.book.has_ended(), "kept for the next write");
     let reached = r.core.transport.sent_to_protected().len();
     for _ in 0..2 {
         assert!(matches!(
             refused(r.call(&at(100.0, 300.0))),
             Refusal::Audit { .. }
         ));
-        assert!(r.book.has_ended());
     }
     assert_eq!(r.core.transport.sent_to_protected().len(), reached);
-    // the log can be written again: the close goes in, and calls are judged as usual
+    // the log can be written again: the close goes in, once, and calls are judged as usual
     std::fs::remove_dir_all(&head).unwrap();
     let e = refused(r.call(&at(100.0, 300.0)));
     assert!(!matches!(e, Refusal::Audit { .. }), "{e:?}");
-    assert!(!r.book.has_ended());
-    assert!(
-        audit_rules(&log)
+    let released = |log: &std::path::Path| {
+        audit_rules(log)
             .iter()
-            .any(|(rule, why)| rule == "lease:closed" && why.ends_with("closed: released")),
-        "{:?}",
-        audit_rules(&log)
-    );
+            .filter(|(rule, why)| rule == "lease:closed" && why.ends_with("closed: released"))
+            .count()
+    };
+    assert_eq!(released(&log), 1, "{:?}", audit_rules(&log));
+    refused(r.call(&at(100.0, 300.0)));
+    assert_eq!(released(&log), 1, "written once, then gone from the queue");
 }
 
 // item 13: the holder in the push
@@ -1794,4 +1808,418 @@ fn the_ask_names_the_holder_briefly_and_with_no_link() {
     );
     assert!(!ask.reason.contains("://"), "{}", ask.reason);
     assert!(!ask.reason.contains('\n'), "{}", ask.reason);
+}
+
+// ---------------------------------------------------------------------------------------------
+// review round 4
+// ---------------------------------------------------------------------------------------------
+
+fn key(name: &str) -> Call {
+    Call::Key { name: name.into() }
+}
+
+fn swipe_up() -> Call {
+    Call::Swipe {
+        x1: 540.0,
+        y1: 2000.0,
+        x2: 540.0,
+        y2: 800.0,
+        ms: 300,
+        space: None,
+        image_width: None,
+    }
+}
+
+/// Every audit line with `rule`, its reason.
+fn reasons(log: &std::path::Path, rule: &str) -> Vec<String> {
+    audit_rules(log)
+        .into_iter()
+        .filter(|(r, _)| r == rule)
+        .map(|(_, why)| why)
+        .collect()
+}
+
+// item 1: a Deny on an older overnight notice is an overnight Deny
+
+#[test]
+fn a_deny_on_an_older_overnight_notice_closes_the_lease_and_holds_until_awake() {
+    let mut r = rig("r4-old-notice");
+    let log = r.audit();
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0))
+        .expect("the first overnight lease");
+    let first = r.sent()[0].clone();
+    // it runs out; the next overnight lease opens with its own notice
+    r.wall.advance(30 * MIN + 1);
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0))
+        .expect("the second overnight lease");
+    assert_eq!(r.sent().len(), 2);
+    let second = r.sent()[1].clone();
+    assert_ne!(first.id, second.id);
+    // the owner finds the FIRST notice in his shade and taps Deny on it
+    r.answer("deny", &first.id, r.now() + 1_000);
+    r.wall.advance(10_000);
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("Deny"), "{e}");
+    assert!(r.book.active().is_none(), "the open lease closed");
+    assert!(
+        reasons(&log, "lease:closed")
+            .iter()
+            .any(|why| why.ends_with("closed: denied")),
+        "{:?}",
+        audit_rules(&log)
+    );
+    // an overnight Deny: held while asleep, past the ask window, until the owner is awake
+    for step in [11 * MIN, 45 * MIN] {
+        r.wall.advance(step);
+        r.presence("asleep", r.now());
+        let e = refused(r.call(&at(100.0, 300.0)));
+        assert!(e.to_string().contains("held"), "{step}: {e}");
+    }
+    assert_eq!(r.sent().len(), 2, "no push while held");
+    r.presence("present", r.now());
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+}
+
+#[test]
+fn before_an_overnight_lease_opens_the_earlier_notices_are_checked() {
+    let mut r = rig("r4-before-open");
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0)).unwrap();
+    let first = r.sent()[0].clone();
+    r.wall.advance(30 * MIN + 1);
+    // a Deny on the run-out lease's notice, posted after it ended: no new lease opens
+    r.answer("deny", &first.id, r.now() - 1_000);
+    r.presence("asleep", r.now());
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("earlier lease"), "{e}");
+    assert!(r.book.active().is_none());
+    assert_eq!(r.sent().len(), 1, "no new notice");
+    r.wall.advance(20 * MIN);
+    r.presence("asleep", r.now());
+    assert!(refused(r.call(&at(100.0, 300.0)))
+        .to_string()
+        .contains("held"));
+    // with the channel unreadable, no overnight lease opens either
+    let mut q = rig("r4-before-open-unreadable");
+    q.presence("asleep", q.now());
+    q.call(&at(100.0, 300.0)).unwrap();
+    q.wall.advance(30 * MIN + 1);
+    q.presence("asleep", q.now());
+    q.inbox.lock().unwrap().poll_fails = true;
+    let e = refused(q.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("could not be read"), "{e}");
+    assert!(q.book.active().is_none());
+    assert_eq!(q.sent().len(), 1, "no new notice");
+    q.inbox.lock().unwrap().poll_fails = false;
+    q.call(&at(100.0, 300.0))
+        .expect("checked, nothing denied: the next overnight lease opens");
+}
+
+#[test]
+fn a_deny_posted_while_the_daemon_was_down_is_seen_at_start_up() {
+    let r = {
+        let mut r = rig("r4-down");
+        r.presence("asleep", r.now());
+        r.call(&at(100.0, 300.0)).unwrap();
+        r
+    };
+    let notice = r.sent()[0].clone();
+    let path = r.dir.join("protected-holds.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["notices"][0]["request_id"], notice.id.as_str());
+    assert_eq!(v["notices"][0]["overnight"], true);
+    // the daemon restarts an hour later; the owner tapped Deny while it was down
+    let mut again = rig_in(r.dir.clone());
+    again.wall.set(Some(T0 + 60 * MIN));
+    again.answer("deny", &notice.id, T0 + 20 * MIN);
+    again.presence("asleep", again.now());
+    let e = refused(again.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("Deny"), "{e}");
+    assert!(again.sent().is_empty(), "no overnight lease, no push");
+    again.wall.advance(30 * MIN);
+    again.presence("asleep", again.now());
+    assert!(refused(again.call(&at(100.0, 300.0)))
+        .to_string()
+        .contains("held"));
+    drop(again);
+    drop(r);
+}
+
+#[test]
+fn a_deny_on_an_allowed_asks_notice_after_its_lease_ended_still_holds() {
+    let mut r = rig("r4-day-notice");
+    let ask = r.open_lease();
+    r.wall.advance(30 * MIN + 1);
+    // the owner taps Deny on the lease-open notice once the lease has run out
+    r.answer("deny", &ask.id, r.now());
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("earlier lease"), "{e}");
+    let asks = r.asks().len();
+    r.wall.advance(5 * MIN);
+    assert!(refused(r.call(&at(100.0, 300.0)))
+        .to_string()
+        .contains("held"));
+    assert_eq!(r.asks().len(), asks, "held: no ask");
+    // a daytime Deny holds for the ask window, then the next call asks
+    r.wall.advance(5 * MIN);
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+}
+
+// item 2: a wake key on a dark screen, and paste on a PIN prompt
+
+#[test]
+fn overnight_with_the_screen_off_a_wake_key_then_a_swipe_go() {
+    let mut r = rig("r4-dark");
+    r.presence("asleep", r.now());
+    r.core.transport.asleep = true;
+    r.call(&key("wake"))
+        .expect("a wake key needs no screen read");
+    assert!(!r.core.transport.asleep, "woken");
+    r.core.transport.show(keyguard());
+    r.call(&swipe_up())
+        .expect("the swipe on the woken keyguard goes");
+    // a touch on a screen that is off is not refused for the PIN check
+    r.core.transport.asleep = true;
+    let e = r.call(&at(100.0, 300.0));
+    if let Err(CoreError::Refused(Refusal::Protected { rule, .. })) = &e {
+        panic!("refused by the protected check ({rule})");
+    }
+    // a screen that is on and cannot be read still refuses
+    r.core.transport.asleep = false;
+    r.core.transport.tree_fails = true;
+    assert_eq!(protected_rule(r.call(&swipe_up())), "screen");
+}
+
+#[test]
+fn paste_is_refused_on_a_pin_prompt() {
+    let mut r = rig("r4-paste");
+    r.open_lease();
+    r.core.transport.show(pin_prompt());
+    let before = r.core.transport.sent_to_protected().len();
+    for name in ["paste", "KEYCODE_PASTE"] {
+        assert_eq!(protected_rule(r.call(&key(name))), "pin", "{name}");
+    }
+    assert_eq!(r.core.transport.sent_to_protected().len(), before);
+}
+
+// item 3: an Allow tapped in time counts however late the agent asks
+
+#[test]
+fn an_allow_dated_inside_the_window_opens_even_when_the_agent_asks_after_it() {
+    let mut r = rig("r4-late-call");
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let ask = r.asks()[0].clone();
+    r.answer("allow", &ask.id, ask.created_ms + MIN);
+    r.wall.set(Some(ask.expires_ms + 5 * MIN));
+    r.call(&at(100.0, 300.0))
+        .expect("the Allow was tapped in time");
+    assert!(r.book.active().is_some());
+    // dated after the window: still nothing opens, however the call is timed
+    let mut q = rig("r4-late-call-late");
+    q.call(&at(100.0, 300.0)).unwrap_err();
+    let ask = q.asks()[0].clone();
+    q.answer("allow", &ask.id, ask.expires_ms + 1);
+    q.wall.set(Some(ask.expires_ms + 5 * MIN));
+    q.call(&at(100.0, 300.0)).unwrap_err();
+    assert!(q.book.active().is_none());
+}
+
+// item 4: the pending ask and the cool-down survive a restart
+
+#[test]
+fn after_a_restart_a_deny_on_the_old_ask_holds_and_no_new_push_goes_in_the_cool_down() {
+    let make = |name: &str| {
+        let mut r = rig(name);
+        r.call(&at(100.0, 300.0)).unwrap_err();
+        let ask = r.asks()[0].clone();
+        (r, ask)
+    };
+    // a Deny tapped while the daemon was down
+    let (r, ask) = make("r4-restart-deny");
+    let mut again = rig_in(r.dir.clone());
+    again.wall.set(Some(T0 + 2 * MIN));
+    again.answer("deny", &ask.id, T0 + MIN);
+    let e = refused(again.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("Deny"), "{e}");
+    again.wall.advance(5 * MIN);
+    assert!(refused(again.call(&at(100.0, 300.0)))
+        .to_string()
+        .contains("held"));
+    assert!(again.sent().is_empty(), "no new push");
+    drop(again);
+    drop(r);
+    // no answer yet: the old ask is still open, it is nobody's, and no new push goes out
+    let (r, ask) = make("r4-restart-open");
+    let mut again = rig_in(r.dir.clone());
+    again.wall.set(Some(T0 + 2 * MIN));
+    let e = refused(again.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("still open"), "{e}");
+    // its Allow opens nothing (the same holder name and epoch after a restart are not the asker)
+    again.answer("allow", &ask.id, T0 + 3 * MIN);
+    again.wall.set(Some(T0 + 4 * MIN));
+    let e = refused(again.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("an ask went to the owner"), "{e}");
+    assert!(again.book.active().is_none());
+    assert!(again.sent().is_empty(), "no new push within the cool-down");
+    again.wall.set(Some(T0 + 10 * MIN));
+    assert!(matches!(
+        refused(again.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+    drop(again);
+    drop(r);
+}
+
+// item 5: a presence hiccup at night asks quietly
+
+#[test]
+fn an_overnight_lease_ended_by_an_unreadable_presence_file_asks_quietly() {
+    let mut r = rig("r4-quiet");
+    let log = r.audit();
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0)).unwrap();
+    // the presence file goes stale (15 min): the lease ends, and the ask that follows is quiet
+    r.wall.advance(16 * MIN);
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    assert!(r.book.active().is_none());
+    assert!(
+        reasons(&log, "lease:closed")
+            .iter()
+            .any(|why| why.ends_with("closed: presence ended")),
+        "{:?}",
+        audit_rules(&log)
+    );
+    let ask = r.asks().last().cloned().unwrap();
+    assert!(ask.quiet, "a hiccup at night: low priority");
+    // it ends unanswered (a hold for the ask window); once the presence file is trusted again
+    // (the owner is up), the next ask is loud
+    r.wall.advance(10 * MIN);
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    r.wall.advance(10 * MIN);
+    r.presence("present", r.now());
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let next = r.asks().last().cloned().unwrap();
+    assert_ne!(next.id, ask.id);
+    assert!(!next.quiet);
+    // an overnight lease ended because the owner woke: the ask is loud
+    let mut q = rig("r4-quiet-awake");
+    q.presence("asleep", q.now());
+    q.call(&at(100.0, 300.0)).unwrap();
+    q.wall.advance(MIN);
+    q.presence("present", q.now());
+    q.call(&at(100.0, 300.0)).unwrap_err();
+    assert!(!q.asks().last().unwrap().quiet);
+}
+
+// item 6: core's own closes go through the close queue
+
+#[test]
+fn a_close_by_core_that_cannot_be_logged_stays_queued() {
+    let mut r = rig("r4-core-close");
+    let log = r.audit();
+    r.open_lease();
+    let head = agentroid_core::audit::head_path(&log);
+    std::fs::remove_file(&head).unwrap();
+    std::fs::create_dir_all(&head).unwrap();
+    // another holder calls: the open lease closes, but the close cannot be written yet
+    *r.holder.lock().unwrap() = Some(Holder {
+        name: "lane-b".into(),
+        epoch: 2,
+    });
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::Audit { .. }
+    ));
+    assert!(r.book.active().is_none());
+    std::fs::remove_dir_all(&head).unwrap();
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let closes = reasons(&log, "lease:closed");
+    assert_eq!(
+        closes
+            .iter()
+            .filter(|why| why.ends_with("closed: another holder called"))
+            .count(),
+        1,
+        "{closes:?}"
+    );
+}
+
+// item 7: a clock that goes back polls at once
+
+#[test]
+fn a_clock_that_goes_back_still_polls_for_the_deny() {
+    let mut r = rig("r4-clock-back");
+    let ask = r.open_lease();
+    r.answer("deny", &ask.id, r.now());
+    r.wall.set(Some(r.now() - 5 * MIN));
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeaseRefused { .. }
+    ));
+    assert!(r.book.active().is_none());
+}
+
+// item 10: the agent's own touches under an Allow are its own for the screen lock
+
+#[test]
+fn after_an_allowed_lease_an_overnight_lease_carries_on_the_agents_own_burst() {
+    use agentroid_core::askscreen::Signals;
+    use agentroid_core::screenlock::{Reading, ScreenLock};
+    for touched_by_owner in [false, true] {
+        let mut r = rig(&format!("r4-burst-{touched_by_owner}"));
+        // the phone reads awake, with an app up, last touched at `last`
+        let last = Arc::new(Mutex::new(T0));
+        let (wall, mono, l) = (r.wall.clone(), r.wall.clone(), last.clone());
+        r.core.set_screen_lock(ScreenLock::new(
+            r.dir.join("lock"),
+            Box::new(move |_, mono| {
+                let t = mono();
+                Some(Reading {
+                    signals: Signals {
+                        wakefulness: Some("Awake".into()),
+                        idle_ms: Some(t.saturating_sub(*l.lock().unwrap())),
+                        screen_kept_on: Some(false),
+                        focus: Some("com.example.notes".into()),
+                        ime_shown: Some(false),
+                        keyguard: Some(false),
+                        in_call: Some(false),
+                    },
+                    power_from: t,
+                    power_to: t,
+                })
+            }),
+            Box::new(move || agentroid_adb_link::lease::WallClock::now_ms(&*wall).unwrap_or(0)),
+            Box::new(move || agentroid_adb_link::lease::WallClock::now_ms(&*mono).unwrap_or(0)),
+        ));
+        r.open_lease();
+        // the agent taps near the end of the Allowed lease
+        r.wall.advance(29 * MIN);
+        r.call(&at(100.0, 300.0)).expect("under the Allow");
+        *last.lock().unwrap() = r.now();
+        if touched_by_owner {
+            *last.lock().unwrap() = r.now() + 20_000;
+        }
+        // the lease runs out; the owner is asleep: an overnight lease, straight after
+        r.wall.advance(MIN + 1);
+        r.presence("asleep", r.now());
+        let got = r.call(&at(100.0, 300.0));
+        if touched_by_owner {
+            assert!(
+                matches!(got, Err(CoreError::Refused(Refusal::ScreenLock { .. }))),
+                "someone else touched the phone since: {got:?}"
+            );
+        } else {
+            got.expect("the agent's own burst carries on");
+            assert_eq!(r.book.active().unwrap().granted, Granted::Overnight);
+        }
+    }
 }

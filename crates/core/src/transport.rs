@@ -549,13 +549,19 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 .retain(|_, (s, h, _)| phone_key(h, s) != phone);
             let now = p_now(self.protected.as_ref());
             self.lock_lease_ms = Some(lease.expires_at_ms.saturating_sub(now));
+            // the agent's own touches under an Allow are its own for the lock too: an overnight
+            // lease straight after carries on as the agent's burst (only while nobody else has
+            // touched the phone) instead of waiting out the idle limit (review round 4, item 10)
+            if call.is_some() {
+                self.lock_admitted = Some((d.serial.clone(), d.hw_serial.clone()));
+            }
         }
         Ok(())
     }
 
     /// The protected phone's PIN check before `call` is sent (the one screen rule left: digits are
     /// never entered on a PIN prompt). Only a call that could enter a digit is checked
-    /// ([`protected::needs_pin_check`]); reads, launches and exit keys go without a read. The tree
+    /// ([`protected::needs_pin_check`]); reads, launches and other keys go without a read. The tree
     /// is the stored one when it is fresh and nothing acted since (as the screen guard takes it),
     /// else one new read; the screen guard and a selector then use the same tree, so an act costs
     /// at most one dump.
@@ -577,17 +583,36 @@ impl<T: Transport, C: Clock> Core<T, C> {
         });
         let xml = match stored {
             Some(x) => x,
-            None => self
-                .transport
-                .tree_xml(&d.serial, self.backend)
-                .map_err(|e| Refusal::Protected {
-                    tool,
-                    rule: "screen",
-                    why: format!(
-                        "the screen could not be read for the PIN check ({}), so nothing was sent",
-                        e.0.chars().take(120).collect::<String>()
-                    ),
-                })?,
+            None => match self.transport.tree_xml(&d.serial, self.backend) {
+                Ok(x) => x,
+                Err(e) => {
+                    // a screen that is off or dozing shows no PIN prompt to touch: a tap, long
+                    // press or swipe there goes on to the usual guards; only a screen that is on
+                    // (or whose state cannot be read) and cannot be read refuses (review round 4,
+                    // item 2)
+                    let touch = matches!(
+                        call,
+                        Call::Tap { .. } | Call::LongPress { .. } | Call::Swipe { .. }
+                    );
+                    if touch
+                        && matches!(
+                            self.transport.screen_state(&d.serial).as_deref(),
+                            Ok("Asleep" | "Dozing")
+                        )
+                    {
+                        return Ok(());
+                    }
+                    return Err(Refusal::Protected {
+                        tool,
+                        rule: "screen",
+                        why: format!(
+                            "the screen could not be read for the PIN check ({}), so nothing was sent",
+                            e.0.chars().take(120).collect::<String>()
+                        ),
+                    }
+                    .into());
+                }
+            },
         };
         let f = protected::screen_facts(&xml).map_err(|why| Refusal::Protected {
             tool,
@@ -962,7 +987,9 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 Some(Refusal::Protected {
                     tool,
                     rule: "shell",
-                    why: "raw shell lines never run on the protected phone (a shell can read notifications and app data)".into(),
+                    // a fixed engineering rule, not a judgement of what the line reads (review
+                    // round 4, item 9)
+                    why: "raw shell is not allowed on the protected phone".into(),
                 })
             } else if tool == "push" {
                 // code never goes to the protected phone (review round 3, item 2): the guard

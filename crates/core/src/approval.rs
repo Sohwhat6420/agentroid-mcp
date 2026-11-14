@@ -65,6 +65,9 @@ pub struct Request {
     pub created_ms: u64,
     pub expires_ms: u64,
     pub style: Style,
+    /// Sent at low priority (2), so it waits quietly in the shade: the protected-device lease's
+    /// ask after an overnight lease ended on an unreadable presence file.
+    pub quiet: bool,
 }
 
 impl Request {
@@ -294,6 +297,7 @@ impl Approver {
             created_ms: now_ms,
             expires_ms: now_ms + self.expiry_ms,
             style: Style::Action,
+            quiet: false,
         }
     }
 
@@ -305,15 +309,24 @@ impl Approver {
 
     /// One look at an ask sent with [`Approver::send`]: `Some` once it is answered (the same strict
     /// grammar and one-shot rules as [`Approver::ask`]) or its window has closed at `now_ms`
-    /// (`Expired`; an answer found after that is not an answer); `None` while it is still open,
-    /// including when the channel cannot be read just now.
+    /// (`Expired`); `None` while it is still open, including when the channel cannot be read just
+    /// now. The channel is read first even once the window has closed (review round 4, item 3):
+    /// an answer DATED inside the window counts however late the caller looks, and once the
+    /// window has closed only one dated no later than its end does (no grace at all).
     pub fn check(&mut self, req: &Request, now_ms: u64) -> Option<Outcome> {
-        if now_ms >= req.expires_ms || self.resolved_set.contains(&req.id) {
-            remember(&mut self.resolved, &mut self.resolved_set, &req.id);
+        if self.resolved_set.contains(&req.id) {
             return Some(Outcome::Expired);
         }
-        let events = self.channel.poll(req).ok()?;
+        let closed = now_ms >= req.expires_ms;
+        let events = match self.channel.poll(req) {
+            Ok(e) => e,
+            Err(_) if !closed => return None,
+            Err(_) => vec![],
+        };
         for ev in &events {
+            if closed && ev.time_ms > req.expires_ms {
+                continue;
+            }
             if let Some(a) = self.judge(req, ev) {
                 remember(&mut self.resolved, &mut self.resolved_set, &req.id);
                 return Some(match a {
@@ -326,6 +339,10 @@ impl Approver {
                 });
             }
         }
+        if closed {
+            remember(&mut self.resolved, &mut self.resolved_set, &req.id);
+            return Some(Outcome::Expired);
+        }
         None
     }
 
@@ -336,7 +353,20 @@ impl Approver {
     /// restart ([`Approver::mark_seen`]). `Err`: the channel could not be read, which the caller
     /// must not take for "no deny".
     pub fn poll_deny(&mut self, req: &Request) -> Result<Option<String>, String> {
-        let events = self.channel.poll(req)?;
+        Ok(self
+            .poll_denies(std::slice::from_ref(req))?
+            .map(|(_, ev)| ev))
+    }
+
+    /// [`Approver::poll_deny`] for several asks at once, in one read of the channel (from the
+    /// oldest ask's creation, so every later event is in it): the first fresh, exact `deny <id>`
+    /// for any of them, dated no earlier than [`MAX_EARLY_MS`] before that ask was made, as
+    /// `(index into reqs, event id)`. Only that event is marked used. `Ok(None)` with no asks.
+    pub fn poll_denies(&mut self, reqs: &[Request]) -> Result<Option<(usize, String)>, String> {
+        let Some(oldest) = reqs.iter().min_by_key(|r| r.created_ms) else {
+            return Ok(None);
+        };
+        let events = self.channel.poll(oldest)?;
         for ev in &events {
             if ev.event_id.is_empty()
                 || ev.event_id.len() > 64
@@ -344,11 +374,15 @@ impl Approver {
             {
                 continue;
             }
-            if ev.time_ms + MAX_EARLY_MS >= req.created_ms
-                && parse_answer(&ev.message) == Some((Answer::Deny, req.id.clone()))
-            {
+            let Some((Answer::Deny, id)) = parse_answer(&ev.message) else {
+                continue;
+            };
+            let hit = reqs
+                .iter()
+                .position(|r| r.id == id && ev.time_ms + MAX_EARLY_MS >= r.created_ms);
+            if let Some(i) = hit {
                 remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
-                return Ok(Some(ev.event_id.clone()));
+                return Ok(Some((i, ev.event_id.clone())));
             }
         }
         Ok(None)
@@ -724,7 +758,7 @@ impl<H: Http> NtfyChannel<H> {
             "title": self.cfg.title,
             "message": req.message(),
             // a notice needs no answer: it arrives quietly (ntfy 2 = low), an ask at 4 (high)
-            "priority": if req.style == Style::Notice { 2 } else { 4 },
+            "priority": if req.style == Style::Notice || req.quiet { 2 } else { 4 },
             "tags": ["lock"],
             "actions": actions
         })
@@ -1528,6 +1562,11 @@ mod tests {
                 serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
             assert_eq!(v["priority"], want, "{style:?}");
         }
+        // review round 4, item 5: a quiet ask goes at low priority
+        r.style = Style::Lease;
+        r.quiet = true;
+        let v: serde_json::Value = serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
+        assert_eq!(v["priority"], 2);
     }
 
     #[test]
@@ -1616,13 +1655,66 @@ mod tests {
         );
         assert_eq!(a.reallowed(&r, t0 + 50, t0 + 60).as_deref(), Some("e4"));
         assert_eq!(a.reallowed(&r, t0 + 50, u64::MAX), None, "one shot");
-        // a checked ask whose window has closed is expired, whatever arrives later
-        let r2 = req(&mut a, t0);
+        // review round 4, item 3: once its window has closed, a checked ask still takes an answer
+        // DATED inside it (with no grace after it), and is expired otherwise, for good
+        let mut r2 = req(&mut a, t0);
+        r2.style = Style::Lease;
         ch.lock()
             .unwrap()
-            .push(ev("e5", t0 + 10, format!("allow {}", r2.id)));
-        assert_eq!(a.check(&r2, r2.expires_ms), Some(Outcome::Expired));
+            .push(ev("e5", r2.expires_ms + 1, format!("allow {}", r2.id)));
+        assert_eq!(
+            a.check(&r2, r2.expires_ms + 5_000),
+            Some(Outcome::Expired),
+            "dated after the window"
+        );
         assert_eq!(a.check(&r2, t0 + 11), Some(Outcome::Expired), "resolved");
+        let r3 = req(&mut a, t0);
+        ch.lock()
+            .unwrap()
+            .push(ev("e6", r3.expires_ms + 1, format!("allow {}", r3.id)));
+        assert_eq!(
+            a.check(&r3, r3.expires_ms + 5_000),
+            Some(Outcome::Expired),
+            "no grace once the window has closed, whatever the style"
+        );
+        let r4 = req(&mut a, t0);
+        ch.lock()
+            .unwrap()
+            .push(ev("e7", r4.expires_ms, format!("allow {}", r4.id)));
+        assert_eq!(
+            a.check(&r4, r4.expires_ms + 60 * 60_000),
+            Some(Outcome::Approved {
+                event_id: "e7".into()
+            }),
+            "tapped in time, looked at late"
+        );
+        // a channel that cannot be read once the window has closed: expired
+        let r5 = req(&mut a, t0);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.check(&r5, r5.expires_ms - 1), None, "open: try again");
+        assert_eq!(a.check(&r5, r5.expires_ms), Some(Outcome::Expired));
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        // several asks in one read: the first Deny on any of them, and only that event is used
+        let (p1, p2) = (req(&mut a, t0 + 100), req(&mut a, t0 + 200));
+        ch.lock()
+            .unwrap()
+            .push(ev("e8", t0 + 300, format!("deny {}", p2.id)));
+        ch.lock()
+            .unwrap()
+            .push(ev("e9", t0 + 300, format!("deny {}", p1.id)));
+        let both = [p1.clone(), p2.clone()];
+        assert_eq!(a.poll_denies(&both), Ok(Some((1, "e8".to_string()))));
+        assert_eq!(a.poll_denies(&both), Ok(Some((0, "e9".to_string()))));
+        assert_eq!(a.poll_denies(&both), Ok(None));
+        assert_eq!(a.poll_denies(&[]), Ok(None));
+        // a Deny dated more than a minute before the ask it names is a replay
+        let p3 = req(&mut a, t0 + 10 * 60_000);
+        ch.lock().unwrap().push(ev(
+            "e10",
+            t0 + 10 * 60_000 - 60_001,
+            format!("deny {}", p3.id),
+        ));
+        assert_eq!(a.poll_denies(&[p1, p3]), Ok(None));
     }
 
     #[test]
