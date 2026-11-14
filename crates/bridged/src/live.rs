@@ -40,8 +40,8 @@ const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// changing (a running stopwatch, 11 Nov 2026), and the screen guard then refuses every touch. This
 /// makes the same platform calls without the idle requirement, so the XML is the platform's own.
 const IDLE_FREE_DEX: &[u8] = include_bytes!("../assets/idle-free-dump/agentroid-dump.dex");
-const IDLE_FREE_REMOTE: &str = "/data/local/tmp/agentroid-dump.dex";
-const IDLE_FREE_CMD: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump /dev/tty";
+const IDLE_FREE_REMOTE: &str = agentroid_adb_link::guard::DUMP_HELPER_REMOTE;
+const IDLE_FREE_CMD: &str = agentroid_adb_link::guard::IDLE_FREE_READ;
 const NOT_IDLE: &str = "could not get idle state";
 
 pub struct AdbTransport<R: Runner> {
@@ -56,6 +56,25 @@ pub struct AdbTransport<R: Runner> {
     idle_fallback: bool,
     /// adb serial -> what this transport's own replies said about the phone (the `health_hint` source).
     seen: HashMap<String, Seen>,
+    /// The protected phone's heads-up check runs through this runner alone
+    /// ([`GuardedRunner::with_s24_heads_up`](agentroid_adb_link::guard::GuardedRunner::with_s24_heads_up)).
+    /// `None`: not wired, so the check cannot be made and the protected phone takes no screenshot.
+    heads_up: Option<Box<dyn Runner + Send>>,
+}
+
+/// The heads-up check's answer: `Some(true)` for `agentroid-hun: yes`, `Some(false)` for `no`,
+/// `None` for anything else (`unknown`, an error, no helper on the phone). Nothing else of the
+/// output is kept.
+pub fn parse_heads_up(stdout: &str) -> Option<bool> {
+    let mut answer = None;
+    for l in stdout.lines() {
+        match l.trim() {
+            "agentroid-hun: yes" => answer = Some(true),
+            "agentroid-hun: no" if answer.is_none() => answer = Some(false),
+            _ => {}
+        }
+    }
+    answer
 }
 
 /// What the replies served so far said about one phone, each with when it was read (field notes,
@@ -176,7 +195,32 @@ impl<R: Runner> AdbTransport<R> {
             dex_on: HashSet::new(),
             idle_fallback: !off,
             seen: HashMap::new(),
+            heads_up: None,
         }
+    }
+
+    /// Wire the protected phone's heads-up check: `runner` is the one runner that may send
+    /// [`S24_HEADS_UP_READ`](agentroid_adb_link::guard::S24_HEADS_UP_READ) (built with
+    /// `GuardedRunner::with_s24_heads_up`).
+    pub fn with_heads_up_runner(mut self, runner: Box<dyn Runner + Send>) -> Self {
+        self.heads_up = Some(runner);
+        self
+    }
+
+    /// Put the dump helper on the phone once per process (the fallback read and the heads-up
+    /// check both run it).
+    fn ensure_dex(&mut self, serial: &str) -> Result<(), TransportError> {
+        if self.dex_on.contains(serial) {
+            return Ok(());
+        }
+        let local = std::env::temp_dir().join(format!("agentroid-dump-{}.dex", std::process::id()));
+        std::fs::write(&local, IDLE_FREE_DEX)
+            .map_err(|e| TransportError(format!("could not stage the fallback reader: {e}")))?;
+        let pushed = self.push(serial, &local, IDLE_FREE_REMOTE);
+        let _ = std::fs::remove_file(&local);
+        pushed?;
+        self.dex_on.insert(serial.to_string());
+        Ok(())
     }
 
     /// The same transport without the idle-free fallback (what `AGENTROID_NO_IDLE_FALLBACK=1` gives).
@@ -187,16 +231,7 @@ impl<R: Runner> AdbTransport<R> {
 
     /// The fallback read (see [`IDLE_FREE_DEX`]): pushes the reader once per device, then runs it.
     fn idle_free_xml(&mut self, serial: &str) -> Result<String, TransportError> {
-        if !self.dex_on.contains(serial) {
-            let local =
-                std::env::temp_dir().join(format!("agentroid-dump-{}.dex", std::process::id()));
-            std::fs::write(&local, IDLE_FREE_DEX)
-                .map_err(|e| TransportError(format!("could not stage the fallback reader: {e}")))?;
-            let pushed = self.push(serial, &local, IDLE_FREE_REMOTE);
-            let _ = std::fs::remove_file(&local);
-            pushed?;
-            self.dex_on.insert(serial.to_string());
-        }
+        self.ensure_dex(serial)?;
         let out = self.run(&["-s", serial, "exec-out", IDLE_FREE_CMD], DUMP_MS)?;
         if let Some(why) = adb_level_failure(&out) {
             return Err(TransportError(why));
@@ -542,6 +577,41 @@ impl<R: Runner> Transport for AdbTransport<R> {
             return Err(TransportError(text.trim().to_string()));
         }
         Ok(())
+    }
+
+    fn heads_up(&mut self, serial: &str) -> Result<bool, TransportError> {
+        if self.heads_up.is_none() {
+            return Err(TransportError(
+                "the heads-up check is not wired in this daemon".into(),
+            ));
+        }
+        self.ensure_dex(serial)?;
+        let argv: Vec<String> = [
+            "-s",
+            serial,
+            "exec-out",
+            agentroid_adb_link::guard::S24_HEADS_UP_READ,
+        ]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+        let out = self
+            .heads_up
+            .as_ref()
+            .map(|r| r.run(&argv, PROBE_MS))
+            .unwrap_or_else(|| Err(RunError::Refused("no heads-up runner".into())))
+            .map_err(run_err)?;
+        // only the yes or no is kept: the rest of the output is dropped here
+        match parse_heads_up(&out.stdout) {
+            Some(b) => Ok(b),
+            None => {
+                // a phone that lost the helper gets it again next time
+                self.dex_on.remove(serial);
+                Err(TransportError(
+                    "the heads-up check gave no yes or no".into(),
+                ))
+            }
+        }
     }
 
     fn packages(&mut self, serial: &str) -> Result<Vec<String>, TransportError> {
@@ -1146,6 +1216,87 @@ mod tests {
             b"dex\n",
             "rebuild it with assets/idle-free-dump/build.sh"
         );
+        // the helper carries the heads-up check's mode
+        let needle = b"--heads-up";
+        assert!(
+            IDLE_FREE_DEX.windows(needle.len()).any(|w| w == needle),
+            "rebuild it with assets/idle-free-dump/build.sh"
+        );
+    }
+
+    /// The heads-up runner (it must be `Send`): records its argv, answers `out`.
+    struct Hun {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        out: &'static str,
+    }
+
+    impl Runner for Hun {
+        fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
+            self.seen.lock().unwrap().push(a.to_vec());
+            Ok(ok(self.out))
+        }
+    }
+
+    #[test]
+    fn the_heads_up_check_keeps_only_a_yes_or_no_and_runs_through_its_own_runner() {
+        assert_eq!(parse_heads_up("agentroid-hun: no\n"), Some(false));
+        assert_eq!(parse_heads_up("agentroid-hun: yes\r\n"), Some(true));
+        assert_eq!(
+            parse_heads_up("agentroid-hun: no\nagentroid-hun: yes\n"),
+            Some(true),
+            "a yes wins"
+        );
+        assert_eq!(
+            parse_heads_up("agentroid-hun: yes\nagentroid-hun: no\n"),
+            Some(true)
+        );
+        for junk in [
+            "agentroid-hun: unknown\n",
+            "Error: Could not find or load main class dev.agentroid.dump.Dump\n",
+            "x agentroid-hun: no\n",
+            "",
+        ] {
+            assert_eq!(parse_heads_up(junk), None, "{junk:?}");
+        }
+        // not wired: no answer, and nothing is sent
+        let log: Log = Default::default();
+        let mut t = live(Script::new(&log));
+        assert!(t.heads_up("emulator-5554").is_err());
+        assert!(lines(&log).is_empty(), "{:?}", lines(&log));
+        // wired: the helper goes over the main runner once, the check over its own runner, word
+        // for word
+        for (out, want) in [
+            ("agentroid-hun: no\n", Some(false)),
+            ("agentroid-hun: yes\n", Some(true)),
+            ("agentroid-hun: unknown\n", None),
+        ] {
+            let log: Log = Default::default();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+            let mut t = live(Script::new(&log)).with_heads_up_runner(Box::new(Hun {
+                seen: seen.clone(),
+                out,
+            }));
+            assert_eq!(t.heads_up("emulator-5554").ok(), want, "{out}");
+            assert_eq!(
+                seen.lock().unwrap()[0],
+                [
+                    "-s",
+                    "emulator-5554",
+                    "exec-out",
+                    agentroid_adb_link::guard::S24_HEADS_UP_READ
+                ]
+            );
+            let l = lines(&log);
+            assert_eq!(l.len(), 1, "{l:?}");
+            assert!(l[0].contains(" push ") && l[0].ends_with(IDLE_FREE_REMOTE));
+            // a second check pushes again only after an answer that was no answer
+            let _ = t.heads_up("emulator-5554");
+            assert_eq!(
+                lines(&log).len(),
+                if want.is_some() { 1 } else { 2 },
+                "{out}"
+            );
+        }
     }
 
     #[test]
@@ -1419,7 +1570,7 @@ mod tests {
         let usb = core.transport.run(&["-s", ip, "usb"], 1000);
         assert!(usb.is_err(), "only shell, exec-out, push and pull");
         // the lease ends: the guard refuses again, whatever core does
-        book.close_epoch(1);
+        book.close_epoch(1, "released");
         assert!(!book.admits(ip));
         let after = core
             .transport

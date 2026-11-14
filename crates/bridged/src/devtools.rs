@@ -178,6 +178,7 @@ impl Daemon {
         let key = device_key(&info);
         self.require_holder(&key, conn)?;
         self.keep_awake(conn, &key, &info);
+        let _caller = crate::server::caller_scope(conn, None);
         let (mode, allowed) = {
             let b = self.backend();
             (b.mode_of(&info), b.allowed(&info))

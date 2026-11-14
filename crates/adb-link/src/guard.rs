@@ -67,6 +67,27 @@ pub const S24_SCREEN_AWAKE_KEYS: [(&str, &str); 2] = [
 /// (`askscreen::parse_call_state`) and drops the text. It is not in [`S24_READS`].
 pub const S24_CALL_STATE_READ: &str = "dumpsys telephony.registry";
 
+/// The fallback screen reader's path on a phone (`bridged/assets/idle-free-dump`).
+pub const DUMP_HELPER_REMOTE: &str = "/data/local/tmp/agentroid-dump.dex";
+
+/// The fallback screen read, as an `exec-out` line (the dump goes to stdout).
+pub const IDLE_FREE_READ: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump /dev/tty";
+
+/// **Needs the owner's yes before it is merged.** The protected phone's heads-up check, for
+/// core's screenshot guard alone: the dump helper's `--heads-up` mode asks the accessibility
+/// service for every interactive window (`FLAG_RETRIEVE_INTERACTIVE_WINDOWS`, `getWindows()`),
+/// looks on the phone for a notification row or heads-up in any of them, and prints only
+/// `agentroid-hun: yes`, `no` or `unknown`. No text of any notification leaves the phone, and it
+/// changes no setting.
+///
+/// Only a runner built with [`GuardedRunner::with_s24_heads_up`] (the live transport's heads-up
+/// reader, and no other) lets this one line through to the protected phone, and only in the exact
+/// shape [`Checked::is_s24_heads_up`] accepts (`exec-out` plus this one argument). Every other
+/// runner, the plain [`Guard`], `doctor` and the MCP tools still refuse it for the protected phone,
+/// and the lease's own [`protected_policy`] never lets it through. It is not in [`S24_READS`]. The
+/// reader keeps only the parsed yes or no.
+pub const S24_HEADS_UP_READ: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump --heads-up";
+
 /// A value the protected phone exception may write: a plain decimal (no sign, no leading zero), at most
 /// `i32::MAX` ms for the timeout and at most 15 (the AC, USB, wireless and dock bits) for stay-on.
 fn screen_awake_value(key: &str, v: &str) -> bool {
@@ -335,6 +356,12 @@ impl Checked {
         self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == S24_CALL_STATE_READ
     }
 
+    /// True when this is exactly the protected phone's heads-up check as the live transport sends
+    /// it: `exec-out` plus the one argument [`S24_HEADS_UP_READ`], word for word.
+    pub fn is_s24_heads_up(&self) -> bool {
+        self.sub == "exec-out" && self.rest.len() == 1 && self.rest[0] == S24_HEADS_UP_READ
+    }
+
     /// True when `sub` + `rest` is exactly one of [`GETEVENT_SHAPES`].
     pub fn is_getevent_shape(&self) -> bool {
         let mut words = vec![self.sub.as_str()];
@@ -390,8 +417,8 @@ impl Checked {
 ///   `uninstall`, `tcpip`, `usb`, `root`, `reboot`, `emu`, `remount`, `sideload`, `forward`,
 ///   `reverse`, `backup`, `restore` and every other subcommand stay refused;
 /// * no link-pairing shape (the helper's link is never paired with the protected phone);
-/// * no shell line that reboots, sets properties, becomes root, touches adbd or the USB, Wi-Fi or
-///   data transport, streams raw input, or installs, uninstalls or clears a package.
+/// * a `shell` or `exec-out` line only in one of the exact shapes core and the live transport
+///   send ([`protected_shell_allowed`]); anything else is refused, whatever it does.
 pub fn protected_policy(c: &Checked) -> Result<(), String> {
     const SUBS: [&str; 4] = ["shell", "exec-out", "push", "pull"];
     if !SUBS.contains(&c.sub.as_str()) {
@@ -404,65 +431,160 @@ pub fn protected_policy(c: &Checked) -> Result<(), String> {
         return Err("the helper's link is never paired with the protected phone".into());
     }
     if c.sub == "shell" || c.sub == "exec-out" {
-        let line = c.rest.join(" ").to_ascii_lowercase();
-        if let Some(why) = protected_shell_refusal(&line) {
-            return Err(format!("{why}: never on the protected phone, lease or not"));
+        let line = c.rest.join(" ");
+        if !protected_shell_allowed(&c.sub, &line) {
+            return Err(
+                "the line is not one of the exact shapes core sends to the protected phone (taps, swipes, keys, text, a screen read, a launch): never on the protected phone, lease or not"
+                    .into(),
+            );
         }
     }
     Ok(())
 }
 
-/// The shell-line half of [`protected_policy`]: the command words of every segment of `line`
-/// (split at `;`, `&`, `|`, newlines, backticks and brackets).
-fn protected_shell_refusal(line: &str) -> Option<&'static str> {
-    for seg in line.split([';', '&', '|', '\n', '`', '(', ')']) {
-        let words: Vec<&str> = seg.split_whitespace().collect();
-        let Some(first) = words.first().map(|w| w.trim_start_matches('$')) else {
-            continue;
-        };
-        // `/system/bin/reboot` is `reboot`
-        let first = first.rsplit('/').next().unwrap_or(first);
-        let second = words.get(1).copied().unwrap_or("");
-        let refused = match first {
-            "reboot" | "setprop" | "su" | "getevent" | "sendevent" | "start" | "stop" => {
-                Some("rebooting, properties, root, adbd and raw input")
+/// The lines sent to the protected phone word for word.
+const PROTECTED_EXACT_SHELL: [&str; 3] = [
+    "wm size; dumpsys input | grep -m1 SurfaceOrientation",
+    "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -1",
+    "pm list packages",
+];
+const PROTECTED_EXACT_EXEC_OUT: [&str; 3] =
+    ["screencap -p", "uiautomator dump /dev/tty", IDLE_FREE_READ];
+
+/// The `input text` argument as core escapes it: one word, every shell metacharacter behind a
+/// backslash, spaces as `%s`.
+fn escaped_input_text(t: &str) -> bool {
+    const SPECIAL: &str = "\\'\"`$&|;<>()*?!#~{}[]";
+    let mut it = t.chars();
+    let mut any = false;
+    while let Some(c) = it.next() {
+        any = true;
+        if c == '\\' {
+            match it.next() {
+                Some(n) if SPECIAL.contains(n) => {}
+                _ => return false,
             }
-            "svc" if matches!(second, "usb" | "wifi" | "data") => Some("transport switches"),
-            "pm" if matches!(
-                second,
-                "install"
-                    | "install-create"
-                    | "install-write"
-                    | "install-commit"
-                    | "install-existing"
-                    | "uninstall"
-                    | "clear"
-            ) =>
-            {
-                Some("installing, uninstalling or clearing an app")
-            }
-            "cmd"
-                if second == "package"
-                    && matches!(
-                        words.get(2).copied().unwrap_or(""),
-                        "install" | "install-existing" | "uninstall" | "clear"
-                    ) =>
-            {
-                Some("installing, uninstalling or clearing an app")
-            }
-            _ => None,
-        };
-        if refused.is_some() {
-            return refused;
-        }
-        if words
-            .iter()
-            .any(|w| w.contains("adbd") || w.contains("adb_wifi") || w.contains("service.adb"))
-        {
-            return Some("adbd and the adb transport");
+        } else if c.is_whitespace() || c.is_control() || SPECIAL.contains(c) {
+            return false;
         }
     }
-    None
+    any
+}
+
+/// Split a shell line into words the way the phone's `sh` would, accepting only plain words
+/// (`[A-Za-z0-9_.:/=+,@%-]`) and single-quoted ones (with the `'\''` escape), one space apart.
+/// `None` for anything else: no unquoted metacharacter, no other quoting, no double space.
+fn plain_words(line: &str) -> Option<Vec<String>> {
+    let mut words = vec![];
+    let mut w = String::new();
+    let mut started = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' => {
+                // one space between words, none leading or trailing
+                if !started || chars.peek().is_none_or(|n| *n == ' ') {
+                    return None;
+                }
+                words.push(std::mem::take(&mut w));
+                started = false;
+            }
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(x) if !x.is_control() => w.push(x),
+                        _ => return None,
+                    }
+                }
+            }
+            '\\' if chars.peek() == Some(&'\'') => {
+                started = true;
+                chars.next();
+                w.push('\'');
+            }
+            c if c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | ',' | '@' | '%' | '-') =>
+            {
+                started = true;
+                w.push(c)
+            }
+            _ => return None,
+        }
+    }
+    if !started {
+        return None;
+    }
+    words.push(w);
+    Some(words)
+}
+
+fn int_word(w: &str) -> bool {
+    let d = w.strip_prefix('-').unwrap_or(w);
+    !d.is_empty() && d.len() <= 6 && d.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Is `line` (the words after `shell` or `exec-out`) one of the exact shapes core and the live
+/// transport send to the protected phone? An allowlist: `input` taps, long presses, swipes, key
+/// events and escaped text; the screen size, rotation, wakefulness and package reads; `getprop` of
+/// one key; a launcher `monkey` of one package; `am start -W` with quoted arguments; and, as
+/// `exec-out`, `screencap -p`, `uiautomator dump /dev/tty` and the fallback reader.
+pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
+    if sub == "exec-out" {
+        return PROTECTED_EXACT_EXEC_OUT.contains(&line);
+    }
+    if sub != "shell" {
+        return false;
+    }
+    if PROTECTED_EXACT_SHELL.contains(&line) {
+        return true;
+    }
+    if let Some(t) = line.strip_prefix("input text ") {
+        return escaped_input_text(t);
+    }
+    let Some(w) = plain_words(line) else {
+        return false;
+    };
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    let key = |k: &str| {
+        !k.is_empty()
+            && k.len() <= 64
+            && k.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    };
+    let pkg = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 128
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    };
+    let input = match w.as_slice() {
+        ["input", "-d", d, rest @ ..] if d.bytes().all(|b| b.is_ascii_digit()) && !d.is_empty() => {
+            rest
+        }
+        ["input", rest @ ..] => rest,
+        _ => &[][..],
+    };
+    let input_ok = match input {
+        ["tap", x, y] => int_word(x) && int_word(y),
+        ["swipe", a, b, c, d, ms] => [a, b, c, d, ms].iter().all(|v| int_word(v)),
+        ["keyevent", k] => key(k),
+        _ => false,
+    };
+    if !input.is_empty() {
+        return input_ok;
+    }
+    match w.as_slice() {
+        ["getprop", k] => {
+            k.len() <= 64
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        }
+        ["monkey", "-p", p, "-c", "android.intent.category.LAUNCHER", "1"] => pkg(p),
+        ["am", "start", "-W", args @ ..] => !args.is_empty() && args.len() <= 16,
+        _ => false,
+    }
 }
 
 /// The guard. Holds the set of tokens learnt to be forbidden at run time (S24 addresses), and the
@@ -477,6 +599,9 @@ pub struct Guard {
     /// The protected phone call-state read (see [`S24_CALL_STATE_READ`]). Off unless the runner was built
     /// with [`GuardedRunner::with_s24_call_state`].
     s24_call_state: bool,
+    /// The protected phone heads-up check (see [`S24_HEADS_UP_READ`]). Off unless the runner was
+    /// built with [`GuardedRunner::with_s24_heads_up`].
+    s24_heads_up: bool,
 }
 
 fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -516,7 +641,8 @@ impl Guard {
             if let Some(v) = sel.get(1) {
                 let read = probe.is_s24_read()
                     || (self.s24_screen_awake && probe.is_s24_screen_awake())
-                    || (self.s24_call_state && probe.is_s24_call_state());
+                    || (self.s24_call_state && probe.is_s24_call_state())
+                    || (self.s24_heads_up && probe.is_s24_heads_up());
                 // under a lease core bound this name: `GuardedRunner::admit` still reads the
                 // hardware serial and applies `protected_policy`
                 if self.is_forbidden(v) && !read && !self.lease_admits(v) {
@@ -712,6 +838,19 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
+    /// The runner the live transport's heads-up check reads the protected phone through, and
+    /// nothing else: as [`GuardedRunner::new`], plus [`S24_HEADS_UP_READ`], exactly as
+    /// [`Checked::is_s24_heads_up`] accepts it.
+    pub fn with_s24_heads_up(inner: R) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                s24_heads_up: true,
+                ..Guard::default()
+            },
+        }
+    }
+
     /// As [`GuardedRunner::new`], plus the protected-device lease: a non-read command reaches the
     /// protected phone while `leases` holds an open lease that core bound its `-s` name under,
     /// and [`protected_policy`] allows it.
@@ -805,7 +944,8 @@ impl<R: Runner> GuardedRunner<R> {
                         self.guard.deny(v);
                     }
                     let excepted = (self.guard.s24_screen_awake && c.is_s24_screen_awake())
-                        || (self.guard.s24_call_state && c.is_s24_call_state());
+                        || (self.guard.s24_call_state && c.is_s24_call_state())
+                        || (self.guard.s24_heads_up && c.is_s24_heads_up());
                     if !c.is_s24_read() && !excepted {
                         // the lease counts only for a name core checked and bound under it: a
                         // phone core took for an ordinary device never rides on it
@@ -2059,6 +2199,105 @@ mod tests {
         assert!(plain
             .run(&args(&["-s", S24_IP, "shell", "input tap 1 1"]), 1000)
             .is_err());
+    }
+
+    /// Review round 2, item 9: the lease's shell rule is an allowlist of the exact shapes core
+    /// sends, not a denylist of known-bad words.
+    #[test]
+    fn a_lease_lets_through_only_the_shapes_core_sends() {
+        for (sub, line) in [
+            ("shell", "input tap 10 20"),
+            ("shell", "input -d 1 tap 10 20"),
+            ("shell", "input swipe 1 2 3 4 350"),
+            ("shell", "input keyevent KEYCODE_BACK"),
+            ("shell", "input text hello%sworld\\!"),
+            (
+                "shell",
+                "wm size; dumpsys input | grep -m1 SurfaceOrientation",
+            ),
+            (
+                "shell",
+                "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -1",
+            ),
+            ("shell", "pm list packages"),
+            ("shell", "getprop ro.product.model"),
+            (
+                "shell",
+                "monkey -p 'com.android.settings' -c android.intent.category.LAUNCHER 1",
+            ),
+            (
+                "shell",
+                "am start -W '-a' 'android.intent.action.VIEW' '-d' 'https://example.com/it'\\''s'",
+            ),
+            ("exec-out", "screencap -p"),
+            ("exec-out", "uiautomator dump /dev/tty"),
+            ("exec-out", IDLE_FREE_READ),
+        ] {
+            assert!(protected_shell_allowed(sub, line), "{sub} {line}");
+        }
+        for (sub, line) in [
+            ("shell", "dumpsys notification"),
+            ("shell", "dumpsys notification --noredact"),
+            ("shell", "content query --uri content://sms"),
+            ("shell", "cat /data/system/notification_log.db"),
+            ("shell", "input tap 1 1; reboot"),
+            ("shell", "input tap 1 1 && ls"),
+            ("shell", "input text a b"),
+            ("shell", "input text $(id)"),
+            ("shell", "input keyevent 'KEYCODE_BACK; reboot'"),
+            ("shell", "getprop ro.product.model; id"),
+            (
+                "shell",
+                "monkey -p com.whatsapp -c android.intent.category.LAUNCHER 1 ; id",
+            ),
+            ("shell", "am start -W $(id)"),
+            ("shell", "am start -W"),
+            ("shell", "settings put global adb_enabled 0"),
+            ("shell", "uiautomator dump /sdcard/x.xml"),
+            ("exec-out", "uiautomator dump /dev/tty; cat /sdcard/x"),
+            ("exec-out", "cat /data/system/notification_log.db"),
+            ("exec-out", S24_HEADS_UP_READ),
+            ("shell", S24_HEADS_UP_READ),
+        ] {
+            assert!(!protected_shell_allowed(sub, line), "{sub} {line}");
+        }
+    }
+
+    /// Review round 2, item 10: the heads-up check reaches the protected phone only through its
+    /// own runner, in its one exact shape, and never through a lease or the plain guard.
+    #[test]
+    fn the_heads_up_check_has_one_runner_and_one_shape() {
+        let spy = || Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        };
+        let exact = args(&["-s", S24_IP, "exec-out", S24_HEADS_UP_READ]);
+        let r = GuardedRunner::with_s24_heads_up(spy());
+        assert!(r.run(&exact, 1000).is_ok());
+        for near in [
+            args(&["-s", S24_IP, "shell", S24_HEADS_UP_READ]),
+            args(&["-s", S24_IP, "exec-out", &format!("{S24_HEADS_UP_READ} ")]),
+            args(&[
+                "-s",
+                S24_IP,
+                "exec-out",
+                &format!("{S24_HEADS_UP_READ}; id"),
+            ]),
+            args(&["-s", S24_IP, "exec-out", IDLE_FREE_READ]),
+        ] {
+            let r = GuardedRunner::with_s24_heads_up(spy());
+            assert!(r.run(&near, 1000).is_err(), "{near:?}");
+        }
+        assert!(GuardedRunner::new(spy()).run(&exact, 1000).is_err());
+        assert!(GuardedRunner::with_s24_call_state(spy())
+            .run(&exact, 1000)
+            .is_err());
+        let (_, book) = book_with_lease(&[S24_IP]);
+        assert!(
+            leased_s24(&book).run(&exact, 1000).is_err(),
+            "a lease never lets it through"
+        );
+        assert!(!S24_READS.contains(&format!("exec-out {S24_HEADS_UP_READ}").as_str()));
     }
 
     #[test]

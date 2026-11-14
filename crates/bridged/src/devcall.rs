@@ -392,6 +392,8 @@ impl Daemon {
         let key = device_key(&dev);
         self.require_holder(&key, conn_id)?;
         self.keep_awake(conn_id, &key, &dev);
+        // the protected-device lease is this connection's, not the registry's holder of the moment
+        let _caller = crate::server::caller_scope(conn_id, None);
         match self.run_tool(&dev, &key, &p.call) {
             Ok((d, attempts)) => {
                 let health = self.health_member(&dev);

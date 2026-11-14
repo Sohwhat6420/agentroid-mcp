@@ -354,9 +354,10 @@ impl Approver {
     }
 
     /// The explicit re-allow after a Deny: a fresh `allow <req.id>` (an event id never applied
-    /// before) dated after `after_ms`, the time of the Deny. `req` is resolved already, so
-    /// [`Approver::check`] would ignore it; this is the one way back. `Some(event id)` on one.
-    pub fn reallowed(&mut self, req: &Request, after_ms: u64) -> Option<String> {
+    /// before) dated after `after_ms`, the time of the Deny, and no later than `until_ms` (the end
+    /// of the ask window after it). `req` is resolved already, so [`Approver::check`] would ignore
+    /// it; this is the one way back. `Some(event id)` on one.
+    pub fn reallowed(&mut self, req: &Request, after_ms: u64, until_ms: u64) -> Option<String> {
         let events = self.channel.poll(req).ok()?;
         for ev in &events {
             if ev.event_id.is_empty()
@@ -367,6 +368,7 @@ impl Approver {
             }
             // only the one event used is marked seen: others may answer other asks
             if ev.time_ms > after_ms
+                && ev.time_ms <= until_ms
                 && parse_answer(&ev.message) == Some((Answer::Allow, req.id.clone()))
             {
                 remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
@@ -383,7 +385,6 @@ impl Approver {
         {
             return None;
         }
-        remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
         let (answer, id) = parse_answer(&ev.message)?;
         if id != req.id || self.resolved_set.contains(&id) {
             return None;
@@ -393,6 +394,9 @@ impl Approver {
         {
             return None;
         }
+        // only the event that answers this request is used up: any other (a Deny of an open
+        // protected-device lease, an answer to another ask) stays for the one it names
+        remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
         Some(answer)
     }
 
@@ -702,7 +706,8 @@ impl<H: Http> NtfyChannel<H> {
             "topic": topic,
             "title": self.cfg.title,
             "message": req.message(),
-            "priority": 4,
+            // a notice needs no answer: it arrives quietly (ntfy 2 = low), an ask at 4 (high)
+            "priority": if req.style == Style::Notice { 2 } else { 4 },
             "tags": ["lock"],
             "actions": actions
         })
@@ -1440,6 +1445,74 @@ mod tests {
         assert!(r.message().contains("within 10 min"));
     }
 
+    /// Review round 2, item 2: an ask judged while a lease is open must not use up the lease's
+    /// Deny. The same Deny, with and without a concurrent ask, ends the lease either way.
+    #[test]
+    fn a_concurrent_ask_never_swallows_another_requests_deny() {
+        for concurrent in [false, true] {
+            let ch = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Inbound>::new()));
+            struct Shared(std::sync::Arc<std::sync::Mutex<Vec<Inbound>>>);
+            impl Channel for Shared {
+                fn name(&self) -> &'static str {
+                    "shared"
+                }
+                fn send(&mut self, _: &Request) -> Result<(), String> {
+                    Ok(())
+                }
+                fn poll(&mut self, _: &Request) -> Result<Vec<Inbound>, String> {
+                    Ok(self.0.lock().unwrap().clone())
+                }
+            }
+            let mut a = Approver::new(Box::new(Shared(ch.clone())));
+            let t0 = 1_700_000_000_000u64;
+            let lease = req(&mut a, t0);
+            ch.lock().unwrap().push(Inbound {
+                event_id: "e1".into(),
+                time_ms: t0 + 5,
+                message: format!("allow {}", lease.id),
+            });
+            assert!(matches!(
+                a.check(&lease, t0 + 6),
+                Some(Outcome::Approved { .. })
+            ));
+            ch.lock().unwrap().push(Inbound {
+                event_id: "e2".into(),
+                time_ms: t0 + 20,
+                message: format!("deny {}", lease.id),
+            });
+            if concurrent {
+                // another ask is checked first: it sees the lease's Deny, which is not its answer
+                let other = req(&mut a, t0 + 10);
+                assert_eq!(a.check(&other, t0 + 21), None, "{concurrent}");
+            }
+            assert_eq!(
+                a.poll_deny(&lease),
+                Ok(true),
+                "concurrent ask: {concurrent}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_is_sent_quietly_and_an_ask_loudly() {
+        let mut a = Approver::new(Box::new(FakeChannel::default()));
+        let mut r = req(&mut a, 1_700_000_000_000);
+        let ch = NtfyChannel::new(
+            NtfyConfig::new("unused"),
+            RecHttp {
+                posts: vec![],
+                gets: vec![],
+                reply: String::new(),
+            },
+        );
+        for (style, want) in [(Style::Notice, 2), (Style::Lease, 4), (Style::Action, 4)] {
+            r.style = style;
+            let v: serde_json::Value =
+                serde_json::from_str(&ch.publish_body(&r, "t", "i")).unwrap();
+            assert_eq!(v["priority"], want, "{style:?}");
+        }
+    }
+
     #[test]
     fn a_background_ask_is_checked_without_waiting_and_a_deny_poll_error_is_an_error() {
         let ch = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Inbound>::new()));
@@ -1492,16 +1565,29 @@ mod tests {
         assert_eq!(a.poll_deny(&r), Ok(true));
         assert_eq!(a.poll_deny(&r), Ok(false), "a Deny counts once");
         // re-allow: only a fresh allow dated after the deny
-        assert_eq!(a.reallowed(&r, t0 + 50), None, "the old allow was used");
+        assert_eq!(
+            a.reallowed(&r, t0 + 50, u64::MAX),
+            None,
+            "the old allow was used"
+        );
         ch.lock()
             .unwrap()
             .push(ev("e3", t0 + 40, format!("allow {}", r.id)));
-        assert_eq!(a.reallowed(&r, t0 + 50), None, "dated before the deny");
+        assert_eq!(
+            a.reallowed(&r, t0 + 50, u64::MAX),
+            None,
+            "dated before the deny"
+        );
         ch.lock()
             .unwrap()
             .push(ev("e4", t0 + 60, format!("allow {}", r.id)));
-        assert_eq!(a.reallowed(&r, t0 + 50).as_deref(), Some("e4"));
-        assert_eq!(a.reallowed(&r, t0 + 50), None, "one shot");
+        assert_eq!(
+            a.reallowed(&r, t0 + 50, t0 + 59),
+            None,
+            "dated after the ask window that followed the deny"
+        );
+        assert_eq!(a.reallowed(&r, t0 + 50, t0 + 60).as_deref(), Some("e4"));
+        assert_eq!(a.reallowed(&r, t0 + 50, u64::MAX), None, "one shot");
         // a checked ask whose window has closed is expired, whatever arrives later
         let r2 = req(&mut a, t0);
         ch.lock()

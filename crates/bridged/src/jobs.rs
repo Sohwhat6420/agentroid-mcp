@@ -855,6 +855,8 @@ fn run_thread(daemon: Arc<Daemon>, job: Arc<Job>, conn: u64, resume: Option<Resu
         .registry
         .lease_of(&job.meta.device)
         .map_or(0, |l| l.epoch);
+    // the protected-device lease: this job's connection and the epoch it started under, only
+    let _caller = crate::server::caller_scope(conn, Some(epoch));
     // care (2.13) and take-over (2.15): leases first, before any step
     let care = match job_care(&daemon, &job, cfg) {
         Ok(c) => c,

@@ -5,7 +5,7 @@
 
 use agentroid_adb_link::guard::S24_SERIAL;
 use agentroid_adb_link::lease::{LeaseBook, ManualClock};
-use agentroid_core::approval::{Approver, Channel, Inbound, Request};
+use agentroid_core::approval::{Approver, Channel, Inbound, Request, Style};
 use agentroid_core::fake::FakeClock;
 use agentroid_core::frame::Shot;
 use agentroid_core::protected::{Protected, ProtectedConfig};
@@ -166,8 +166,10 @@ struct Harness {
     _shutdown: watch::Sender<bool>,
     _daemon: Arc<Daemon>,
     book: Arc<LeaseBook>,
+    wall: Arc<ManualClock>,
     inbox: Arc<Mutex<Inbox>>,
     phone: Arc<Mutex<Phone>>,
+    audit: PathBuf,
 }
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -184,9 +186,11 @@ fn start(name: &str) -> Harness {
     let dir = tmp_dir(name);
     let phone = Arc::new(Mutex::new(Phone::default()));
     let wall = Arc::new(ManualClock::new(T0));
-    let book = Arc::new(LeaseBook::new(wall));
+    let book = Arc::new(LeaseBook::new(wall.clone()));
     let inbox = Arc::new(Mutex::new(Inbox::default()));
     let mut core = Core::new(SharedPhone(phone.clone()), FakeClock::new());
+    let audit = dir.join("audit.log");
+    core.set_audit(agentroid_core::audit::AuditLog::open(&audit).unwrap());
     core.set_approver(Approver::new(Box::new(Ch(inbox.clone()))));
     core.set_protected(Protected::new(
         ProtectedConfig::new(30, 10, None),
@@ -212,8 +216,10 @@ fn start(name: &str) -> Harness {
         _shutdown: shutdown,
         _daemon: daemon,
         book,
+        wall,
         inbox,
         phone,
+        audit,
     }
 }
 
@@ -260,9 +266,33 @@ impl Harness {
     fn sent(&self) -> Vec<Request> {
         self.inbox.lock().unwrap().sent.clone()
     }
+    /// The lease asks sent (not the lease-open notices).
+    fn asks(&self) -> Vec<Request> {
+        self.sent()
+            .into_iter()
+            .filter(|r| r.style == Style::Lease)
+            .collect()
+    }
+    /// The audit log's lease closes so far.
+    fn closes(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.audit)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| agentroid_core::audit::Record::from_json(l).ok())
+            .filter(|r| r.entry.rule == "lease:closed")
+            .map(|r| r.entry.reason)
+            .collect()
+    }
     fn allow_last(&self) {
         let mut g = self.inbox.lock().unwrap();
-        let id = g.sent.last().unwrap().id.clone();
+        let id = g
+            .sent
+            .iter()
+            .rev()
+            .find(|r| r.style == Style::Lease)
+            .unwrap()
+            .id
+            .clone();
         let n = g.events.len();
         g.events.push(Inbound {
             event_id: format!("ev{n}"),
@@ -330,7 +360,8 @@ fn the_ask_names_the_daemon_lease_holder_and_the_lease_is_theirs() {
         for _ in 0..3 {
             assert!(c.tap().await["result"].is_object());
         }
-        assert_eq!(h.sent().len(), 1, "one Allow");
+        assert_eq!(h.asks().len(), 1, "one Allow");
+        assert_eq!(h.sent().len(), 2, "and its lease-open notice");
     });
 }
 
@@ -343,13 +374,25 @@ fn a_connection_that_goes_closes_its_protected_lease() {
         drop(c);
         h.until_closed().await;
         assert!(!h.book.admits(PROT), "the adb guard refuses at once");
-        // the next holder starts from nothing: an ask of its own
+        // the next holder starts from nothing: an ask of its own, once the ask window has passed
         let mut d = Client::leased(&h, "lane-b").await;
         let r = d.tap().await;
         assert!(r["error"].is_object(), "{r}");
-        assert_eq!(h.sent().len(), 2);
-        assert!(h.sent()[1].reason.contains("lane-b"));
+        assert_eq!(h.asks().len(), 1, "one ask per ask window");
+        h.wall.advance(10 * 60_000);
+        let r = d.tap().await;
+        assert!(r["error"].is_object(), "{r}");
+        assert_eq!(h.asks().len(), 2);
+        assert!(h.asks()[1].reason.contains("lane-b"));
         assert_eq!(h.taps(), 1);
+        // the close was logged
+        let closes = h.closes();
+        assert!(
+            closes
+                .iter()
+                .any(|c| c.ends_with("closed: connection closed")),
+            "{closes:?}"
+        );
     });
 }
 
@@ -363,6 +406,10 @@ fn releasing_the_protected_phone_closes_its_protected_lease() {
         assert_eq!(r["result"]["released"], true, "{r}");
         assert!(h.book.active().is_none(), "closed with the release");
         assert!(!h.book.admits(PROT));
+        // logged at the release, before any later call
+        let closes = h.closes();
+        assert_eq!(closes.len(), 1, "{closes:?}");
+        assert!(closes[0].ends_with("closed: released"), "{closes:?}");
     });
 }
 

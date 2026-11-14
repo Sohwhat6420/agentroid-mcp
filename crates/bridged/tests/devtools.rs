@@ -383,6 +383,11 @@ fn s24_answers_only_serial_and_the_approved_probes_through_diagnose() {
             "pm list packages",
             "getevent -pl",
             "getprop ro.serialno; id",
+            // the single-purpose reads of the screen lock and the screenshot guard: their own
+            // runners only, never doctor
+            agentroid_adb_link::guard::S24_CALL_STATE_READ,
+            agentroid_adb_link::guard::S24_HEADS_UP_READ,
+            "app_process /system/bin dev.agentroid.dump.Dump --heads-up",
         ] {
             for _ in 0..10 {
                 assert_eq!(code(&c.diagnose(S24, cmd).await), REFUSED, "{cmd}");

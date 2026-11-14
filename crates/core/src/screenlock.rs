@@ -262,12 +262,8 @@ impl ScreenLock {
         }
     }
 
-    /// May a screen-changing call go to this phone now? `Err` holds the reason, for the refusal.
-    pub fn admit(&mut self, adb_serial: &str, hw_serial: &str) -> Result<Admitted, String> {
-        if self.is_emulator(adb_serial, hw_serial) {
-            return Ok(Admitted::Emulator);
-        }
-        let t = (self.wall)();
+    /// The latest ask-screen lease end and No for this phone (Unix ms, 0: none), at wall time `t`.
+    fn memory(&self, adb_serial: &str, hw_serial: &str, t: u64) -> (u64, u64) {
         // ask-screen keys its file by the hardware serial when it can read it (and it is not a
         // junk serial), else by the `--device` text; look under both. A junk hardware serial is
         // never a key, but the adb serial always is, even a junk one: a USB phone whose adb serial
@@ -287,6 +283,30 @@ impl ScreenLock {
             lease_until = m.leases.values().copied().fold(lease_until, u64::max);
             denied_until = denied_until.max(m.denied_until_ms);
         }
+        (lease_until, denied_until)
+    }
+
+    /// The owner's explicit ask-screen No for this phone, while it lasts (and no later ask-screen
+    /// Yes is live): `Some(reason)`. The protected-device lease satisfies the rest of the lock,
+    /// never this.
+    pub fn denied(&mut self, adb_serial: &str, hw_serial: &str) -> Option<String> {
+        let t = (self.wall)();
+        let (lease_until, denied_until) = self.memory(adb_serial, hw_serial, t);
+        (lease_until <= t && t < denied_until).then(|| {
+            format!(
+                "the owner said No to the last ask-screen (or did not answer): no screen-changing call for {} s",
+                (denied_until - t).div_ceil(1000).min(REASK_AFTER_MS / 1000)
+            )
+        })
+    }
+
+    /// May a screen-changing call go to this phone now? `Err` holds the reason, for the refusal.
+    pub fn admit(&mut self, adb_serial: &str, hw_serial: &str) -> Result<Admitted, String> {
+        if self.is_emulator(adb_serial, hw_serial) {
+            return Ok(Admitted::Emulator);
+        }
+        let t = (self.wall)();
+        let (lease_until, denied_until) = self.memory(adb_serial, hw_serial, t);
         let ask = format!(
             "run `agentroid ask-screen --device {adb_serial} --minutes N --why \"...\"` first (a Yes gives a lease this lock honours)"
         );

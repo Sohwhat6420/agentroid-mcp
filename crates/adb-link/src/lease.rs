@@ -14,6 +14,9 @@
 //!   lease, so a phone core took for an ordinary device (its `ro.serialno` could not be read) is
 //!   never let through on the strength of a lease core never applied to it.
 //! * **Fail closed.** An unreadable wall clock, or a time past the end, is no lease.
+//! * **Every close is told.** A lease the book drops itself (it ran out) or closes for the daemon
+//!   (its holder released the phone or went) is queued with the reason, for core to write to the
+//!   audit log ([`LeaseBook::take_ended`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -124,7 +127,12 @@ impl Lease {
 pub struct LeaseBook {
     clock: Arc<dyn WallClock>,
     open: Mutex<Option<Lease>>,
+    /// Leases closed without core (run out, released, connection gone), with why, not yet audited.
+    ended: Mutex<Vec<(Lease, &'static str)>>,
 }
+
+/// How many closes the book keeps for the audit log before it drops the oldest.
+pub const ENDED_KEPT: usize = 64;
 
 impl std::fmt::Debug for LeaseBook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,6 +147,7 @@ impl LeaseBook {
         LeaseBook {
             clock,
             open: Mutex::new(None),
+            ended: Mutex::new(Vec::new()),
         }
     }
 
@@ -165,7 +174,9 @@ impl LeaseBook {
         match (now, g.as_ref()) {
             (Some(t), Some(l)) if t < l.expires_at_ms => Some(l.clone()),
             (Some(_), Some(_)) => {
-                *g = None;
+                if let Some(l) = g.take() {
+                    self.ended_push(l, "expired");
+                }
                 None
             }
             _ => None,
@@ -178,13 +189,32 @@ impl LeaseBook {
     }
 
     /// Close the lease if it belongs to the daemon lease of `epoch` (its holder's connection went,
-    /// or it released the phone). Returns the one closed.
-    pub fn close_epoch(&self, epoch: u64) -> Option<Lease> {
+    /// or it released the phone; `why` says which, for the audit log). Returns the one closed.
+    pub fn close_epoch(&self, epoch: u64, why: &'static str) -> Option<Lease> {
         let mut g = self.lock();
         if g.as_ref().is_some_and(|l| l.holder.epoch == epoch) {
-            return g.take();
+            let l = g.take();
+            drop(g);
+            if let Some(l) = &l {
+                self.ended_push(l.clone(), why);
+            }
+            return l;
         }
         None
+    }
+
+    fn ended_push(&self, l: Lease, why: &'static str) {
+        let mut e = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        if e.len() >= ENDED_KEPT {
+            e.remove(0);
+        }
+        e.push((l, why));
+    }
+
+    /// The leases closed without core since the last call (oldest first), with why: core writes
+    /// each to the audit log.
+    pub fn take_ended(&self) -> Vec<(Lease, &'static str)> {
+        std::mem::take(&mut *self.ended.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Name the job now running under the daemon lease of `epoch` (`None`: it ended) on the open
@@ -258,6 +288,14 @@ mod tests {
         assert!(book.active().is_none(), "the end is exclusive");
         clock.set(Some(T0));
         assert!(book.active().is_none(), "a lease that ran out was dropped");
+        let ended = book.take_ended();
+        assert_eq!(
+            ended.len(),
+            1,
+            "the run-out lease is queued once for the audit log"
+        );
+        assert_eq!(ended[0].1, "expired");
+        assert!(book.take_ended().is_empty());
     }
 
     #[test]
@@ -271,8 +309,13 @@ mod tests {
         book.bind("192.0.2.60:5555");
         assert!(book.admits("192.0.2.60:5555"));
         assert!(!book.admits("192.0.2.61:5555"));
-        assert!(book.close_epoch(8).is_none(), "another holder's epoch");
-        assert!(book.close_epoch(7).is_some());
+        assert!(
+            book.close_epoch(8, "released").is_none(),
+            "another holder's epoch"
+        );
+        assert!(book.take_ended().is_empty());
+        assert!(book.close_epoch(7, "released").is_some());
+        assert_eq!(book.take_ended()[0].1, "released");
         assert!(!book.admits("192.0.2.60:5555"));
         assert_eq!(clamp_minutes(0), 1);
         assert_eq!(clamp_minutes(u64::MAX), MAX_MINUTES);

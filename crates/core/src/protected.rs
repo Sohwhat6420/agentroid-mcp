@@ -7,24 +7,35 @@
 //!
 //! * **One Allow.** The first call with no lease sends the owner one push (Allow / Deny, answered
 //!   within the ask window, 10 min by default) and is refused as `lease:pending`; the agent retries
-//!   once the owner has tapped Allow. The same lease also satisfies the screen lock, so one Allow
-//!   is never asked for twice.
+//!   once the owner has tapped Allow. The Allow is followed by one quiet notice ("open until
+//!   HH:MM UTC") with a Deny button. An Allowed lease also satisfies the screen lock's in-use check,
+//!   so one Allow is never asked for twice; an `ask-screen` No still refuses.
+//! * **One ask per phone.** At most one ask is out at a time, whoever it is for; another holder is
+//!   refused without a push, and no new ask goes out within the ask window of the last one.
 //! * **Overnight.** When a presence file signed with the owner's key (HMAC-SHA256), written in the
 //!   last `--presence-ttl-min` minutes and not dated in the future, says `asleep`, the lease opens
 //!   without an ask, and a notice with a Deny button goes out (no notice sent: no lease). Any
-//!   problem with the file turns the overnight rule off, so the call asks instead.
+//!   problem with the file turns the overnight rule off, so the call asks instead. The screen
+//!   lock's own check still applies: the owner picking the phone up stops the agent.
 //! * **Bound to its holder.** A lease, and a pending ask, belong to one daemon lease (the holder's
-//!   name and the registry epoch); another holder never inherits either, and the daemon closes the
-//!   lease when its holder's connection goes.
+//!   name and the registry epoch) of the caller's own connection; another holder never inherits
+//!   either, and the daemon closes the lease when its holder's connection goes.
 //! * **Deny ends it.** The open lease's Deny channel is polled every 10 s; a Deny closes the lease
-//!   and holds: after an overnight Deny, until a trusted presence file says the owner is awake;
-//!   after a daytime Deny (or no answer), for the ask window. A fresh `allow <id>` for the denied
-//!   request lifts the hold. A channel that cannot be read for 2 min closes the lease.
-//! * **Never under any lease.** Gmail (and Gmail Go) and WhatsApp (any package naming it), the
-//!   keyguard, the notification shade, notification rows and Recents, a system bar naming a
-//!   protected app, digits on a PIN prompt (one at a time included), `unlock`, paths naming the
+//!   and holds, for every holder: after an overnight Deny, until a trusted presence file says the
+//!   owner is awake; after a daytime Deny (or no answer), for the ask window. The hold is kept in
+//!   the holds file (`--state-dir`'s `protected-holds.json`), so a restart does not lift it; a file
+//!   that cannot be read holds until a trusted presence state changes. The denied holder may lift
+//!   it with a fresh `allow <id>` within the ask window of the Deny. A channel that cannot be read
+//!   for 2 min closes the lease.
+//! * **Never under any lease.** Gmail (and Gmail Go) and WhatsApp (any package naming it, any
+//!   short name resolving to one), their web hosts (`open_url` with any package, and typed text),
+//!   the keyguard, the notification shade, notification rows, heads-up notifications, Recents,
+//!   Notification history and notification-listener screens, any node outside the launcher naming
+//!   a protected app, digits on a PIN prompt (one at a time included), `unlock`, paths naming the
 //!   protected apps, raw shell lines and link segments. Reads are refused on those screens too, and
 //!   a screenshot is checked again after it is taken.
+//! * **Logged first.** Every lease is written to the audit log before it opens (a failed write
+//!   opens nothing), and every close is logged with its reason.
 
 use crate::approval::{Approver, Outcome as Answer, Request, Style};
 use crate::audit::{AuditLog, Entry};
@@ -104,6 +115,8 @@ pub struct ProtectedConfig {
     pub presence: Option<PresenceConfig>,
     pub deny_poll_ms: u64,
     pub deny_poll_fail_ms: u64,
+    /// Where a hold after a Deny is kept across restarts (`None`: in memory only).
+    pub holds_file: Option<PathBuf>,
 }
 
 impl ProtectedConfig {
@@ -115,7 +128,14 @@ impl ProtectedConfig {
             presence,
             deny_poll_ms: DENY_POLL_MS,
             deny_poll_fail_ms: DENY_POLL_FAIL_MS,
+            holds_file: None,
         }
+    }
+
+    /// Keep holds in `path` (the daemon: `protected-holds.json` in its state directory).
+    pub fn with_holds_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.holds_file = Some(path.into());
+        self
     }
 }
 
@@ -276,10 +296,29 @@ pub fn is_protected_package(p: &str) -> bool {
         || p.contains("whatsapp")
 }
 
-/// Does a label or name mention a protected app?
+/// Does a label or name mention a protected app (its name, or Gmail's web hosts)?
 pub fn names_protected(s: &str) -> bool {
     let s = s.to_lowercase();
-    s.contains("whatsapp") || s.contains("gmail")
+    s.contains("whatsapp")
+        || s.contains("gmail")
+        || s.contains("mail.google")
+        || s.contains("inbox.google")
+}
+
+/// The web hosts of the protected apps: a page there shows the same mail and chats in a browser.
+pub const PROTECTED_HOSTS: [&str; 6] = [
+    "mail.google.com",
+    "inbox.google.com",
+    "gmail.com",
+    "web.whatsapp.com",
+    "wa.me",
+    "whatsapp.com",
+];
+
+/// Does `s` (a URI, or typed text) contain one of the [`PROTECTED_HOSTS`], in any case?
+pub fn names_protected_host(s: &str) -> bool {
+    let s = s.to_lowercase();
+    PROTECTED_HOSTS.iter().any(|h| s.contains(h))
 }
 
 /// Resource-id and class fragments of the keyguard (lock screen and bouncer).
@@ -328,6 +367,31 @@ const PIN_MARKS: [&str; 6] = [
     "pin_pad",
 ];
 const PIN_TEXTS: [&str; 4] = ["enter pin", "enter your pin", "pin code", "passcode"];
+/// Resource-id and class fragments of a screen that lists past notifications: Settings'
+/// Notification history and notification log, and the notification-listener (notification
+/// access) screens.
+const NOTIFICATION_LOG_MARKS: [&str; 9] = [
+    "notification_history",
+    "notificationhistory",
+    "notification_log",
+    "notificationlog",
+    "notificationstation",
+    "notification_station",
+    "notification_listener",
+    "notificationlistener",
+    "notification_access",
+];
+/// The titles of those screens, as a title bar shows them.
+const NOTIFICATION_LOG_TITLES: [&str; 6] = [
+    "notification history",
+    "notification log",
+    "notification access",
+    "device & app notifications",
+    "device and app notifications",
+    "notification read, reply & control",
+];
+/// Resource-id fragments of a screen's title bar (not a list row's `android:id/title`).
+const TITLE_BAR_MARKS: [&str; 4] = ["toolbar", "action_bar", "appbar", "collapsing"];
 
 /// What the protected phone's screen shows that matters to the lease.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -337,7 +401,10 @@ pub struct ScreenFacts {
     pub keyguard: bool,
     pub preview: bool,
     pub recents: bool,
-    /// A System UI node (a status-bar icon's description, a toast) names a protected app.
+    /// Notification history, the notification log, or a notification-listener screen.
+    pub notification_log: bool,
+    /// A node outside the launcher (a status-bar icon's description, a toast, a share target, a
+    /// list of apps, a browser tab) names a protected app.
     pub protected_mention: bool,
     pub pin_prompt: bool,
     /// Where a node naming a protected app sits (a launcher icon, a share target): no touch there.
@@ -375,9 +442,23 @@ pub fn screen_facts(xml: &str) -> Result<ScreenFacts, String> {
             if marks(&PREVIEW_MARKS) {
                 f.preview = true;
             }
-            if names_protected(&n.text) || names_protected(&n.desc) {
-                f.protected_mention = true;
-            }
+        }
+        // any package: a past notification's text is no safer in Settings than in System UI
+        if marks(&NOTIFICATION_LOG_MARKS) {
+            f.notification_log = true;
+        }
+        let title_bar = TITLE_BAR_MARKS.iter().any(|m| rid.contains(m));
+        let is_title = |s: &str| {
+            let s = s.trim().to_lowercase();
+            NOTIFICATION_LOG_TITLES.contains(&s.as_str())
+        };
+        if title_bar && (is_title(&n.text) || is_title(&n.desc)) {
+            f.notification_log = true;
+        }
+        // a launcher's icon of a protected app is no read of its content (a touch there is
+        // refused below); a node naming one anywhere else may be its content
+        if !is_launcher(&pkg) && (names_protected(&n.text) || names_protected(&n.desc)) {
+            f.protected_mention = true;
         }
         if (is_systemui(&pkg) || is_launcher(&pkg)) && marks(&RECENTS_MARKS) {
             f.recents = true;
@@ -437,10 +518,17 @@ pub fn read_refusal(f: &ScreenFacts) -> Option<(&'static str, String)> {
     if f.recents {
         return Some(("preview", "Recents is showing (app thumbnails)".into()));
     }
+    if f.notification_log {
+        return Some((
+            "preview",
+            "Notification history, a notification log or a notification-listener screen is showing"
+                .into(),
+        ));
+    }
     if f.protected_mention {
         return Some((
             "preview",
-            "a system bar names a protected app (a notification from it)".into(),
+            "something on screen outside the launcher names a protected app (a notification, a share target, a page of it)".into(),
         ));
     }
     if let Some(p) = &f.protected_app {
@@ -492,14 +580,28 @@ pub fn screen_refusal(
     None
 }
 
-/// Does a URI open a protected app (its scheme, host or package)? `mailto:` counts: it opens the
-/// mail app.
+/// Does a URI open a protected app or its web pages (its scheme, host or package, whatever app
+/// would open it)? `mailto:` counts: it opens the mail app.
 pub fn uri_names_protected(uri: &str) -> bool {
     let u = uri.trim().to_lowercase();
     names_protected(&u)
-        || u.contains("wa.me")
+        || names_protected_host(&u)
         || u.contains("com.google.android.gm")
         || u.starts_with("mailto:")
+}
+
+/// Typed text naming a protected app's web host (`type_text`, and `set_value`, which the daemon
+/// sends as a `type_text`): typed into an address bar, it would open the protected app's pages.
+pub fn typed_refusal(call: &Call) -> Option<(&'static str, String)> {
+    let Call::TypeText { text, .. } = call else {
+        return None;
+    };
+    names_protected_host(text).then(|| {
+        (
+            "app",
+            "the text names a protected app's web host (it would open its pages)".to_string(),
+        )
+    })
 }
 
 /// A launch that would open a protected app: `open_app`, `open_url`, `start_activity`.
@@ -555,7 +657,8 @@ pub fn path_refusal(p: &str) -> Option<String> {
 // the lease
 // ---------------------------------------------------------------------------------------------
 
-/// Who holds the protected phone in the daemon for this call (`None`: nobody, or not this caller).
+/// Who holds the protected phone in the daemon for this call: the caller's own daemon lease
+/// (`None`: the caller holds none on it, or it is no longer the current grant).
 pub type HolderFn = Box<dyn Fn(&DeviceInfo) -> Option<Holder> + Send>;
 
 #[derive(Debug, Clone)]
@@ -564,12 +667,25 @@ struct Pending {
     holder: Holder,
 }
 
+/// What a hold lasts until.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Until {
+    /// A daytime Deny, or an ask nobody answered: until this wall-clock time (the ask window).
+    Window(u64),
+    /// Denied while the owner was asleep: until a trusted presence file says otherwise.
+    Awake,
+    /// The holds file could not be read at start-up, so what it held is unknown: until a trusted
+    /// presence file's state changes from the first one seen (`None`: none seen yet).
+    Unknown(Option<String>),
+}
+
 #[derive(Debug, Clone)]
 struct Held {
     req: Request,
+    /// The daemon lease whose ask (or lease) was denied: only it may re-allow.
+    holder: Option<Holder>,
     at_ms: u64,
-    /// Denied while the owner was asleep: held until a trusted presence file says otherwise.
-    asleep: bool,
+    until: Until,
 }
 
 #[derive(Debug, Clone)]
@@ -579,15 +695,21 @@ struct Running {
     fail_since: Option<u64>,
 }
 
+/// The holds file's format version.
+pub const HOLDS_VERSION: u64 = 1;
+
 /// The lease's state in core.
 pub struct Protected {
     pub cfg: ProtectedConfig,
     book: Arc<LeaseBook>,
     holder_of: Option<HolderFn>,
     jobs: HashMap<u64, String>,
+    /// At most one ask per phone is out at a time, whoever it is for.
     pending: Option<Pending>,
     held: Option<Held>,
     running: Option<Running>,
+    /// When the last ask went out: no other goes out within the ask window of it.
+    last_ask_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for Protected {
@@ -621,9 +743,115 @@ fn clean(s: &str, n: usize) -> String {
         .collect::<String>()
 }
 
+/// `HH:MM UTC` for Unix ms (the push says when the lease ends).
+pub fn utc_hhmm(ms: u64) -> String {
+    let m = ms / 60_000;
+    format!("{:02}:{:02} UTC", (m / 60) % 24, m % 60)
+}
+
+/// The holds file's text for `held` (`None`: no hold).
+fn holds_json(held: Option<&Held>) -> String {
+    let hold = held.map(|h| {
+        let (until, until_ms, state) = match &h.until {
+            Until::Window(t) => ("window", Some(*t), None),
+            Until::Awake => ("awake", None, None),
+            Until::Unknown(s) => ("presence_change", None, s.clone()),
+        };
+        serde_json::json!({
+            "request_id": h.req.id,
+            "created_ms": h.req.created_ms,
+            "expires_ms": h.req.expires_ms,
+            "holder": h.holder.as_ref().map(|x| serde_json::json!({"name": x.name, "epoch": x.epoch})),
+            "denied_at_ms": h.at_ms,
+            "until": until,
+            "until_ms": until_ms,
+            "presence_state": state,
+        })
+    });
+    serde_json::json!({ "version": HOLDS_VERSION, "hold": hold }).to_string()
+}
+
+/// Read a holds file's text. `Ok(None)`: no hold. `Err`: it could not be read as one (the caller
+/// holds until the presence state changes).
+fn parse_holds(text: &str) -> Result<Option<Held>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(text.trim()).map_err(|_| "the holds file is not JSON".to_string())?;
+    if v.get("version").and_then(serde_json::Value::as_u64) != Some(HOLDS_VERSION) {
+        return Err("the holds file has another version".into());
+    }
+    let h = match v.get("hold") {
+        Some(serde_json::Value::Null) => return Ok(None),
+        Some(h) => h,
+        None => return Err("the holds file has no hold".into()),
+    };
+    let bad = || "the holds file's hold is malformed".to_string();
+    let id = h
+        .get("request_id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(bad)?;
+    let num = |k: &str| h.get(k).and_then(serde_json::Value::as_u64).ok_or_else(bad);
+    let (created, expires, at) = (num("created_ms")?, num("expires_ms")?, num("denied_at_ms")?);
+    let holder = match h.get("holder") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(x) => Some(Holder {
+            name: x
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(bad)?
+                .to_string(),
+            epoch: x
+                .get("epoch")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(bad)?,
+        }),
+    };
+    let until = match h.get("until").and_then(|x| x.as_str()) {
+        Some("window") => Until::Window(num("until_ms")?),
+        Some("awake") => Until::Awake,
+        Some("presence_change") => Until::Unknown(
+            h.get("presence_state")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+        ),
+        _ => return Err(bad()),
+    };
+    Ok(Some(Held {
+        req: Request {
+            id: id.to_string(),
+            device: String::new(),
+            tool: String::new(),
+            kind: "lease".into(),
+            reason: String::new(),
+            target: String::new(),
+            created_ms: created,
+            expires_ms: expires,
+            style: Style::Lease,
+        },
+        holder,
+        at_ms: at,
+        until,
+    }))
+}
+
+/// Write `text` to `path` atomically: a temporary file beside it, then a rename over it.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 impl Protected {
+    /// A new lease state. With a holds file configured, the hold it records is loaded; a file
+    /// that cannot be read as one holds until a trusted presence state change.
     pub fn new(cfg: ProtectedConfig, book: Arc<LeaseBook>) -> Self {
-        Protected {
+        let mut p = Protected {
             cfg,
             book,
             holder_of: None,
@@ -631,11 +859,60 @@ impl Protected {
             pending: None,
             held: None,
             running: None,
+            last_ask_ms: None,
+        };
+        p.held = p.load_holds();
+        p
+    }
+
+    fn load_holds(&self) -> Option<Held> {
+        let path = self.cfg.holds_file.as_ref()?;
+        let unknown = |why: String| {
+            let now = self.book.now_ms().unwrap_or(0);
+            let state = match self.presence(now) {
+                Presence::Untrusted(_) => None,
+                p => Some(p.to_string()),
+            };
+            Some(Held {
+                req: Request {
+                    id: format!("unknown hold ({why})"),
+                    device: String::new(),
+                    tool: String::new(),
+                    kind: "lease".into(),
+                    reason: String::new(),
+                    target: String::new(),
+                    created_ms: 0,
+                    expires_ms: 0,
+                    style: Style::Lease,
+                },
+                holder: None,
+                at_ms: now,
+                until: Until::Unknown(state),
+            })
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => match parse_holds(&text) {
+                Ok(h) => h,
+                Err(why) => unknown(why),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => unknown(format!("the holds file could not be read: {}", e.kind())),
         }
     }
 
-    /// How core learns who holds the protected phone (the daemon's registry). Without it no lease
-    /// opens.
+    /// Set (or clear) the hold, and write it to the holds file when one is configured. `Err`: the
+    /// file could not be written (the hold stands in memory either way).
+    fn set_held(&mut self, h: Option<Held>) -> Result<(), String> {
+        self.held = h;
+        match &self.cfg.holds_file {
+            Some(path) => write_atomic(path, &holds_json(self.held.as_ref()))
+                .map_err(|e| format!("the holds file could not be written: {}", e.kind())),
+            None => Ok(()),
+        }
+    }
+
+    /// How core learns who holds the protected phone (the daemon's registry, for the caller's own
+    /// connection). Without it no lease opens.
     pub fn set_holders(&mut self, f: HolderFn) {
         self.holder_of = Some(f);
     }
@@ -658,14 +935,58 @@ impl Protected {
         &self.book
     }
 
-    /// Close the lease of daemon lease `epoch` (its holder released the phone or went).
+    /// Close the lease of daemon lease `epoch` (its holder released the phone). The close is
+    /// written to the audit log on the next call ([`Protected::audit_closes`]).
     pub fn close_epoch(&mut self, epoch: u64) -> Option<Lease> {
-        let closed = self.book.close_epoch(epoch);
+        let closed = self.book.close_epoch(epoch, "released");
         if closed.is_some() {
             self.running = None;
         }
         self.jobs.remove(&epoch);
         closed
+    }
+
+    /// Write every lease the book closed without core (it ran out, its holder released the phone
+    /// or went) to the audit log. `Err`: a write failed (the rest are dropped).
+    pub fn audit_closes(
+        &mut self,
+        audit: Option<&mut AuditLog>,
+        tool: &'static str,
+    ) -> Result<(), Refusal> {
+        // (reading the book first drops, and queues, a lease that has just run out)
+        let open = self.book.active().is_some();
+        let ended = self.book.take_ended();
+        if ended.is_empty() {
+            return Ok(());
+        }
+        // a run-out or released lease's Deny poll ends with it
+        if !open {
+            self.running = None;
+        }
+        let Some(a) = audit else {
+            return Ok(());
+        };
+        for (l, why) in ended {
+            a.append(&Entry {
+                device: String::new(),
+                tool: tool.to_string(),
+                decision: "blocked".into(),
+                rule: "lease:closed".into(),
+                reason: format!(
+                    "lease {} for {} (epoch {}) closed: {why}",
+                    reference(&l.id),
+                    clean(&l.holder.name, 40),
+                    l.holder.epoch
+                ),
+                target: String::new(),
+                screen: String::new(),
+            })
+            .map_err(|e| Refusal::Audit {
+                tool,
+                why: e.to_string(),
+            })?;
+        }
+        Ok(())
     }
 
     /// What the presence file says now (no file configured: untrusted, so the overnight rule is off).
@@ -694,9 +1015,32 @@ impl Protected {
         lease
     }
 
+    /// After an Allow: one quiet notice, with the same request id, saying until when the lease is
+    /// open, with a Deny button (the Allow button cleared the ask and its Deny). `Err`: not sent.
+    fn send_open_notice(
+        &self,
+        a: &mut Approver,
+        ask: &Request,
+        now: u64,
+        tool: &str,
+    ) -> Result<(), String> {
+        let mut n = ask.clone();
+        n.style = Style::Notice;
+        n.tool = tool.to_string();
+        n.created_ms = now;
+        n.expires_ms = now.saturating_add(self.cfg.lease_ms);
+        n.reason = format!(
+            "Lease on the protected phone open until {} ({} min).",
+            utc_hhmm(n.expires_ms),
+            self.cfg.lease_ms / 60_000
+        );
+        a.send(&n)
+    }
+
     /// Admit a call for the protected phone `d` under a lease: the open one when it is this
     /// holder's, or a new one (overnight), or an ask (refused as pending). Binds `d.serial` for the
-    /// adb guard on success.
+    /// adb guard on success. Every lease is written to the audit log before it opens; a failed
+    /// write opens nothing.
     pub fn admit(
         &mut self,
         d: &DeviceInfo,
@@ -708,6 +1052,7 @@ impl Protected {
         let mut audit = audit;
         let device = device_name(d);
         let refused = |why: String| Refusal::LeaseRefused { tool, why };
+        self.audit_closes(audit.as_deref_mut(), tool)?;
         let Some(now) = self.book.now_ms() else {
             return Err(refused("the wall clock cannot be read".into()));
         };
@@ -776,18 +1121,24 @@ impl Protected {
                                 self.book.close();
                                 let asleep = lease.granted == Granted::Overnight
                                     || self.presence(now).asleep();
-                                self.held = Some(Held {
+                                let saved = self.set_held(Some(Held {
                                     req,
+                                    holder: Some(lease.holder.clone()),
                                     at_ms: now,
-                                    asleep,
-                                });
+                                    until: if asleep {
+                                        Until::Awake
+                                    } else {
+                                        Until::Window(now.saturating_add(self.cfg.ask_window_ms))
+                                    },
+                                }));
                                 log(
                                     audit.as_deref_mut(),
                                     "blocked",
                                     "lease:denied",
                                     format!(
-                                        "the owner tapped Deny on lease {}: closed and held",
-                                        reference(&lease.id)
+                                        "the owner tapped Deny on lease {}: closed and held{}",
+                                        reference(&lease.id),
+                                        saved.err().map_or(String::new(), |e| format!(" ({e})"))
                                     ),
                                 )?;
                                 return Err(refused(
@@ -851,13 +1202,38 @@ impl Protected {
             }
         }
 
-        // 2. a hold after a Deny (or no answer)
+        // 2. a hold after a Deny (or no answer), for every holder: a new holder inherits it
         if let Some(h) = self.held.clone() {
+            // only the denied holder, within the ask window after the Deny, may re-allow
+            let own = h.holder.as_ref() == Some(&holder);
+            let until = h.at_ms.saturating_add(self.cfg.ask_window_ms);
             if let Some(ev) = approver
                 .as_deref_mut()
-                .and_then(|a| a.reallowed(&h.req, h.at_ms))
+                .filter(|_| own)
+                .and_then(|a| a.reallowed(&h.req, h.at_ms, until))
             {
-                self.held = None;
+                let saved = self.set_held(None);
+                if let Err(e) = log(
+                    audit.as_deref_mut(),
+                    "allowed",
+                    "lease:reallowed",
+                    format!(
+                        "the owner re-allowed ask {} (answer {ev}): lease open for {} min for {} (epoch {}){}",
+                        reference(&h.req.id),
+                        self.cfg.lease_ms / 60_000,
+                        holder.name,
+                        holder.epoch,
+                        saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                    ),
+                ) {
+                    // nothing opens unlogged, and the hold stands
+                    let _ = self.set_held(Some(h));
+                    return Err(e);
+                }
+                let notice = match approver.as_deref_mut() {
+                    Some(a) => self.send_open_notice(a, &h.req, now, tool),
+                    None => Err("no approval channel".into()),
+                };
                 let lease = self.open(
                     now,
                     &holder,
@@ -866,117 +1242,182 @@ impl Protected {
                     },
                     h.req.clone(),
                 );
-                log(
-                    audit.as_deref_mut(),
-                    "allowed",
-                    "lease:reallowed",
-                    format!(
-                        "the owner re-allowed ask {} (answer {ev}): lease open for {} min",
-                        reference(&h.req.id),
-                        self.cfg.lease_ms / 60_000
-                    ),
-                )?;
+                if let Err(e) = notice {
+                    log(
+                        audit.as_deref_mut(),
+                        "blocked",
+                        "lease:notice_unsent",
+                        format!("the lease-open notice could not be sent ({e}); the owner can still reply deny"),
+                    )?;
+                }
                 self.book.bind(&d.serial);
                 return Ok(lease);
             }
-            let over = if h.asleep {
-                matches!(self.presence(now), Presence::Other(_))
-            } else {
-                now >= h.at_ms.saturating_add(self.cfg.ask_window_ms)
+            let presence = self.presence(now);
+            let (over, until_text) = match &h.until {
+                Until::Window(t) => (
+                    now >= *t,
+                    format!("for {} min", self.cfg.ask_window_ms / 60_000),
+                ),
+                Until::Awake => (
+                    matches!(presence, Presence::Other(_)),
+                    "until the presence file says the owner is awake".to_string(),
+                ),
+                Until::Unknown(seen) => {
+                    let state = match &presence {
+                        Presence::Untrusted(_) => None,
+                        p => Some(p.to_string()),
+                    };
+                    match (seen, state) {
+                        (Some(a), Some(b)) => (*a != b, String::new()),
+                        (None, Some(b)) => {
+                            // the first trusted state seen: the hold lasts until it changes
+                            let mut h2 = h.clone();
+                            h2.until = Until::Unknown(Some(b));
+                            let _ = self.set_held(Some(h2));
+                            (false, String::new())
+                        }
+                        (_, None) => (false, String::new()),
+                    }
+                }
             };
             if !over {
+                if matches!(h.until, Until::Unknown(_)) {
+                    return Err(refused(
+                        "held: the holds file could not be read at start-up, so an earlier Deny may stand; held until a trusted presence file's state changes".into(),
+                    ));
+                }
                 return Err(refused(format!(
-                    "held after the owner's Deny on ask {} ({}); the owner can lift it by answering allow to that ask",
+                    "held after the owner's Deny on ask {} ({until_text}); the owner can lift it by answering allow to that ask within {} min of the Deny",
                     reference(&h.req.id),
-                    if h.asleep {
-                        "until the presence file says the owner is awake".to_string()
-                    } else {
-                        format!("for {} min", self.cfg.ask_window_ms / 60_000)
-                    }
+                    self.cfg.ask_window_ms / 60_000
                 )));
             }
-            self.held = None;
+            let saved = self.set_held(None);
+            log(
+                audit.as_deref_mut(),
+                "allowed",
+                "lease:hold_ended",
+                format!(
+                    "the hold after ask {} ended (the presence file says {presence}){}",
+                    reference(&h.req.id),
+                    saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                ),
+            )?;
         }
 
-        // 3. a pending ask
+        // 3. the one pending ask on this phone, whoever it is for
         if let Some(p) = self.pending.take() {
-            if p.holder != holder {
-                log(
-                    audit.as_deref_mut(),
-                    "blocked",
-                    "lease:stale",
-                    format!(
-                        "ask {} was for {} (epoch {}): dropped, asking again for {} (epoch {})",
-                        reference(&p.req.id),
-                        p.holder.name,
-                        p.holder.epoch,
-                        holder.name,
-                        holder.epoch
-                    ),
-                )?;
-            } else {
-                let Some(a) = approver.as_deref_mut() else {
-                    return Err(refused("no approval channel is configured".into()));
-                };
-                match a.check(&p.req, now) {
-                    None => {
-                        let r = reference(&p.req.id);
-                        self.pending = Some(p);
-                        return Err(Refusal::LeasePending { tool, reference: r });
-                    }
-                    Some(Answer::Approved { event_id }) => {
-                        let lease = self.open(
-                            now,
-                            &holder,
-                            Granted::Approved {
-                                request_id: p.req.id.clone(),
-                            },
-                            p.req.clone(),
-                        );
-                        log(
-                            audit.as_deref_mut(),
-                            "allowed",
-                            "lease:opened",
-                            format!(
-                                "the owner allowed ask {} (answer {event_id}): lease open for {} min for {} (epoch {})",
-                                reference(&p.req.id),
-                                self.cfg.lease_ms / 60_000,
-                                holder.name,
-                                holder.epoch
-                            ),
-                        )?;
-                        self.book.bind(&d.serial);
-                        return Ok(lease);
-                    }
-                    Some(Answer::Denied { .. }) => {
-                        let asleep = self.presence(now).asleep();
-                        self.held = Some(Held {
-                            req: p.req.clone(),
-                            at_ms: now,
-                            asleep,
-                        });
+            let Some(a) = approver.as_deref_mut() else {
+                self.pending = Some(p);
+                return Err(refused("no approval channel is configured".into()));
+            };
+            let mine = p.holder == holder;
+            match a.check(&p.req, now) {
+                None if mine => {
+                    let r = reference(&p.req.id);
+                    self.pending = Some(p);
+                    return Err(Refusal::LeasePending { tool, reference: r });
+                }
+                None => {
+                    let r = reference(&p.req.id);
+                    let who = clean(&p.holder.name, 40);
+                    let epoch = p.holder.epoch;
+                    self.pending = Some(p);
+                    return Err(refused(format!(
+                        "ask {r} for {who} (epoch {epoch}) is still open; one ask at a time goes to the owner, so try again once it has ended"
+                    )));
+                }
+                Some(Answer::Approved { event_id }) if mine => {
+                    log(
+                        audit.as_deref_mut(),
+                        "allowed",
+                        "lease:opened",
+                        format!(
+                            "the owner allowed ask {} (answer {event_id}): lease open for {} min for {} (epoch {})",
+                            reference(&p.req.id),
+                            self.cfg.lease_ms / 60_000,
+                            holder.name,
+                            holder.epoch
+                        ),
+                    )?;
+                    let notice = self.send_open_notice(a, &p.req, now, tool);
+                    let lease = self.open(
+                        now,
+                        &holder,
+                        Granted::Approved {
+                            request_id: p.req.id.clone(),
+                        },
+                        p.req.clone(),
+                    );
+                    if let Err(e) = notice {
                         log(
                             audit.as_deref_mut(),
                             "blocked",
-                            "lease:denied",
-                            format!("the owner denied ask {}", reference(&p.req.id)),
+                            "lease:notice_unsent",
+                            format!("the lease-open notice could not be sent ({e}); the owner can still reply deny"),
                         )?;
-                        return Err(refused("the owner tapped Deny".into()));
                     }
-                    Some(other) => {
-                        self.held = Some(Held {
-                            req: p.req.clone(),
-                            at_ms: now,
-                            asleep: false,
-                        });
-                        log(
-                            audit.as_deref_mut(),
-                            "blocked",
-                            "lease:expired",
-                            format!("ask {}: {other}", reference(&p.req.id)),
-                        )?;
-                        return Err(refused(format!("the ask ended unanswered ({other})")));
-                    }
+                    self.book.bind(&d.serial);
+                    return Ok(lease);
+                }
+                Some(Answer::Approved { .. }) => {
+                    log(
+                        audit.as_deref_mut(),
+                        "blocked",
+                        "lease:stale",
+                        format!(
+                            "ask {} was allowed for {} (epoch {}), which no longer holds the phone: nothing opened for {} (epoch {})",
+                            reference(&p.req.id),
+                            p.holder.name,
+                            p.holder.epoch,
+                            holder.name,
+                            holder.epoch
+                        ),
+                    )?;
+                }
+                Some(Answer::Denied { .. }) => {
+                    let asleep = self.presence(now).asleep();
+                    let saved = self.set_held(Some(Held {
+                        req: p.req.clone(),
+                        holder: Some(p.holder.clone()),
+                        at_ms: now,
+                        until: if asleep {
+                            Until::Awake
+                        } else {
+                            Until::Window(now.saturating_add(self.cfg.ask_window_ms))
+                        },
+                    }));
+                    log(
+                        audit.as_deref_mut(),
+                        "blocked",
+                        "lease:denied",
+                        format!(
+                            "the owner denied ask {}{}",
+                            reference(&p.req.id),
+                            saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                        ),
+                    )?;
+                    return Err(refused("the owner tapped Deny".into()));
+                }
+                Some(other) => {
+                    let saved = self.set_held(Some(Held {
+                        req: p.req.clone(),
+                        holder: Some(p.holder.clone()),
+                        at_ms: now,
+                        until: Until::Window(now.saturating_add(self.cfg.ask_window_ms)),
+                    }));
+                    log(
+                        audit.as_deref_mut(),
+                        "blocked",
+                        "lease:expired",
+                        format!(
+                            "ask {}: {other}{}",
+                            reference(&p.req.id),
+                            saved.err().map_or(String::new(), |e| format!(" ({e})"))
+                        ),
+                    )?;
+                    return Err(refused(format!("the ask ended unanswered ({other})")));
                 }
             }
         }
@@ -1011,7 +1452,6 @@ impl Protected {
                 )));
             }
             let id = req.id.clone();
-            let lease = self.open(now, &holder, Granted::Overnight, req);
             log(
                 audit.as_deref_mut(),
                 "allowed",
@@ -1023,8 +1463,20 @@ impl Protected {
                     holder.epoch
                 ),
             )?;
+            let lease = self.open(now, &holder, Granted::Overnight, req);
             self.book.bind(&d.serial);
             return Ok(lease);
+        }
+        // one ask per ask window, whoever it was for
+        if let Some(last) = self.last_ask_ms {
+            let next = last.saturating_add(self.cfg.ask_window_ms);
+            if now < next {
+                return Err(refused(format!(
+                    "an ask went to the owner {} min ago; the next may go in {} min",
+                    now.saturating_sub(last) / 60_000,
+                    (next - now).div_ceil(60_000)
+                )));
+            }
         }
         let mut req = a.request(
             now,
@@ -1041,6 +1493,7 @@ impl Protected {
         if let Err(e) = a.send(&req) {
             return Err(refused(format!("the ask could not be sent ({e})")));
         }
+        self.last_ask_ms = Some(now);
         let r = reference(&req.id);
         self.pending = Some(Pending {
             req,

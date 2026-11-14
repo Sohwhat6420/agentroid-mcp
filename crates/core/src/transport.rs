@@ -175,7 +175,21 @@ pub trait Transport {
     fn health_hint(&mut self, _serial: &str) -> HealthHint {
         HealthHint::default()
     }
+    /// Is a heads-up notification (or any notification row) showing on the protected phone, in
+    /// any window? Only the yes or no is kept; nothing of the notification is read off the phone.
+    /// Default: this transport cannot tell (`Err`), so the protected phone takes no screenshot.
+    fn heads_up(&mut self, _serial: &str) -> Result<bool, TransportError> {
+        Err(TransportError(
+            "this transport cannot tell whether a heads-up notification is showing".into(),
+        ))
+    }
 }
+
+/// How long the protected phone's screenshot waits for a heads-up notification to go before it
+/// looks again ([`HEADS_UP_RETRIES`] times), and then refuses.
+pub const HEADS_UP_WAIT_MS: u64 = 1_500;
+/// How many times a screenshot on the protected phone looks again for a heads-up to have gone.
+pub const HEADS_UP_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreError {
@@ -412,6 +426,8 @@ pub struct Core<T: Transport, C: Clock> {
     prot_active: Option<&'static str>,
     /// The protected phone's screen as the check before the call found it.
     prot_facts: Option<ScreenFacts>,
+    /// The tree that check read: the screen guard and `ui_tree` use it rather than read again.
+    prot_xml: Option<String>,
 }
 
 /// How many link segments may wait for their report at once (the oldest goes first).
@@ -487,6 +503,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             prot_overnight: false,
             prot_active: None,
             prot_facts: None,
+            prot_xml: None,
         }
     }
 
@@ -542,7 +559,14 @@ impl<T: Transport, C: Clock> Core<T, C> {
             Some(c) => gate::check_leased(configured, c)?,
             None => gate::check_leased_raw(configured, tool)?,
         }
-        if let Some((rule, why)) = call.and_then(protected::launch_refusal) {
+        // `read_only` on the protected phone: the ruled reads only, as without a lease, and
+        // nothing is asked for a read
+        if configured == DeviceMode::ReadOnly {
+            return Err(Refusal::S24 { tool }.into());
+        }
+        if let Some((rule, why)) =
+            call.and_then(|c| protected::launch_refusal(c).or_else(|| protected::typed_refusal(c)))
+        {
             return Err(Refusal::Protected { tool, rule, why }.into());
         }
         let Some(p) = self.protected.as_mut() else {
@@ -551,6 +575,20 @@ impl<T: Transport, C: Clock> Core<T, C> {
         let lease = p.admit(d, tool, self.approver.as_mut(), self.audit.as_mut())?;
         self.prot_overnight = lease.granted == Granted::Overnight;
         if call.is_none_or(Call::is_acting) {
+            if self.prot_overnight {
+                // overnight the owner allowed nothing: the screen lock's own check stands, so the
+                // agent stops the moment the owner picks the phone up
+                self.lock_check(d, tool)?;
+                return Ok(());
+            }
+            // an Allow satisfies the lock, but never an explicit ask-screen No
+            if let Some(why) = self
+                .lock
+                .as_mut()
+                .and_then(|l| l.denied(&d.serial, &d.hw_serial))
+            {
+                return Err(Refusal::ScreenLock { tool, why }.into());
+            }
             let phone = phone_key(&d.hw_serial, &d.serial);
             self.lock_running
                 .retain(|_, (_, s, h)| phone_key(h, s) != phone);
@@ -579,6 +617,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// never the cached one. Exit keys go without a read.
     fn protected_pre(&mut self, d: &DeviceInfo, call: &Call) -> Result<(), CoreError> {
         self.prot_facts = None;
+        self.prot_xml = None;
         if let Call::Key { name } = call {
             if protected::exit_key(name) {
                 return Ok(());
@@ -605,8 +644,47 @@ impl<T: Transport, C: Clock> Core<T, C> {
             return Err(Refusal::Protected { tool, rule, why }.into());
         }
         self.prot_facts = Some(f);
-        // the screen guard reads again too, rather than reuse a cached tree
-        self.st(&d.serial).dirty = true;
+        // the screen guard and `ui_tree` judge this same fresh tree rather than read again (a
+        // screenshot still reads once more after the shot)
+        self.prot_xml = Some(xml);
+        Ok(())
+    }
+
+    /// A screenshot on the protected phone only while no heads-up notification is showing: one
+    /// that is waits [`HEADS_UP_WAIT_MS`] and looks again, up to `retries` times, then refuses. A
+    /// phone that cannot be asked refuses too.
+    fn protected_heads_up(
+        &mut self,
+        serial: &str,
+        tool: &'static str,
+        retries: u32,
+    ) -> Result<(), CoreError> {
+        for i in 0..=retries {
+            match self.transport.heads_up(serial) {
+                Ok(false) => return Ok(()),
+                Ok(true) if i < retries => self.clock.sleep_ms(HEADS_UP_WAIT_MS),
+                Ok(true) => {
+                    return Err(Refusal::Protected {
+                        tool,
+                        rule: "preview",
+                        why: "a heads-up notification is showing, so no image was taken or kept"
+                            .into(),
+                    }
+                    .into())
+                }
+                Err(e) => {
+                    return Err(Refusal::Protected {
+                        tool,
+                        rule: "screen",
+                        why: format!(
+                            "whether a heads-up notification is showing could not be read ({}), so no image was taken or kept",
+                            e.0.chars().take(120).collect::<String>()
+                        ),
+                    }
+                    .into())
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1039,9 +1117,12 @@ impl<T: Transport, C: Clock> Core<T, C> {
         self.lock_running.remove(serial.unwrap_or_default());
         self.prot_active = None;
         self.prot_facts = None;
+        self.prot_xml = None;
+        self.protected_audit_closes(call.name());
         let r = self.call_inner(serial, call);
         self.prot_active = None;
         self.prot_facts = None;
+        self.prot_xml = None;
         if let Err(CoreError::Refused(refusal)) = &r {
             self.record_refusal(serial, call.name(), refusal, "");
         }
@@ -1055,6 +1136,15 @@ impl<T: Transport, C: Clock> Core<T, C> {
             }
         }
         r
+    }
+
+    /// Write the protected-device leases that closed without core (run out, released, connection
+    /// gone) to the audit log. A write that fails here is not retried: the lease's own check
+    /// refuses on a failed write.
+    pub fn protected_audit_closes(&mut self, tool: &'static str) {
+        if let Some(p) = self.protected.as_mut() {
+            let _ = p.audit_closes(self.audit.as_mut(), tool);
+        }
     }
 
     /// Write a refusal to the audit log (when one is set). The call is refused either way; a failed
@@ -1316,6 +1406,10 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// The tree the screen guard judges: the stored one when it is fresh and nothing acted since,
     /// else a new read (not stored, so the indexes the model holds stay valid).
     fn guard_xml(&mut self, serial: &str) -> Result<String, TransportError> {
+        // the protected phone: the tree its own check read a moment ago, fresh for this call
+        if let Some(x) = &self.prot_xml {
+            return Ok(x.clone());
+        }
         let now = self.clock.now_ms();
         if let Some(st) = self.state.get(serial) {
             if let Some((xml, _)) = &st.tree {
@@ -1420,10 +1514,15 @@ impl<T: Transport, C: Clock> Core<T, C> {
         match call {
             Call::ListDevices | Call::Wait { .. } => unreachable!("handled above"),
             Call::Screenshot { max_width } => {
+                if let Some(tool) = self.prot_active {
+                    self.prot_xml = None;
+                    self.protected_heads_up(&s, tool, HEADS_UP_RETRIES)?;
+                }
                 let (img, note, shot) = self.shoot(&s, *max_width)?;
                 // the screen may have changed while the shot was taken: check it again, and
                 // drop the image when it now shows what is never shown
                 if let Some(tool) = self.prot_active {
+                    self.protected_heads_up(&s, tool, 0)?;
                     let xml = self.transport.tree_xml(&s, self.backend).map_err(|_| {
                         Refusal::Protected {
                             tool,
@@ -1446,7 +1545,15 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 timeout_ms,
             } => self.ui_tree(&s, *interactive_only, require, *timeout_ms),
             Call::Look { max_width } => {
+                if let Some(tool) = self.prot_active {
+                    // the tree after the shot is read anew, not the one from before it
+                    self.prot_xml = None;
+                    self.protected_heads_up(&s, tool, HEADS_UP_RETRIES)?;
+                }
                 let (img, note, shot) = self.shoot(&s, *max_width)?;
+                if let Some(tool) = self.prot_active {
+                    self.protected_heads_up(&s, tool, 0)?;
+                }
                 // on the protected phone this tree is read after the shot and checked, so a
                 // refusal here drops the image too
                 let listing = match self.read_tree(&s, false) {
@@ -1612,6 +1719,14 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 // the request first (refused before anything is read), then the package it resolves to
                 self.screen_gate_launch_request(&p, call)?;
                 let pkg = self.resolve_package(&s, package)?;
+                // the protected phone: a short name may resolve to a protected app
+                if let Some(tool) = self.prot_active {
+                    if let Some((rule, why)) = protected::launch_refusal(&Call::OpenApp {
+                        package: pkg.clone(),
+                    }) {
+                        return Err(Refusal::Protected { tool, rule, why }.into());
+                    }
+                }
                 self.screen_gate(
                     &p,
                     &Call::OpenApp {
@@ -1793,7 +1908,11 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// Read, remember and render the tree.
     fn read_tree(&mut self, serial: &str, interactive_only: bool) -> Result<String, CoreError> {
         let t0 = self.clock.now_ms();
-        let xml = self.transport.tree_xml(serial, self.backend)?;
+        // the protected phone's check read this call's tree a moment ago: no second dump
+        let xml = match self.prot_xml.take() {
+            Some(x) => x,
+            None => self.transport.tree_xml(serial, self.backend)?,
+        };
         let took = self.clock.now_ms().saturating_sub(t0);
         self.render_tree(serial, xml, interactive_only, took)
     }
@@ -2001,7 +2120,10 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 ))
             }
             Target::Select(sel) => {
-                let xml = self.transport.tree_xml(serial, self.backend)?;
+                let xml = match &self.prot_xml {
+                    Some(x) => x.clone(),
+                    None => self.transport.tree_xml(serial, self.backend)?,
+                };
                 if let Some(tool) = self.prot_active {
                     self.protected_xml(tool, &xml)?;
                 }
@@ -2033,6 +2155,8 @@ impl<T: Transport, C: Clock> Core<T, C> {
     }
 
     fn send(&mut self, serial: &str, input: &Input) -> Result<(), CoreError> {
+        // a tree read before an act is never reused after it
+        self.prot_xml = None;
         match self.transport.input(serial, input) {
             Ok(()) => Ok(()),
             Err(e) => match shell::check_input(&e.0) {
@@ -2141,6 +2265,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
     }
 
     fn launch_package(&mut self, serial: &str, pkg: &str) -> Result<Outcome, CoreError> {
+        self.prot_xml = None;
         let out = self.transport.shell(
             serial,
             &format!(
@@ -2157,6 +2282,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
     }
 
     fn am_start(&mut self, serial: &str, args: &[String]) -> Result<String, CoreError> {
+        self.prot_xml = None;
         let out = self.transport.shell(serial, &shell::am_start_line(args))?;
         shell::parse_am_start(&out).map_err(CoreError::Invalid)
     }

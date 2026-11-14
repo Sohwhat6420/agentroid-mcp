@@ -66,6 +66,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// Where the protected-device lease keeps a Deny's hold, in the state directory.
+const PROTECTED_HOLDS_FILE: &str = "protected-holds.json";
+
 /// Backend used when neither --fake nor --adb is given: no devices, so nothing can be leased or driven.
 struct NoDevices;
 
@@ -481,7 +484,14 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
             Some(book) => GuardedRunner::with_leases(AdbRunner::new(path), book.clone()),
             None => GuardedRunner::new(AdbRunner::new(path)),
         };
-        let mut core = Core::new(bridged::live::AdbTransport::new(runner), SystemClock::new());
+        let mut transport = bridged::live::AdbTransport::new(runner);
+        if protected_book.is_some() {
+            // the protected phone's heads-up check, through its own single-purpose runner
+            transport = transport.with_heads_up_runner(Box::new(GuardedRunner::with_s24_heads_up(
+                AdbRunner::new(path),
+            )));
+        }
+        let mut core = Core::new(transport, SystemClock::new());
         // Nothing is allowed unless named: --allow-serial, the allow file, or --allow-emulators
         // (allowed() matches a hardware serial or an adb serial exactly, or the `adb-<serial>-` prefix of a wireless name; an emulator is `emulator-<port>`).
         let allow = bridged::allow::load(
@@ -616,7 +626,9 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
                 args.protected_ask_window_min
                     .unwrap_or(agentroid_core::protected::DEFAULT_ASK_WINDOW_MIN),
                 presence,
-            );
+            )
+            // a Deny's hold outlives a restart
+            .with_holds_file(args.state_dir.join(PROTECTED_HOLDS_FILE));
             log(
                 &args.state_dir,
                 &format!(
