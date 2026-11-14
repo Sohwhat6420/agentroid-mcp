@@ -33,17 +33,26 @@ final class ClockRender {
     /**
      * Segments drawn left to right on one baseline, segment i in colour i, gapEm apart. With shadow, a soft dark
      * shadow keeps white type legible on a light wallpaper (the clock has no surface of its own).
+     *
+     * strokeEm above 0 grows every dot by that much (an outline of that width around each one). At 0.02 em the dots
+     * of a line nearly touch, which is how the hello clock's time looks in the original widget (measured side by side,
+     * 14 Nov 2026: its dots are about 3 px wider at the same dot pitch).
      */
-    static Bitmap line(Context c, float sp, String[] text, int[] colour, float gapEm, boolean shadow) {
+    static Bitmap line(Context c, float sp, String[] text, int[] colour, float gapEm, boolean shadow, float strokeEm) {
         float px = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, sp, c.getResources().getDisplayMetrics());
         float dp = c.getResources().getDisplayMetrics().density;
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setTypeface(face(c));
         p.setTextSize(px);
         float pad = 0;
+        if (strokeEm > 0) {
+            p.setStyle(Paint.Style.FILL_AND_STROKE);
+            p.setStrokeWidth(strokeEm * px);
+            pad = strokeEm * px / 2;
+        }
         if (shadow) {
-            pad = 3 * dp;
-            p.setShadowLayer(pad, 0, 0, 0x59000000);
+            pad += 3 * dp;
+            p.setShadowLayer(3 * dp, 0, 0, 0x59000000);
         }
         float gap = gapEm * px, w = 0;
         float[] widths = new float[text.length];
@@ -66,6 +75,10 @@ final class ClockRender {
     }
 
     static Bitmap line(Context c, float sp, String text, int colour, boolean shadow) {
-        return line(c, sp, new String[] {text}, new int[] {colour}, 0, shadow);
+        return line(c, sp, new String[] {text}, new int[] {colour}, 0, shadow, 0);
+    }
+
+    static Bitmap line(Context c, float sp, String[] text, int[] colour, float gapEm, boolean shadow) {
+        return line(c, sp, text, colour, gapEm, shadow, 0);
     }
 }

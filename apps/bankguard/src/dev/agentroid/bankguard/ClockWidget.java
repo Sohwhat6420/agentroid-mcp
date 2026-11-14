@@ -93,7 +93,9 @@ public abstract class ClockWidget extends AppWidgetProvider {
             String t = time(d, h24);
             rv.setImageViewBitmap(R.id.w_greeting,
                     ClockRender.line(c, 22, c.getString(R.string.clock_greeting_text), INK, true));
-            rv.setImageViewBitmap(R.id.w_time, ClockRender.line(c, 56, t, INK, true));
+            // Heavier dots on the time only: in the original, its dots nearly touch (side by side, 14 Nov 2026).
+            rv.setImageViewBitmap(R.id.w_time, ClockRender.line(c, 56, new String[] {t}, new int[] {INK}, 0, true,
+                    0.02f));
             rv.setImageViewBitmap(R.id.w_date, ClockRender.line(c, 22, caps(fmt("EEE, d MMM", d)), INK, true));
             rv.setContentDescription(R.id.w_time, t);
             rv.setContentDescription(R.id.w_date, fmt("EEEE d MMMM", d));
