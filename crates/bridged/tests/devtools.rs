@@ -377,7 +377,7 @@ fn s24_answers_only_serial_and_the_approved_probes_through_diagnose() {
         for cmd in [
             "getprop ro.product.manufacturer",
             "getprop ro.serial",
-            "dumpsys power",
+            "dumpsys window",
             "dumpsys battery set level 5",
             "settings get system a",
             "pm list packages",

@@ -7,7 +7,7 @@
 //! * `dumpsys <service>` takes no further argument; `wm size` and `wm density` take none.
 //!   `dumpsys battery set|reset|unplug` and `dumpsys deviceidle force-idle|unforce|step` are named
 //!   R2; anything else that is not on the list is R2 by default in Phase 2 and refused.
-//! * The protected phone (deny-by-default) answers only the 10 commands of `S24_READS` (`getprop ro.serialno`
+//! * The protected phone (deny-by-default) answers only the 11 commands of `S24_READS` (`getprop ro.serialno`
 //!   and the 2.16 probe subset), each matched as an exact string.
 //! * Pure functions here; the daemon arm is in `devtools.rs`.
 
@@ -410,7 +410,7 @@ mod tests {
         for s in [
             "getprop ro.product.manufacturer",
             "getprop ro.serial",
-            "dumpsys power",
+            "dumpsys window",
             "settings get system a",
             "pm list packages",
             "ime list -s",

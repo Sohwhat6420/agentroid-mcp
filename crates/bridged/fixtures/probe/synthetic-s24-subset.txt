@@ -1,4 +1,4 @@
-# SYNTHETIC: the answers to the 10 approved S24 commands, in the real formats. Not captured from the protected phone.
+# SYNTHETIC: the answers to the 11 approved S24 commands, in the real formats. Not captured from the protected phone.
 ### getprop ro.serialno
 PLACEHOLDER-S24-SERIAL
 ### getprop ro.build.version.sdk
@@ -23,3 +23,9 @@ Current Battery Service state:
 ### dumpsys thermalservice
 IsStatusOverride: false
 Thermal Status: 0
+### dumpsys power
+POWER MANAGER (dumpsys power)
+
+Power Manager State:
+  mWakefulness=Awake
+  mLastUserActivityTime=1000000 (5000 ms ago)
