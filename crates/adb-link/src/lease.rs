@@ -217,6 +217,28 @@ impl LeaseBook {
         std::mem::take(&mut *self.ended.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Put closes that could not be written back at the front of the queue, oldest first, ahead
+    /// of any that ended meanwhile (core writes them on its next try). None is dropped: while one
+    /// waits, core opens no lease, so the queue cannot grow without bound.
+    pub fn requeue_ended(&self, unwritten: Vec<(Lease, &'static str)>) {
+        if unwritten.is_empty() {
+            return;
+        }
+        let mut e = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        let later = std::mem::take(&mut *e);
+        e.extend(unwritten);
+        e.extend(later);
+    }
+
+    /// Is a close waiting to be written to the audit log?
+    pub fn has_ended(&self) -> bool {
+        !self
+            .ended
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     /// Name the job now running under the daemon lease of `epoch` (`None`: it ended) on the open
     /// lease, when that lease is the epoch's.
     pub fn set_job(&self, epoch: u64, job: Option<String>) {
@@ -296,6 +318,38 @@ mod tests {
         );
         assert_eq!(ended[0].1, "expired");
         assert!(book.take_ended().is_empty());
+    }
+
+    /// Review round 3, item 10: closes that could not be written go back in front, in order, and
+    /// none is dropped.
+    #[test]
+    fn unwritten_closes_go_back_in_front_of_later_ones() {
+        let clock = Arc::new(ManualClock::new(T0));
+        let book = LeaseBook::new(clock.clone());
+        assert!(!book.has_ended());
+        book.requeue_ended(vec![]);
+        assert!(!book.has_ended());
+        for e in 1..=2 {
+            book.open(lease(e));
+            book.close_epoch(e, "released");
+        }
+        let first = book.take_ended();
+        assert!(!book.has_ended());
+        book.open(lease(3));
+        book.close_epoch(3, "released");
+        book.requeue_ended(first);
+        assert!(book.has_ended());
+        let all: Vec<u64> = book
+            .take_ended()
+            .iter()
+            .map(|(l, _)| l.holder.epoch)
+            .collect();
+        assert_eq!(all, [1, 2, 3]);
+        let many: Vec<(Lease, &'static str)> = (0..ENDED_KEPT as u64 + 5)
+            .map(|e| (lease(e), "x"))
+            .collect();
+        book.requeue_ended(many);
+        assert_eq!(book.take_ended().len(), ENDED_KEPT + 5);
     }
 
     #[test]

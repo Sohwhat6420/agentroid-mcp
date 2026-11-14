@@ -22,8 +22,9 @@
 //! * [`shellguard`] and [`fileguard`] (D3b): raw shell lines, `push` and `pull` through the same
 //!   deny-by-default rules and the same audit log.
 //! * [`protected`]: the protected-device lease (opt-in): one owner's Allow, or a signed and fresh
-//!   presence file overnight, opens a time-boxed lease on the protected phone; Gmail, WhatsApp,
-//!   the keyguard, notification previews and PIN entry stay off-limits under any lease.
+//!   presence file overnight, opens a time-boxed lease on the protected phone. The gate is the
+//!   owner's approval, not what the screen shows; PIN digits, `unlock` and code pushes stay
+//!   refused under any lease.
 //!
 //! Nothing here starts adb or touches a device; the live transport is a later task.
 

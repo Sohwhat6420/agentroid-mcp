@@ -33,10 +33,6 @@ struct Phone {
     screens: VecDeque<String>,
     calls: Vec<String>,
     tree_fails: bool,
-    /// Heads-up answers served in turn; then `hun`.
-    hun_seq: VecDeque<bool>,
-    hun: bool,
-    hun_fails: bool,
 }
 
 impl Phone {
@@ -136,13 +132,6 @@ impl Transport for Phone {
     }
     fn helper_status(&mut self, _: &str) -> Result<(), String> {
         Ok(())
-    }
-    fn heads_up(&mut self, serial: &str) -> Result<bool, TransportError> {
-        self.calls.push(format!("heads_up {serial}"));
-        if self.hun_fails {
-            return Err(TransportError("no answer".into()));
-        }
-        Ok(self.hun_seq.pop_front().unwrap_or(self.hun))
     }
 }
 
@@ -457,7 +446,12 @@ fn one_allow_opens_a_lease_for_a_burst_and_nothing_is_sent_before_it() {
     let ask = r.sent()[0].clone();
     assert_eq!(ask.style, Style::Lease);
     assert_eq!(ask.expires_ms - ask.created_ms, 10 * MIN, "the ask window");
-    assert!(ask.reason.contains("30-minute lease"), "{}", ask.reason);
+    assert!(
+        ask.reason
+            .contains("asks to take over the protected phone for 30 min"),
+        "{}",
+        ask.reason
+    );
     // the agent sees a short reference, never the id it could answer with
     assert_eq!(reference.len(), 6);
     assert!(!first.to_string().contains(&ask.id));
@@ -542,18 +536,20 @@ fn the_protected_lease_also_satisfies_the_screen_lock_so_nothing_is_allowed_twic
 }
 
 // ---------------------------------------------------------------------------------------------
-// blocker 1: notification previews, keyguard, shade, Recents
+// round 3: the gate is the owner's Allow, never what the screen shows
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn the_keyguard_the_shade_and_recents_refuse_reads_and_acts_under_a_lease() {
-    let mut r = rig("previews");
+fn under_a_lease_no_screen_or_app_is_refused_for_what_it_shows() {
+    let mut r = rig("no-content-rule");
     r.open_lease();
     let before = r.core.transport.sent_to_protected().len();
     for (name, xml) in [
         ("keyguard", keyguard()),
         ("shade", shade()),
         ("recents", recents()),
+        ("gmail go", gmail_go()),
+        ("home", home()),
     ] {
         r.core.transport.show(xml);
         let shots = r.core.transport.shots();
@@ -561,26 +557,20 @@ fn the_keyguard_the_shade_and_recents_refuse_reads_and_acts_under_a_lease() {
             ui_tree(),
             Call::Screenshot { max_width: 720 },
             Call::Look { max_width: 720 },
-            at(100.0, 300.0),
+            at(100.0, 250.0),
             Call::Key {
                 name: "recents".into(),
             },
         ] {
-            assert_eq!(protected_rule(r.call(&c)), "preview", "{name} {c:?}");
+            r.call(&c).unwrap_or_else(|e| panic!("{name} {c:?}: {e:?}"));
         }
-        assert_eq!(r.core.transport.shots(), shots, "{name}: no shot was taken");
-        // the way out still works
-        r.call(&Call::Key {
-            name: "back".into(),
-        })
-        .unwrap();
+        assert_eq!(
+            r.core.transport.shots(),
+            shots + 2,
+            "{name}: both shots taken"
+        );
     }
-    assert_eq!(
-        r.core.transport.sent_to_protected().len(),
-        before + 3,
-        "only the three back keys"
-    );
-    // a status-bar icon naming a protected app is a preview too
+    // a status-bar icon naming a protected app is just a screen
     r.core.transport.show(page(&[n(
         "com.android.systemui",
         "com.android.systemui:id/icon",
@@ -588,120 +578,121 @@ fn the_keyguard_the_shade_and_recents_refuse_reads_and_acts_under_a_lease() {
         "WhatsApp notification: Dinner at 8?",
         "[0,0][40,40]",
     )]));
-    assert_eq!(protected_rule(r.call(&ui_tree())), "preview");
-}
-
-#[test]
-fn a_protected_app_on_screen_or_under_the_finger_is_never_touched() {
-    let mut r = rig("apps");
-    r.open_lease();
-    // the launcher's WhatsApp icon
-    assert_eq!(protected_rule(r.call(&at(100.0, 1100.0))), "app");
-    // Gmail Go on screen: reads refused too
-    r.core.transport.show(gmail_go());
-    assert_eq!(protected_rule(r.call(&ui_tree())), "app");
-    assert_eq!(protected_rule(r.call(&at(100.0, 250.0))), "app");
-    // launches, refused before any ask
+    r.call(&ui_tree()).unwrap();
+    // the launcher's WhatsApp icon, and launches of the apps once refused
     r.core.transport.show(home());
+    r.call(&at(100.0, 1100.0)).unwrap();
     for c in [
         Call::OpenApp {
             package: "whatsapp".into(),
         },
+        Call::OpenApp {
+            package: "gm.lite".into(),
+        },
         Call::OpenUrl {
-            uri: "https://wa.me/15550000".into(),
+            uri: "https://web.whatsapp.com/".into(),
             package: None,
+        },
+        Call::OpenUrl {
+            uri: "https://mail.google.com/mail/u/0/".into(),
+            package: Some("com.android.chrome".into()),
         },
         Call::StartActivity {
             component: "com.google.android.gm.lite/.Inbox".into(),
             action: None,
             data: None,
         },
+        type_text("web.whatsapp.com"),
     ] {
-        assert_eq!(protected_rule(r.call(&c)), "app", "{c:?}");
+        r.call(&c).unwrap_or_else(|e| panic!("{c:?}: {e:?}"));
     }
-    let mut fresh = rig("apps-nolease");
-    assert_eq!(
-        protected_rule(fresh.call(&Call::OpenApp {
-            package: "com.whatsapp".into()
-        })),
-        "app"
-    );
-    assert!(
-        fresh.sent().is_empty(),
-        "no ask for a launch refused anyway"
-    );
+    // a message link is asked about by the usual screen guard, as on any phone, not refused
+    // for the app it names (the rig's channel gives no answer, so the ask ends denied)
+    let e = refused(r.call(&Call::OpenUrl {
+        uri: "https://wa.me/15550000".into(),
+        package: None,
+    }));
+    assert!(matches!(e, Refusal::Screen { .. }), "{e:?}");
+    assert!(r.core.transport.sent_to_protected().len() > before + 5);
+    assert_eq!(r.asks().len(), 1, "the one Allow covered all of it");
 }
 
-// ---------------------------------------------------------------------------------------------
-// blocker 2: settle checks every poll
-// ---------------------------------------------------------------------------------------------
-
 #[test]
-fn settle_checks_the_protected_screen_on_every_poll() {
+fn settle_on_the_protected_phone_is_an_ordinary_settle() {
     let mut r = rig("settle");
     r.open_lease();
-    // the first poll is ordinary, the second shows the shade
     r.core.transport.show(home());
     r.core.transport.then(shade());
-    let e = r
-        .core
-        .settle(Some(PROT), SettleOpts::default())
-        .unwrap_err();
-    assert!(
-        matches!(
-            e,
-            CoreError::Refused(Refusal::Protected {
-                rule: "preview",
-                ..
-            })
-        ),
-        "{e:?}"
-    );
-    // a stable, ordinary screen settles
-    r.core.transport.show(home());
     assert!(r.core.settle(Some(PROT), SettleOpts::default()).is_ok());
-    // the first poll already refused
     r.core.transport.show(keyguard());
-    assert!(r.core.settle(Some(PROT), SettleOpts::default()).is_err());
+    assert!(r.core.settle(Some(PROT), SettleOpts::default()).is_ok());
 }
 
 // ---------------------------------------------------------------------------------------------
-// blocker 3: file paths
+// files: any path under the lease, never code; never raw shell or link segments
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn pulls_and_pushes_naming_a_protected_app_are_refused_in_any_spelling() {
+fn files_go_under_the_lease_but_code_shell_and_link_segments_never_do() {
     let mut r = rig("paths");
+    // code, or anything into /data/local/tmp, is refused before any ask, in any spelling
     for p in [
-        "/sdcard/WhatsApp/Media/a.jpg",
-        "/SDCARD/Android/media/COM.WHATSAPP/a",
-        "/sdcard//Android/data/com.google.android.gm/files/a",
-        "/sdcard/./Download/../Gmail/a",
-        "\\sdcard\\WhatsApp\\a",
+        "/data/local/tmp/agentroid-dump.dex",
+        "/data/local/tmp",
+        "/data/local/tmp/notes.txt",
+        "/DATA/LOCAL/./TMP//notes.txt",
+        "/sdcard/../data/local/tmp/notes.txt",
+        "\\data\\local\\tmp\\notes.txt",
+        "/sdcard/Download/app.APK",
+        "/sdcard/Download/lib.so",
+        "/sdcard/Download/classes.dex",
     ] {
-        for op in [FileOp::Pull, FileOp::Push] {
-            let e = r.core.file_gate(Some(PROT), op, p).unwrap_err();
-            assert!(
-                matches!(
-                    e,
-                    CoreError::Refused(Refusal::Protected { rule: "path", .. })
-                ),
-                "{p}: {e:?}"
-            );
-        }
+        let e = r.core.file_gate(Some(PROT), FileOp::Push, p).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                CoreError::Refused(Refusal::Protected { rule: "code", .. })
+            ),
+            "{p}: {e:?}"
+        );
     }
-    assert!(r.sent().is_empty(), "no ask for a refused path");
-    // an ordinary path asks for the lease, then passes the file guard
+    assert!(r.sent().is_empty(), "no ask for code");
+    // a protected app's folder is an ordinary path now: it asks for the lease, then passes
     assert!(matches!(
         r.core
-            .file_gate(Some(PROT), FileOp::Pull, "/sdcard/DCIM/Camera/a.jpg"),
+            .file_gate(Some(PROT), FileOp::Pull, "/sdcard/WhatsApp/Media/a.jpg"),
         Err(CoreError::Refused(Refusal::LeasePending { .. }))
     ));
     let ask = r.sent()[0].clone();
     r.answer("allow", &ask.id, r.now());
-    r.core
-        .file_gate(Some(PROT), FileOp::Pull, "/sdcard/DCIM/Camera/a.jpg")
-        .unwrap();
+    for (op, p) in [
+        (FileOp::Pull, "/sdcard/WhatsApp/Media/a.jpg"),
+        (FileOp::Pull, "/sdcard/Download/app.apk"),
+        (FileOp::Push, "/sdcard/Download/notes.txt"),
+    ] {
+        r.core
+            .file_gate(Some(PROT), op, p)
+            .unwrap_or_else(|e| panic!("{p}: {e:?}"));
+    }
+    // an app's private folder is asked about by the usual file guard, as on any phone
+    let e = r
+        .core
+        .file_gate(
+            Some(PROT),
+            FileOp::Pull,
+            "/sdcard/Android/media/com.whatsapp/a",
+        )
+        .unwrap_err();
+    assert!(
+        matches!(e, CoreError::Refused(Refusal::Screen { .. })),
+        "{e:?}"
+    );
+    // under the lease too, code never goes
+    assert!(matches!(
+        r.core
+            .file_gate(Some(PROT), FileOp::Push, "/sdcard/Download/app.apk"),
+        Err(CoreError::Refused(Refusal::Protected { rule: "code", .. }))
+    ));
     // raw shell lines never run on it, lease or not
     assert!(matches!(
         r.core.shell_gate(Some(PROT), "dumpsys notification"),
@@ -712,8 +703,8 @@ fn pulls_and_pushes_naming_a_protected_app_are_refused_in_any_spelling() {
         r.core.lock_admit(Some(PROT), "link.segment"),
         Err(CoreError::Refused(Refusal::Protected { rule: "link", .. }))
     ));
+    assert_eq!(r.asks().len(), 1);
 }
-
 // ---------------------------------------------------------------------------------------------
 // blocker 4: holder and job
 // ---------------------------------------------------------------------------------------------
@@ -731,7 +722,7 @@ fn the_lease_and_the_pending_ask_belong_to_one_holder_and_job() {
     ));
     let ask_a = r.sent()[0].clone();
     assert!(
-        ask_a.reason.contains("lane-a, job run-7"),
+        ask_a.reason.contains("Agent session: lane-a, job run-7"),
         "{}",
         ask_a.reason
     );
@@ -1066,46 +1057,6 @@ fn digits_on_a_pin_prompt_are_refused_one_at_a_time() {
 }
 
 #[test]
-fn a_screenshot_is_checked_again_after_it_is_taken() {
-    let mut r = rig("race");
-    r.open_lease();
-    // ordinary before the shot, Gmail Go after it
-    r.core.transport.show(home());
-    r.core.transport.then(gmail_go());
-    let shots = r.core.transport.shots();
-    let e = r
-        .core
-        .call(Some(PROT), &Call::Screenshot { max_width: 720 });
-    assert!(
-        matches!(
-            e,
-            Err(CoreError::Refused(Refusal::Protected { rule: "app", .. }))
-        ),
-        "{e:?}"
-    );
-    assert_eq!(r.core.transport.shots(), shots + 1, "taken, then dropped");
-    // look: the tree read after the shot decides
-    r.core.transport.show(home());
-    r.core.transport.then(shade());
-    let e = r.core.call(Some(PROT), &Call::Look { max_width: 720 });
-    assert!(
-        matches!(e, Err(CoreError::Refused(Refusal::Protected { .. }))),
-        "{e:?}"
-    );
-    // the screen cannot be read again: dropped too
-    r.core.transport.show(home());
-    let ok = r
-        .core
-        .call(Some(PROT), &Call::Screenshot { max_width: 720 });
-    assert!(ok.unwrap().image.is_some());
-    r.core.transport.tree_fails = true;
-    assert!(r
-        .core
-        .call(Some(PROT), &Call::Screenshot { max_width: 720 })
-        .is_err());
-}
-
-#[test]
 fn an_unreadable_clock_or_no_channel_opens_nothing() {
     let mut r = rig("clock");
     r.wall.set(None);
@@ -1210,141 +1161,6 @@ fn with_lock(r: &mut Rig, busy: Arc<Mutex<bool>>) -> PathBuf {
     lock_dir
 }
 
-// item 1: the protected apps' web hosts, past notifications, and mentions outside the launcher
-
-#[test]
-fn the_protected_apps_web_hosts_are_refused_in_open_url_and_type_text() {
-    let mut r = rig("hosts");
-    for uri in [
-        "https://mail.google.com/mail/u/0/",
-        "https://INBOX.google.com",
-        "https://www.gmail.com/",
-        "https://web.whatsapp.com/",
-        "https://wa.me/15550000",
-        "https://www.whatsapp.com/download",
-    ] {
-        for package in [None, Some("com.android.chrome".to_string())] {
-            let c = Call::OpenUrl {
-                uri: uri.into(),
-                package,
-            };
-            assert_eq!(protected_rule(r.call(&c)), "app", "{c:?}");
-        }
-    }
-    // typed into an address bar, the same hosts would open the same pages
-    for text in [
-        "mail.google.com",
-        "go to WEB.WHATSAPP.COM",
-        "wa.me/15550000",
-        "https://inbox.google.com",
-    ] {
-        assert_eq!(protected_rule(r.call(&type_text(text))), "app", "{text}");
-    }
-    assert!(r.sent().is_empty(), "refused before any ask");
-    // ordinary pages and text still ask for (and then get) the lease
-    r.open_lease();
-    r.call(&Call::OpenUrl {
-        uri: "https://example.com/".into(),
-        package: Some("com.android.chrome".into()),
-    })
-    .unwrap();
-    r.call(&type_text("weather tomorrow")).unwrap();
-}
-
-#[test]
-fn notification_history_and_listener_screens_refuse_reads_and_acts() {
-    let mut r = rig("notif-log");
-    r.open_lease();
-    for (name, xml) in [
-        (
-            "history list",
-            page(&[n(
-                "com.android.settings",
-                "com.android.settings:id/notification_history_list",
-                "",
-                "",
-                "[0,200][1080,2000]",
-            )]),
-        ),
-        (
-            "history title",
-            page(&[n(
-                "com.android.settings",
-                "com.android.settings:id/collapsing_toolbar",
-                "Notification history",
-                "",
-                "[0,100][1080,200]",
-            )]),
-        ),
-        (
-            "listener access",
-            page(&[n(
-                "com.android.settings",
-                "com.android.settings:id/action_bar",
-                "Device & app notifications",
-                "",
-                "[0,100][1080,200]",
-            )]),
-        ),
-        (
-            "notification log",
-            page(&[n(
-                "com.example.notilog",
-                "com.example.notilog:id/notification_log_row",
-                "Dinner at 8?",
-                "",
-                "[0,200][1080,300]",
-            )]),
-        ),
-    ] {
-        r.core.transport.show(xml);
-        for c in [
-            ui_tree(),
-            Call::Screenshot { max_width: 720 },
-            at(100.0, 250.0),
-        ] {
-            assert_eq!(protected_rule(r.call(&c)), "preview", "{name}: {c:?}");
-        }
-    }
-    // a Settings row titled like it is no title bar: the notifications settings list stays readable
-    r.core.transport.show(page(&[n(
-        "com.android.settings",
-        "android:id/title",
-        "Notification history",
-        "",
-        "[0,200][1080,300]",
-    )]));
-    r.call(&ui_tree()).unwrap();
-}
-
-#[test]
-fn a_node_outside_the_launcher_naming_a_protected_app_refuses_reads() {
-    let mut r = rig("mention");
-    r.open_lease();
-    // the launcher's icon is the one exception
-    r.core.transport.show(home());
-    r.call(&ui_tree()).unwrap();
-    for (pkg, text, desc) in [
-        ("com.android.settings", "WhatsApp", ""),
-        ("com.android.chrome", "WhatsApp Web", ""),
-        (
-            "com.android.chrome",
-            "",
-            "Inbox (3) - someone@gmail.com - Gmail",
-        ),
-        ("com.example.share", "Share to WhatsApp", ""),
-    ] {
-        r.core
-            .transport
-            .show(page(&[n(pkg, "", text, desc, "[0,200][1080,300]")]));
-        assert_eq!(
-            protected_rule(r.call(&ui_tree())),
-            "preview",
-            "{pkg} {text} {desc}"
-        );
-    }
-}
-
 // item 2: a Deny of the open lease survives another ask, and the Allow is followed by a notice
 
 #[test]
@@ -1388,7 +1204,7 @@ fn an_allow_is_followed_by_one_quiet_notice_whose_deny_ends_the_lease() {
     assert_eq!(notice.id, ask.id);
     // T0 is 2027-01-15T08:00:00Z; the lease is 30 minutes
     assert!(
-        notice.reason.contains("open until 08:30 UTC (30 min)"),
+        notice.reason.contains("open until 16:30 SGT (30 min)"),
         "{}",
         notice.reason
     );
@@ -1473,7 +1289,8 @@ fn a_deny_is_kept_in_the_holds_file_and_holds_after_a_restart() {
         let path = r.dir.join("protected-holds.json");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["version"], 1);
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["hold"]["reallow"], true);
         assert_eq!(v["hold"]["request_id"], ask.id.as_str());
         assert_eq!(v["hold"]["until"], "window");
         assert_eq!(v["hold"]["holder"]["epoch"], 1);
@@ -1541,7 +1358,7 @@ fn a_corrupt_or_unreadable_holds_file_holds_until_a_trusted_presence_change() {
         let path = dir.join("protected-holds.json");
         match broken {
             "junk" => std::fs::write(&path, "{\"version\":1,\"hold\":{\"request_id\"").unwrap(),
-            "other version" => std::fs::write(&path, "{\"version\":2,\"hold\":null}").unwrap(),
+            "other version" => std::fs::write(&path, "{\"version\":3,\"hold\":null}").unwrap(),
             _ => std::fs::create_dir_all(&path).unwrap(),
         }
         let mut r = rig_in(dir);
@@ -1625,45 +1442,61 @@ fn an_ask_that_ends_unanswered_cools_down_for_the_ask_window() {
     assert_eq!(r.asks().len(), 2);
 }
 
-// item 6: the resolved package
+// round 3, item 6: screen dumps per call
 
-#[test]
-fn open_app_is_judged_on_the_package_it_resolves_to() {
-    let mut r = rig("resolve");
-    r.open_lease();
-    let before = r.core.transport.sent_to_protected().len();
-    for name in ["atsap", "WhatsApp", "gm.lite"] {
-        let e = r.call(&Call::OpenApp {
-            package: name.into(),
-        });
-        assert_eq!(protected_rule(e), "app", "{name}");
-    }
-    assert_eq!(r.core.transport.sent_to_protected().len(), before);
-    r.call(&Call::OpenApp {
-        package: "settings".into(),
-    })
-    .unwrap();
+/// The protected phone's screen dumps that `c` cost.
+fn dumps_of(r: &mut Rig, c: &Call) -> usize {
+    let d = r.core.transport.dumps();
+    r.call(c).unwrap_or_else(|e| panic!("{c:?}: {e:?}"));
+    r.core.transport.dumps() - d
 }
 
-// item 7: one dump per tap and per ui_tree
-
 #[test]
-fn a_tap_and_a_ui_tree_dump_the_protected_screen_once() {
+fn each_call_reads_the_protected_screen_at_most_once() {
+    use agentroid_core::selector::Selector;
     let mut r = rig("dumps");
     r.open_lease();
-    let d = r.core.transport.dumps();
-    r.call(&at(100.0, 300.0)).unwrap();
-    assert_eq!(r.core.transport.dumps() - d, 1, "tap");
-    let d = r.core.transport.dumps();
-    r.call(&ui_tree()).unwrap();
-    assert_eq!(r.core.transport.dumps() - d, 1, "ui_tree");
-    // a screenshot still reads once more after the shot
-    let d = r.core.transport.dumps();
-    r.call(&Call::Screenshot { max_width: 720 }).unwrap();
-    assert_eq!(r.core.transport.dumps() - d, 2, "screenshot");
-    let d = r.core.transport.dumps();
-    r.call(&Call::Look { max_width: 720 }).unwrap();
-    assert_eq!(r.core.transport.dumps() - d, 2, "look");
+    let screenshot = Call::Screenshot { max_width: 720 };
+    let look = Call::Look { max_width: 720 };
+    let require = Call::UiTree {
+        interactive_only: false,
+        require: vec![Selector::text("Settings")],
+        timeout_ms: None,
+    };
+    let by_index = Call::TypeText {
+        text: "hello".into(),
+        index: Some(0),
+        submit: false,
+    };
+    // after an act: a tap reads once (the PIN check, then shared with the screen guard)
+    assert_eq!(dumps_of(&mut r, &at(100.0, 300.0)), 1, "tap after a tap");
+    assert_eq!(dumps_of(&mut r, &ui_tree()), 1, "ui_tree");
+    assert_eq!(dumps_of(&mut r, &require), 1, "ui_tree with require (met)");
+    assert_eq!(dumps_of(&mut r, &screenshot), 0, "screenshot");
+    assert_eq!(dumps_of(&mut r, &look), 1, "look");
+    assert_eq!(
+        dumps_of(&mut r, &at(100.0, 300.0)),
+        0,
+        "tap on a fresh, clean tree"
+    );
+    assert_eq!(
+        dumps_of(&mut r, &by_index),
+        1,
+        "type_text by index after a tap"
+    );
+    for c in [
+        Call::Key {
+            name: "back".into(),
+        },
+        Call::Scroll {
+            direction: "down".into(),
+        },
+        Call::OpenApp {
+            package: "settings".into(),
+        },
+    ] {
+        assert_eq!(dumps_of(&mut r, &c), 0, "{c:?}");
+    }
 }
 
 // item 9: the audit log, the re-allow, read_only
@@ -1819,43 +1652,146 @@ fn read_only_reads_on_the_protected_phone_ask_nothing() {
     assert_eq!(r.core.transport.dumps(), 0);
 }
 
-// item 10: heads-up notifications
+// ---------------------------------------------------------------------------------------------
+// round 3 of the review
+// ---------------------------------------------------------------------------------------------
+
+// item 8: the Deny events seen are kept across a restart
 
 #[test]
-fn no_image_is_taken_or_kept_while_a_heads_up_is_showing() {
-    let mut r = rig("heads-up");
-    r.open_lease();
-    for c in [
-        Call::Screenshot { max_width: 720 },
-        Call::Look { max_width: 720 },
-    ] {
-        // showing throughout: waited for twice, then refused, and no shot taken
-        r.core.transport.hun = true;
-        let shots = r.core.transport.shots();
-        let asked = |p: &Phone| p.calls.iter().filter(|x| x.starts_with("heads_up")).count();
-        let before = asked(&r.core.transport);
-        assert_eq!(protected_rule(r.call(&c)), "preview", "{c:?}");
-        assert_eq!(r.core.transport.shots(), shots, "{c:?}");
-        assert_eq!(asked(&r.core.transport) - before, 3, "{c:?}: 1 + 2 retries");
-        // gone after one wait: the shot is taken
-        r.core.transport.hun = false;
-        r.core.transport.hun_seq = VecDeque::from([true]);
-        r.call(&c).expect("the heads-up went");
-        assert_eq!(r.core.transport.shots(), shots + 1, "{c:?}");
-        // one that comes up during the shot: dropped
-        r.core.transport.hun_seq = VecDeque::from([false, true]);
-        assert_eq!(protected_rule(r.call(&c)), "preview", "{c:?}");
-        assert_eq!(r.core.transport.shots(), shots + 2, "{c:?}");
-        // a check that cannot be made refuses
-        r.core.transport.hun_fails = true;
-        assert_eq!(protected_rule(r.call(&c)), "screen", "{c:?}");
-        r.core.transport.hun_fails = false;
+fn a_re_allow_after_a_restart_is_not_closed_again_by_the_old_deny() {
+    let mut r = rig("seen-restart");
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0)).unwrap();
+    let notice = r.sent()[0].clone();
+    r.answer("deny", &notice.id, r.now() + 1_000);
+    r.wall.advance(10_000);
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(r.dir.join("protected-holds.json")).unwrap())
+            .unwrap();
+    assert_eq!(v["version"], 2);
+    assert_eq!(v["hold"]["reallow"], true);
+    assert_eq!(v["seen_denies"], serde_json::json!(["ev1"]));
+    // a restart: the channel still carries the old Deny
+    let mut again = rig_in(r.dir.clone());
+    {
+        let old = r.inbox.lock().unwrap();
+        let mut new = again.inbox.lock().unwrap();
+        new.events = old.events.clone();
+        new.next_event = old.next_event;
     }
-    // the POCO is not asked
-    r.core.set_allow(&[agentroid_core::transport::POCO_SERIAL]);
-    r.core.transport.hun = true;
-    r.core
-        .call(Some(POCO), &Call::Screenshot { max_width: 720 })
-        .unwrap();
-    assert!(!r.core.transport.calls.contains(&format!("heads_up {POCO}")));
+    again.wall.set(Some(T0 + 20_000));
+    again.presence("asleep", again.now());
+    again.answer("allow", &notice.id, again.now());
+    again
+        .call(&at(100.0, 300.0))
+        .expect("re-allowed after the restart");
+    assert!(matches!(
+        again.book.active().unwrap().granted,
+        Granted::Approved { .. }
+    ));
+    for _ in 0..3 {
+        again.wall.advance(11_000);
+        again
+            .call(&at(100.0, 300.0))
+            .expect("the Deny seen before the restart does not close the re-allowed lease");
+    }
+    // a new Deny still does
+    again.answer("deny", &notice.id, again.now());
+    again.wall.advance(11_000);
+    assert!(again.call(&at(100.0, 300.0)).is_err());
+    assert!(again.book.active().is_none());
+    drop(again);
+}
+
+// item 9: a lease ask is strict about the end of its window
+
+#[test]
+fn an_allow_dated_after_the_ask_window_opens_nothing_and_an_unanswered_ask_is_never_re_allowed() {
+    let mut r = rig("late-allow");
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let ask = r.asks()[0].clone();
+    // seen while the ask is still open, but dated 30 s after its window (a phone clock ahead)
+    r.wall.advance(5 * MIN);
+    r.answer("allow", &ask.id, ask.expires_ms + 30_000);
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+    assert!(r.book.active().is_none());
+    // the window closes unanswered: held, and an Allow now (fresh, dated now) re-allows nothing
+    r.wall.advance(5 * MIN);
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    r.wall.advance(MIN);
+    r.answer("allow", &ask.id, r.now());
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("held"), "{e}");
+    assert!(r.book.active().is_none());
+    // an Allow dated at the window's very end counts
+    let mut q = rig("late-allow-edge");
+    q.call(&at(100.0, 300.0)).unwrap_err();
+    let ask = q.asks()[0].clone();
+    q.wall.advance(5 * MIN);
+    q.answer("allow", &ask.id, ask.expires_ms);
+    q.call(&at(100.0, 300.0))
+        .expect("an Allow dated inside the window opens the lease");
+}
+
+// item 10: a close is never dropped
+
+#[test]
+fn a_close_that_cannot_be_logged_stays_queued_and_refuses_until_it_is_written() {
+    let mut r = rig("close-queue");
+    let log = r.audit();
+    r.open_lease();
+    let head = agentroid_core::audit::head_path(&log);
+    std::fs::remove_file(&head).unwrap();
+    std::fs::create_dir_all(&head).unwrap();
+    // released by its holder while the log cannot be written
+    assert!(r.core.protected_mut().unwrap().close_epoch(1).is_some());
+    r.core.protected_audit_closes("lease.release");
+    assert!(r.book.has_ended(), "kept for the next write");
+    let reached = r.core.transport.sent_to_protected().len();
+    for _ in 0..2 {
+        assert!(matches!(
+            refused(r.call(&at(100.0, 300.0))),
+            Refusal::Audit { .. }
+        ));
+        assert!(r.book.has_ended());
+    }
+    assert_eq!(r.core.transport.sent_to_protected().len(), reached);
+    // the log can be written again: the close goes in, and calls are judged as usual
+    std::fs::remove_dir_all(&head).unwrap();
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(!matches!(e, Refusal::Audit { .. }), "{e:?}");
+    assert!(!r.book.has_ended());
+    assert!(
+        audit_rules(&log)
+            .iter()
+            .any(|(rule, why)| rule == "lease:closed" && why.ends_with("closed: released")),
+        "{:?}",
+        audit_rules(&log)
+    );
+}
+
+// item 13: the holder in the push
+
+#[test]
+fn the_ask_names_the_holder_briefly_and_with_no_link() {
+    let mut r = rig("push-holder");
+    *r.holder.lock().unwrap() = Some(Holder {
+        name: "tap https://intranet\nnow please, this is a long name".into(),
+        epoch: 1,
+    });
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let ask = r.asks()[0].clone();
+    assert!(
+        ask.reason
+            .starts_with("Agent session: tap now please, this is asks to take over"),
+        "{}",
+        ask.reason
+    );
+    assert!(!ask.reason.contains("://"), "{}", ask.reason);
+    assert!(!ask.reason.contains('\n'), "{}", ask.reason);
 }

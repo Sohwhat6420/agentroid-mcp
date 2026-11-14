@@ -332,9 +332,10 @@ impl Approver {
     /// Has a fresh, exact `deny <req.id>` arrived since the ask was made (even after it was
     /// approved, or long after its window)? The open lease behind `req` ends on one. Each Deny
     /// counts once (its event id is remembered), so a lease re-allowed after a Deny is not closed
-    /// again by the same Deny. `Err`: the channel could not be read, which the caller must not take
-    /// for "no deny".
-    pub fn poll_deny(&mut self, req: &Request) -> Result<bool, String> {
+    /// again by the same Deny. `Ok(Some(event id))` on one, so the caller can keep it across a
+    /// restart ([`Approver::mark_seen`]). `Err`: the channel could not be read, which the caller
+    /// must not take for "no deny".
+    pub fn poll_deny(&mut self, req: &Request) -> Result<Option<String>, String> {
         let events = self.channel.poll(req)?;
         for ev in &events {
             if ev.event_id.is_empty()
@@ -347,10 +348,20 @@ impl Approver {
                 && parse_answer(&ev.message) == Some((Answer::Deny, req.id.clone()))
             {
                 remember(&mut self.seen_events, &mut self.seen_set, &ev.event_id);
-                return Ok(true);
+                return Ok(Some(ev.event_id.clone()));
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Mark answer events as used already (the protected-device lease's Deny events, kept in its
+    /// holds file): after a restart an old Deny never counts again.
+    pub fn mark_seen(&mut self, event_ids: &[String]) {
+        for id in event_ids {
+            if !id.is_empty() && id.len() <= 64 {
+                remember(&mut self.seen_events, &mut self.seen_set, id);
+            }
+        }
     }
 
     /// The explicit re-allow after a Deny: a fresh `allow <req.id>` (an event id never applied
@@ -389,9 +400,15 @@ impl Approver {
         if id != req.id || self.resolved_set.contains(&id) {
             return None;
         }
-        // a replay from before the ask, or an event dated after the window: not an answer
-        if ev.time_ms + MAX_EARLY_MS < req.created_ms || ev.time_ms > req.expires_ms + MAX_EARLY_MS
-        {
+        // a replay from before the ask, or an event dated after the window: not an answer. A
+        // protected-device lease ask is strict about its end (review round 3, item 9): an Allow
+        // dated after its window never opens the phone, whatever the clocks say
+        let late_ms = if req.style == Style::Lease {
+            0
+        } else {
+            MAX_EARLY_MS
+        };
+        if ev.time_ms + MAX_EARLY_MS < req.created_ms || ev.time_ms > req.expires_ms + late_ms {
             return None;
         }
         // only the event that answers this request is used up: any other (a Deny of an open
@@ -1487,7 +1504,7 @@ mod tests {
             }
             assert_eq!(
                 a.poll_deny(&lease),
-                Ok(true),
+                Ok(Some("e2".to_string())),
                 "concurrent ask: {concurrent}"
             );
         }
@@ -1552,7 +1569,7 @@ mod tests {
             a.check(&r, t0 + 6),
             Some(Outcome::Approved { .. })
         ));
-        assert_eq!(a.poll_deny(&r), Ok(false));
+        assert_eq!(a.poll_deny(&r), Ok(None));
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(
             a.poll_deny(&r).is_err(),
@@ -1562,8 +1579,19 @@ mod tests {
         ch.lock()
             .unwrap()
             .push(ev("e2", t0 + 50, format!("deny {}", r.id)));
-        assert_eq!(a.poll_deny(&r), Ok(true));
-        assert_eq!(a.poll_deny(&r), Ok(false), "a Deny counts once");
+        assert_eq!(a.poll_deny(&r), Ok(Some("e2".to_string())));
+        assert_eq!(a.poll_deny(&r), Ok(None), "a Deny counts once");
+        // review round 3, item 8: a Deny kept across a restart counts as used in a new approver
+        let mut b = Approver::new(Box::new(Shared(ch.clone(), fail.clone())));
+        b.mark_seen(&[String::new(), "x".repeat(65)]);
+        assert_eq!(
+            b.poll_deny(&r),
+            Ok(Some("e2".to_string())),
+            "not marked yet"
+        );
+        let mut b = Approver::new(Box::new(Shared(ch.clone(), fail.clone())));
+        b.mark_seen(&["e2".to_string()]);
+        assert_eq!(b.poll_deny(&r), Ok(None), "the old Deny was kept");
         // re-allow: only a fresh allow dated after the deny
         assert_eq!(
             a.reallowed(&r, t0 + 50, u64::MAX),
@@ -1953,5 +1981,40 @@ mod tests {
         })]);
         assert!(none.send(&r).is_err());
         assert!(AnyChannel::new(vec![]).send(&r).is_err());
+    }
+
+    /// Review round 3, item 9: a protected-device lease ask takes no Allow dated after its window,
+    /// even one seen while the window is still open by the daemon's clock; other asks keep the
+    /// one-minute allowance for a phone's clock running ahead.
+    #[test]
+    fn a_lease_ask_takes_no_allow_dated_after_its_window() {
+        for (style, late, want) in [
+            (Style::Lease, 0, true),
+            (Style::Lease, 1, false),
+            (Style::Lease, MAX_EARLY_MS, false),
+            (Style::Action, 1, true),
+            (Style::Action, MAX_EARLY_MS, true),
+            (Style::Action, MAX_EARLY_MS + 1, false),
+        ] {
+            let mut a = Approver::new(Box::new(FakeChannel {
+                answer_with: Some(Box::new(move |r: &Request, _| {
+                    vec![Inbound {
+                        event_id: "e1".into(),
+                        time_ms: r.expires_ms + late,
+                        message: format!("allow {}", r.id),
+                    }]
+                })),
+                ..FakeChannel::default()
+            }));
+            let t0 = 1_700_000_000_000u64;
+            let mut r = req(&mut a, t0);
+            r.style = style;
+            let got = a.check(&r, t0 + 1);
+            assert_eq!(
+                matches!(got, Some(Outcome::Approved { .. })),
+                want,
+                "{style:?} +{late}: {got:?}"
+            );
+        }
     }
 }

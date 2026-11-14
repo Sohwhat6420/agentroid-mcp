@@ -56,26 +56,60 @@ pub struct AdbTransport<R: Runner> {
     idle_fallback: bool,
     /// adb serial -> what this transport's own replies said about the phone (the `health_hint` source).
     seen: HashMap<String, Seen>,
-    /// The protected phone's heads-up check runs through this runner alone
-    /// ([`GuardedRunner::with_s24_heads_up`](agentroid_adb_link::guard::GuardedRunner::with_s24_heads_up)).
-    /// `None`: not wired, so the check cannot be made and the protected phone takes no screenshot.
-    heads_up: Option<Box<dyn Runner + Send>>,
+    /// The dump helper's own runner and staged copy
+    /// ([`GuardedRunner::with_s24_helper`](agentroid_adb_link::guard::GuardedRunner::with_s24_helper)):
+    /// the protected phone's helper is checked and put there through it alone. `None`: not wired,
+    /// so the helper is never run on the protected phone.
+    helper: Option<DumpHelper>,
+    /// Protected phone adb serial -> when its helper last matched the daemon's copy by hash.
+    helper_checked: HashMap<String, Instant>,
 }
 
-/// The heads-up check's answer: `Some(true)` for `agentroid-hun: yes`, `Some(false)` for `no`,
-/// `None` for anything else (`unknown`, an error, no helper on the phone). Nothing else of the
-/// output is kept.
-pub fn parse_heads_up(stdout: &str) -> Option<bool> {
-    let mut answer = None;
-    for l in stdout.lines() {
-        match l.trim() {
-            "agentroid-hun: yes" => answer = Some(true),
-            "agentroid-hun: no" if answer.is_none() => answer = Some(false),
-            _ => {}
-        }
-    }
-    answer
+/// See [`AdbTransport::with_dump_helper`].
+struct DumpHelper {
+    runner: Box<dyn Runner + Send>,
+    staged: std::path::PathBuf,
 }
+
+/// How long a helper hash check on the protected phone holds: the helper is checked again at each
+/// process start and after this long.
+pub const HELPER_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The embedded helper's sha256 (hex), as `sha256sum` prints it.
+fn embedded_helper_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let mut s = crate::sha256::Sha256::new();
+        s.update(IDLE_FREE_DEX);
+        s.finish_hex()
+    })
+}
+
+/// The hash `sha256sum` printed for the helper: the first word of the first line when it is 64
+/// lower-case hex digits and names the helper's path, else `None` (no file, an error, anything else).
+pub fn parse_helper_hash(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next()?.trim();
+    let mut w = line.split_whitespace();
+    let (h, path) = (w.next()?, w.next()?);
+    let hex = h.len() == 64
+        && h.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (hex && path == IDLE_FREE_REMOTE && w.next().is_none()).then(|| h.to_string())
+}
+
+/// Write the helper to `path` unless it already holds exactly those bytes (tmp, then rename).
+fn stage_helper(path: &Path) -> Result<(), TransportError> {
+    if std::fs::read(path).ok().as_deref() == Some(IDLE_FREE_DEX) {
+        return Ok(());
+    }
+    let tmp = path.with_extension("dex.tmp");
+    std::fs::write(&tmp, IDLE_FREE_DEX)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| TransportError(format!("could not stage the fallback reader: {e}")))
+}
+
+/// One staging at a time in this process (two transports never write the staged copy together).
+static STAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What the replies served so far said about one phone, each with when it was read (field notes,
 /// 11 Nov 2026: the POCO's header showed battery, power and temperature as unknown on every call, and
@@ -195,22 +229,111 @@ impl<R: Runner> AdbTransport<R> {
             dex_on: HashSet::new(),
             idle_fallback: !off,
             seen: HashMap::new(),
-            heads_up: None,
+            helper: None,
+            helper_checked: HashMap::new(),
         }
     }
 
-    /// Wire the protected phone's heads-up check: `runner` is the one runner that may send
-    /// [`S24_HEADS_UP_READ`](agentroid_adb_link::guard::S24_HEADS_UP_READ) (built with
-    /// `GuardedRunner::with_s24_heads_up`).
-    pub fn with_heads_up_runner(mut self, runner: Box<dyn Runner + Send>) -> Self {
-        self.heads_up = Some(runner);
+    /// Wire the dump helper's integrity: `staged` is the daemon's own copy (in its state
+    /// directory), and `runner` the one runner that may check the helper on the protected phone and
+    /// push `staged` there (built with `GuardedRunner::with_s24_helper` for the same path). Other
+    /// phones get `staged` through the main runner.
+    pub fn with_dump_helper(
+        mut self,
+        runner: Box<dyn Runner + Send>,
+        staged: std::path::PathBuf,
+    ) -> Self {
+        self.helper = Some(DumpHelper { runner, staged });
         self
     }
 
-    /// Put the dump helper on the phone once per process (the fallback read and the heads-up
-    /// check both run it).
+    /// Is `serial` the protected phone (by its hardware serial, or by its name)?
+    fn is_protected_serial(&mut self, serial: &str) -> bool {
+        agentroid_core::gate::is_s24(serial)
+            || agentroid_core::gate::is_s24(&self.hardware_serial(serial))
+    }
+
+    /// The helper's hash on the protected phone, read through the helper's own runner.
+    fn helper_hash(&self, serial: &str) -> Result<Option<String>, TransportError> {
+        let h = self.helper.as_ref().ok_or_else(no_helper)?;
+        let argv: Vec<String> = [
+            "-s",
+            serial,
+            "shell",
+            agentroid_adb_link::guard::DUMP_HELPER_HASH_READ,
+        ]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+        let out = h.runner.run(&argv, PROBE_MS).map_err(run_err)?;
+        if let Some(why) = adb_level_failure(&out) {
+            return Err(TransportError(why));
+        }
+        Ok(parse_helper_hash(&out.stdout))
+    }
+
+    /// Review round 3, item 2: run the helper on the protected phone only while it matches the
+    /// daemon's copy. One hash read per process start and per [`HELPER_RECHECK`]; a mismatch (or no
+    /// file) pushes the staged copy through the helper's runner and reads again; a second mismatch
+    /// refuses.
+    fn ensure_dex_protected(&mut self, serial: &str) -> Result<(), TransportError> {
+        if self
+            .helper_checked
+            .get(serial)
+            .is_some_and(|t| t.elapsed() < HELPER_RECHECK)
+        {
+            return Ok(());
+        }
+        let want = embedded_helper_hash();
+        if self.helper_hash(serial)?.as_deref() == Some(want) {
+            self.helper_checked
+                .insert(serial.to_string(), Instant::now());
+            return Ok(());
+        }
+        {
+            let h = self.helper.as_ref().ok_or_else(no_helper)?;
+            let _one = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            stage_helper(&h.staged)?;
+            let l = h.staged.to_string_lossy().into_owned();
+            let argv: Vec<String> = ["-s", serial, "push", &l, IDLE_FREE_REMOTE]
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect();
+            let out = h.runner.run(&argv, 120_000).map_err(run_err)?;
+            if !out.ok() {
+                return Err(TransportError(format!(
+                    "adb push of the fallback reader failed: {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
+        if self.helper_hash(serial)?.as_deref() == Some(want) {
+            self.helper_checked
+                .insert(serial.to_string(), Instant::now());
+            return Ok(());
+        }
+        Err(TransportError(
+            "the fallback reader on the protected phone does not match the daemon's copy, even after a fresh push, so it is not run there".into(),
+        ))
+    }
+
+    /// Put the dump helper on the phone once per process (the fallback read runs it). On the
+    /// protected phone it is checked by hash first ([`Self::ensure_dex_protected`]).
     fn ensure_dex(&mut self, serial: &str) -> Result<(), TransportError> {
+        if self.is_protected_serial(serial) {
+            if self.helper.is_none() {
+                return Err(no_helper());
+            }
+            return self.ensure_dex_protected(serial);
+        }
         if self.dex_on.contains(serial) {
+            return Ok(());
+        }
+        if let Some(staged) = self.helper.as_ref().map(|h| h.staged.clone()) {
+            let _one = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            stage_helper(&staged)?;
+            self.push(serial, &staged, IDLE_FREE_REMOTE)?;
+            self.dex_on.insert(serial.to_string());
             return Ok(());
         }
         // one staging file per push: two transports in one process never write or remove each
@@ -246,6 +369,7 @@ impl<R: Runner> AdbTransport<R> {
             None => {
                 // a phone that lost the file (rebooted, /data/local/tmp cleaned) is pushed again next time
                 self.dex_on.remove(serial);
+                self.helper_checked.remove(serial);
                 Err(TransportError(
                     format!("{}{}", out.stdout.trim(), out.stderr.trim())
                         .chars()
@@ -298,6 +422,12 @@ impl<R: Runner> AdbTransport<R> {
             None => serial.to_string(),
         }
     }
+}
+
+fn no_helper() -> TransportError {
+    TransportError(
+        "the dump helper's own runner is not wired in this daemon, so the fallback reader is not run on the protected phone".into(),
+    )
 }
 
 fn run_err(e: RunError) -> TransportError {
@@ -582,41 +712,6 @@ impl<R: Runner> Transport for AdbTransport<R> {
             return Err(TransportError(text.trim().to_string()));
         }
         Ok(())
-    }
-
-    fn heads_up(&mut self, serial: &str) -> Result<bool, TransportError> {
-        if self.heads_up.is_none() {
-            return Err(TransportError(
-                "the heads-up check is not wired in this daemon".into(),
-            ));
-        }
-        self.ensure_dex(serial)?;
-        let argv: Vec<String> = [
-            "-s",
-            serial,
-            "exec-out",
-            agentroid_adb_link::guard::S24_HEADS_UP_READ,
-        ]
-        .iter()
-        .map(|a| (*a).to_string())
-        .collect();
-        let out = self
-            .heads_up
-            .as_ref()
-            .map(|r| r.run(&argv, PROBE_MS))
-            .unwrap_or_else(|| Err(RunError::Refused("no heads-up runner".into())))
-            .map_err(run_err)?;
-        // only the yes or no is kept: the rest of the output is dropped here
-        match parse_heads_up(&out.stdout) {
-            Some(b) => Ok(b),
-            None => {
-                // a phone that lost the helper gets it again next time
-                self.dex_on.remove(serial);
-                Err(TransportError(
-                    "the heads-up check gave no yes or no".into(),
-                ))
-            }
-        }
     }
 
     fn packages(&mut self, serial: &str) -> Result<Vec<String>, TransportError> {
@@ -1221,87 +1316,267 @@ mod tests {
             b"dex\n",
             "rebuild it with assets/idle-free-dump/build.sh"
         );
-        // the helper carries the heads-up check's mode
+        // the round-2 heads-up mode is gone from the helper (review round 3)
         let needle = b"--heads-up";
         assert!(
-            IDLE_FREE_DEX.windows(needle.len()).any(|w| w == needle),
+            !IDLE_FREE_DEX.windows(needle.len()).any(|w| w == needle),
             "rebuild it with assets/idle-free-dump/build.sh"
         );
+        assert_eq!(embedded_helper_hash().len(), 64);
     }
 
-    /// The heads-up runner (it must be `Send`): records its argv, answers `out`.
-    struct Hun {
+    /// The helper's runner (it must be `Send`): records its argv, answers each hash read with the
+    /// next of `hashes` (then the last one), and every push with `push_ok`.
+    struct HelperSpy {
         seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
-        out: &'static str,
+        hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        push_ok: bool,
     }
 
-    impl Runner for Hun {
+    impl Runner for HelperSpy {
         fn run(&self, a: &[String], _t: u64) -> Result<RunOutput, RunError> {
             self.seen.lock().unwrap().push(a.to_vec());
-            Ok(ok(self.out))
+            if a.iter().any(|x| x == "push") {
+                return Ok(RunOutput {
+                    code: Some(if self.push_ok { 0 } else { 1 }),
+                    stdout: String::new(),
+                    stderr: if self.push_ok { "" } else { "no room" }.into(),
+                });
+            }
+            let mut h = self.hashes.lock().unwrap();
+            let next = if h.len() > 1 {
+                h.remove(0)
+            } else {
+                h[0].clone()
+            };
+            Ok(ok(&next))
         }
+    }
+
+    type HelperLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    fn staged_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("agentroid-live-{}-{name}.dex", std::process::id()))
+    }
+
+    fn sum_line(h: &str) -> String {
+        format!("{h}  {IDLE_FREE_REMOTE}\n")
+    }
+
+    /// A transport aimed at the protected phone (its `ro.serialno` is the protected serial), on a
+    /// screen that never goes idle, with the helper wired to answer `hashes` in turn.
+    fn protected_rig(
+        name: &str,
+        hashes: &[String],
+        push_ok: bool,
+    ) -> (AdbTransport<Script>, Log, HelperLog, std::path::PathBuf) {
+        let log: Log = Default::default();
+        let mut s = Script::new(&log);
+        s.never_idle = true;
+        s.hw = S24_SERIAL.into();
+        let seen: HelperLog = Default::default();
+        let staged = staged_path(name);
+        let _ = std::fs::remove_file(&staged);
+        let t = live(s).with_dump_helper(
+            Box::new(HelperSpy {
+                seen: seen.clone(),
+                hashes: std::sync::Arc::new(std::sync::Mutex::new(hashes.to_vec())),
+                push_ok,
+            }),
+            staged.clone(),
+        );
+        (t, log, seen, staged)
+    }
+
+    fn hash_reads(seen: &HelperLog) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|a| {
+                a.last().map(String::as_str)
+                    == Some(agentroid_adb_link::guard::DUMP_HELPER_HASH_READ)
+            })
+            .count()
+    }
+
+    fn helper_runs(log: &Log) -> usize {
+        lines(log)
+            .iter()
+            .filter(|x| x.contains("app_process /system/bin dev.agentroid.dump.Dump"))
+            .count()
     }
 
     #[test]
-    fn the_heads_up_check_keeps_only_a_yes_or_no_and_runs_through_its_own_runner() {
-        assert_eq!(parse_heads_up("agentroid-hun: no\n"), Some(false));
-        assert_eq!(parse_heads_up("agentroid-hun: yes\r\n"), Some(true));
+    fn the_helper_hash_is_read_strictly() {
+        let h = "a".repeat(64);
+        assert_eq!(parse_helper_hash(&sum_line(&h)), Some(h.clone()));
         assert_eq!(
-            parse_heads_up("agentroid-hun: no\nagentroid-hun: yes\n"),
-            Some(true),
-            "a yes wins"
-        );
-        assert_eq!(
-            parse_heads_up("agentroid-hun: yes\nagentroid-hun: no\n"),
-            Some(true)
+            parse_helper_hash(&format!("{h} {IDLE_FREE_REMOTE}\r\nmore\n")),
+            Some(h.clone())
         );
         for junk in [
-            "agentroid-hun: unknown\n",
-            "Error: Could not find or load main class dev.agentroid.dump.Dump\n",
-            "x agentroid-hun: no\n",
-            "",
+            String::new(),
+            format!("{}  {IDLE_FREE_REMOTE}\n", "A".repeat(64)),
+            format!("{}  {IDLE_FREE_REMOTE}\n", "a".repeat(63)),
+            format!("{}  {IDLE_FREE_REMOTE}\n", "g".repeat(64)),
+            format!("{h}  /sdcard/other.dex\n"),
+            format!("{h}\n"),
+            format!("{h}  {IDLE_FREE_REMOTE} extra\n"),
+            format!("sha256sum: {IDLE_FREE_REMOTE}: No such file or directory\n"),
+            format!("\n{h}  {IDLE_FREE_REMOTE}\n"),
         ] {
-            assert_eq!(parse_heads_up(junk), None, "{junk:?}");
+            assert_eq!(parse_helper_hash(&junk), None, "{junk:?}");
         }
-        // not wired: no answer, and nothing is sent
+    }
+
+    /// Review round 3, item 2: on the protected phone the helper runs only after its hash matched
+    /// the daemon's copy, read through the helper's own runner; a match holds for
+    /// [`HELPER_RECHECK`], and nothing goes through the main runner but the run itself.
+    #[test]
+    fn the_protected_phone_runs_the_helper_only_once_its_hash_matches() {
+        let want = embedded_helper_hash().to_string();
+        let (mut t, log, seen, staged) = protected_rig("match", &[sum_line(&want)], true);
+        t.tree_xml("emulator-5554", Backend::Uiautomator).unwrap();
+        assert_eq!(hash_reads(&seen), 1);
+        assert_eq!(helper_runs(&log), 1);
+        assert!(!lines(&log).iter().any(|x| x.contains(" push ")));
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.iter().any(|x| x == "push")));
+        assert!(
+            !staged.exists(),
+            "nothing is staged while the phone's copy matches"
+        );
+        // within the window: no second read
+        t.tree_xml("emulator-5554", Backend::Uiautomator).unwrap();
+        assert_eq!(hash_reads(&seen), 1);
+        assert_eq!(helper_runs(&log), 2);
+        // past it: read again
+        let old = Instant::now().checked_sub(HELPER_RECHECK).unwrap();
+        t.helper_checked.insert("emulator-5554".into(), old);
+        t.tree_xml("emulator-5554", Backend::Uiautomator).unwrap();
+        assert_eq!(hash_reads(&seen), 2);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            [
+                "-s",
+                "emulator-5554",
+                "shell",
+                agentroid_adb_link::guard::DUMP_HELPER_HASH_READ
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mismatched_helper_is_pushed_again_from_the_state_dir_and_checked_again() {
+        let want = embedded_helper_hash().to_string();
+        let other = sum_line(&"0".repeat(64));
+        let (mut t, log, seen, staged) = protected_rig("mismatch", &[other, sum_line(&want)], true);
+        t.tree_xml("emulator-5554", Backend::Uiautomator).unwrap();
+        let s = seen.lock().unwrap().clone();
+        assert_eq!(s.len(), 3, "{s:?}");
+        assert_eq!(
+            s[1],
+            [
+                "-s".to_string(),
+                "emulator-5554".into(),
+                "push".into(),
+                staged.to_string_lossy().into_owned(),
+                IDLE_FREE_REMOTE.into()
+            ]
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), IDLE_FREE_DEX);
+        assert_eq!(helper_runs(&log), 1);
+        assert!(
+            !lines(&log).iter().any(|x| x.contains(" push ")),
+            "never through the main runner"
+        );
+        let _ = std::fs::remove_file(&staged);
+    }
+
+    #[test]
+    fn a_helper_that_still_does_not_match_or_cannot_be_read_is_never_run() {
+        let other = sum_line(&"0".repeat(64));
+        // a second mismatch after the push
+        let (mut t, log, seen, staged) = protected_rig("twice", std::slice::from_ref(&other), true);
+        let e = t
+            .tree_xml("emulator-5554", Backend::Uiautomator)
+            .unwrap_err()
+            .0;
+        assert!(e.contains("does not match"), "{e}");
+        assert_eq!(hash_reads(&seen), 2);
+        assert_eq!(helper_runs(&log), 0);
+        // and the next call checks again (no match was recorded)
+        let _ = t.tree_xml("emulator-5554", Backend::Uiautomator);
+        assert_eq!(hash_reads(&seen), 4);
+        let _ = std::fs::remove_file(&staged);
+        // a failed push
+        let (mut t, log, seen, staged) = protected_rig("nopush", &[other], false);
+        let e = t
+            .tree_xml("emulator-5554", Backend::Uiautomator)
+            .unwrap_err()
+            .0;
+        assert!(e.contains("push of the fallback reader failed"), "{e}");
+        assert_eq!(hash_reads(&seen), 1);
+        assert_eq!(helper_runs(&log), 0);
+        let _ = std::fs::remove_file(&staged);
+        // not wired: refused, nothing pushed or run
         let log: Log = Default::default();
-        let mut t = live(Script::new(&log));
-        assert!(t.heads_up("emulator-5554").is_err());
-        assert!(lines(&log).is_empty(), "{:?}", lines(&log));
-        // wired: the helper goes over the main runner once, the check over its own runner, word
-        // for word
-        for (out, want) in [
-            ("agentroid-hun: no\n", Some(false)),
-            ("agentroid-hun: yes\n", Some(true)),
-            ("agentroid-hun: unknown\n", None),
-        ] {
-            let log: Log = Default::default();
-            let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
-            let mut t = live(Script::new(&log)).with_heads_up_runner(Box::new(Hun {
-                seen: seen.clone(),
-                out,
-            }));
-            assert_eq!(t.heads_up("emulator-5554").ok(), want, "{out}");
-            assert_eq!(
-                seen.lock().unwrap()[0],
-                [
-                    "-s",
-                    "emulator-5554",
-                    "exec-out",
-                    agentroid_adb_link::guard::S24_HEADS_UP_READ
-                ]
-            );
-            let l = lines(&log);
-            assert_eq!(l.len(), 1, "{l:?}");
-            assert!(l[0].contains(" push ") && l[0].ends_with(IDLE_FREE_REMOTE));
-            // a second check pushes again only after an answer that was no answer
-            let _ = t.heads_up("emulator-5554");
-            assert_eq!(
-                lines(&log).len(),
-                if want.is_some() { 1 } else { 2 },
-                "{out}"
-            );
-        }
+        let mut s = Script::new(&log);
+        s.never_idle = true;
+        s.hw = S24_SERIAL.into();
+        let e = live(s)
+            .tree_xml("emulator-5554", Backend::Uiautomator)
+            .unwrap_err()
+            .0;
+        assert!(e.contains("not wired"), "{e}");
+        assert!(!lines(&log)
+            .iter()
+            .any(|x| x.contains(" push ") || x.contains("app_process")));
+    }
+
+    #[test]
+    fn an_ordinary_phone_gets_the_staged_copy_through_the_main_runner() {
+        let (t, log, seen, staged) = protected_rig("poco", &[String::new()], true);
+        let mut t = t;
+        // the same rig, aimed at an ordinary phone
+        t.runner.hw = "EMU33X1".into();
+        t.tree_xml("emulator-5554", Backend::Uiautomator).unwrap();
+        t.tree_xml("emulator-5554", Backend::Uiautomator).unwrap();
+        let pushes: Vec<_> = lines(&log)
+            .into_iter()
+            .filter(|x| x.contains(" push "))
+            .collect();
+        assert_eq!(pushes.len(), 1, "{pushes:?}");
+        assert!(
+            pushes[0].contains(&*staged.to_string_lossy()),
+            "{}",
+            pushes[0]
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the helper's runner is not used"
+        );
+        assert_eq!(helper_runs(&log), 2);
+        let _ = std::fs::remove_file(&staged);
+    }
+
+    #[test]
+    fn staging_writes_only_when_the_copy_differs() {
+        let p = staged_path("stage");
+        let _ = std::fs::remove_file(&p);
+        stage_helper(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), IDLE_FREE_DEX);
+        std::fs::write(&p, b"tampered").unwrap();
+        stage_helper(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), IDLE_FREE_DEX);
+        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        stage_helper(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), before);
+        assert!(!p.with_extension("dex.tmp").exists());
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

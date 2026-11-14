@@ -175,21 +175,7 @@ pub trait Transport {
     fn health_hint(&mut self, _serial: &str) -> HealthHint {
         HealthHint::default()
     }
-    /// Is a heads-up notification (or any notification row) showing on the protected phone, in
-    /// any window? Only the yes or no is kept; nothing of the notification is read off the phone.
-    /// Default: this transport cannot tell (`Err`), so the protected phone takes no screenshot.
-    fn heads_up(&mut self, _serial: &str) -> Result<bool, TransportError> {
-        Err(TransportError(
-            "this transport cannot tell whether a heads-up notification is showing".into(),
-        ))
-    }
 }
-
-/// How long the protected phone's screenshot waits for a heads-up notification to go before it
-/// looks again ([`HEADS_UP_RETRIES`] times), and then refuses.
-pub const HEADS_UP_WAIT_MS: u64 = 1_500;
-/// How many times a screenshot on the protected phone looks again for a heads-up to have gone.
-pub const HEADS_UP_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreError {
@@ -279,33 +265,6 @@ impl<T: Transport> TreeSource for LiveSource<'_, T> {
         self.transport
             .tree_xml(self.serial, self.backend)
             .map_err(|e| e.0)
-    }
-}
-
-/// A [`TreeSource`] for the protected phone: each tree is checked, and the first refused one ends
-/// the reads (the settle then returns the refusal, never the tree).
-struct ProtectedSource<S: TreeSource> {
-    inner: S,
-    refused: Option<(&'static str, String)>,
-}
-
-impl<S: TreeSource> TreeSource for ProtectedSource<S> {
-    fn dump(&mut self) -> Result<String, String> {
-        if self.refused.is_some() {
-            return Err("the protected phone's screen may not be read now".into());
-        }
-        let xml = self.inner.dump()?;
-        let verdict = match protected::screen_facts(&xml) {
-            Ok(f) => protected::read_refusal(&f),
-            Err(why) => Some(("screen", why)),
-        };
-        match verdict {
-            None => Ok(xml),
-            Some(r) => {
-                self.refused = Some(r);
-                Err("the protected phone's screen may not be read now".into())
-            }
-        }
     }
 }
 
@@ -421,12 +380,11 @@ pub struct Core<T: Transport, C: Clock> {
     protected: Option<Protected>,
     /// This call runs under an overnight lease: no `asked` verdict goes to the owner.
     prot_overnight: bool,
-    /// This call is on the protected phone (the tool's name): every tree it reads is checked
-    /// before it is stored or shown.
+    /// This call is on the protected phone (the tool's name): its touches get the PIN check.
     prot_active: Option<&'static str>,
-    /// The protected phone's screen as the check before the call found it.
+    /// The protected phone's PIN facts as the check before the call found them.
     prot_facts: Option<ScreenFacts>,
-    /// The tree that check read: the screen guard and `ui_tree` use it rather than read again.
+    /// The tree that check read: the screen guard and a selector use it rather than read again.
     prot_xml: Option<String>,
 }
 
@@ -532,9 +490,9 @@ impl<T: Transport, C: Clock> Core<T, C> {
     }
 
     /// The lease's half of the gate, for the protected phone: the configured mode first (so
-    /// `read_only` and `helper` win, and nothing is asked for a call they refuse), then a launch
-    /// of a protected app (refused before anything is asked), then the lease itself. One lease
-    /// satisfies the screen lock as well, so the owner never allows the same work twice.
+    /// `read_only` and `helper` win, and nothing is asked for a call they refuse), then the lease
+    /// itself. One lease satisfies the screen lock as well, so the owner never allows the same
+    /// work twice.
     fn pick_protected(
         &mut self,
         d: &DeviceInfo,
@@ -563,11 +521,6 @@ impl<T: Transport, C: Clock> Core<T, C> {
         // nothing is asked for a read
         if configured == DeviceMode::ReadOnly {
             return Err(Refusal::S24 { tool }.into());
-        }
-        if let Some((rule, why)) =
-            call.and_then(|c| protected::launch_refusal(c).or_else(|| protected::typed_refusal(c)))
-        {
-            return Err(Refusal::Protected { tool, rule, why }.into());
         }
         let Some(p) = self.protected.as_mut() else {
             return Err(Refusal::S24 { tool }.into());
@@ -600,96 +553,56 @@ impl<T: Transport, C: Clock> Core<T, C> {
         Ok(())
     }
 
-    /// Refuse `xml` (a tree read on the protected phone) when it shows what is never shown.
-    fn protected_xml(&self, tool: &'static str, xml: &str) -> Result<(), CoreError> {
-        let f = protected::screen_facts(xml).map_err(|why| Refusal::Protected {
-            tool,
-            rule: "screen",
-            why,
-        })?;
-        match protected::read_refusal(&f) {
-            Some((rule, why)) => Err(Refusal::Protected { tool, rule, why }.into()),
-            None => Ok(()),
-        }
-    }
-
-    /// The protected phone's screen check before `call` is sent (reads included): a fresh tree,
-    /// never the cached one. Exit keys go without a read.
+    /// The protected phone's PIN check before `call` is sent (the one screen rule left: digits are
+    /// never entered on a PIN prompt). Only a call that could enter a digit is checked
+    /// ([`protected::needs_pin_check`]); reads, launches and exit keys go without a read. The tree
+    /// is the stored one when it is fresh and nothing acted since (as the screen guard takes it),
+    /// else one new read; the screen guard and a selector then use the same tree, so an act costs
+    /// at most one dump.
     fn protected_pre(&mut self, d: &DeviceInfo, call: &Call) -> Result<(), CoreError> {
         self.prot_facts = None;
         self.prot_xml = None;
-        if let Call::Key { name } = call {
-            if protected::exit_key(name) {
-                return Ok(());
-            }
+        if !protected::needs_pin_check(call) {
+            return Ok(());
         }
         let tool = call.name();
-        let xml = self
-            .transport
-            .tree_xml(&d.serial, self.backend)
-            .map_err(|e| Refusal::Protected {
-                tool,
-                rule: "screen",
-                why: format!(
-                    "the screen could not be read ({}), so nothing was sent",
-                    e.0.chars().take(120).collect::<String>()
-                ),
-            })?;
+        let now = self.clock.now_ms();
+        let stored = self.state.get(&d.serial).and_then(|st| match &st.tree {
+            Some((xml, _))
+                if !st.dirty && now.saturating_sub(st.tree_at) <= self.guard.max_tree_age_ms =>
+            {
+                Some(xml.clone())
+            }
+            _ => None,
+        });
+        let xml = match stored {
+            Some(x) => x,
+            None => self
+                .transport
+                .tree_xml(&d.serial, self.backend)
+                .map_err(|e| Refusal::Protected {
+                    tool,
+                    rule: "screen",
+                    why: format!(
+                        "the screen could not be read for the PIN check ({}), so nothing was sent",
+                        e.0.chars().take(120).collect::<String>()
+                    ),
+                })?,
+        };
         let f = protected::screen_facts(&xml).map_err(|why| Refusal::Protected {
             tool,
             rule: "screen",
             why,
         })?;
-        if let Some((rule, why)) = protected::screen_refusal(&f, call, None) {
+        if let Some((rule, why)) = protected::pin_refusal(&f, call, None) {
             return Err(Refusal::Protected { tool, rule, why }.into());
         }
         self.prot_facts = Some(f);
-        // the screen guard and `ui_tree` judge this same fresh tree rather than read again (a
-        // screenshot still reads once more after the shot)
         self.prot_xml = Some(xml);
         Ok(())
     }
 
-    /// A screenshot on the protected phone only while no heads-up notification is showing: one
-    /// that is waits [`HEADS_UP_WAIT_MS`] and looks again, up to `retries` times, then refuses. A
-    /// phone that cannot be asked refuses too.
-    fn protected_heads_up(
-        &mut self,
-        serial: &str,
-        tool: &'static str,
-        retries: u32,
-    ) -> Result<(), CoreError> {
-        for i in 0..=retries {
-            match self.transport.heads_up(serial) {
-                Ok(false) => return Ok(()),
-                Ok(true) if i < retries => self.clock.sleep_ms(HEADS_UP_WAIT_MS),
-                Ok(true) => {
-                    return Err(Refusal::Protected {
-                        tool,
-                        rule: "preview",
-                        why: "a heads-up notification is showing, so no image was taken or kept"
-                            .into(),
-                    }
-                    .into())
-                }
-                Err(e) => {
-                    return Err(Refusal::Protected {
-                        tool,
-                        rule: "screen",
-                        why: format!(
-                            "whether a heads-up notification is showing could not be read ({}), so no image was taken or kept",
-                            e.0.chars().take(120).collect::<String>()
-                        ),
-                    }
-                    .into())
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A touch at device point (x, y) on the protected phone: never on a protected app's icon or a
-    /// PIN digit.
+    /// A touch at device point (x, y) on the protected phone: never on a PIN digit.
     fn protected_at(&self, call: &Call, x: i32, y: i32) -> Result<(), CoreError> {
         if self.prot_active.is_none() {
             return Ok(());
@@ -697,7 +610,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         match self
             .prot_facts
             .as_ref()
-            .and_then(|f| protected::screen_refusal(f, call, Some((x, y))))
+            .and_then(|f| protected::pin_refusal(f, call, Some((x, y))))
         {
             Some((rule, why)) => Err(Refusal::Protected {
                 tool: call.name(),
@@ -1034,8 +947,8 @@ impl<T: Transport, C: Clock> Core<T, C> {
         self.pick_raw_path(serial, tool, None)
     }
 
-    /// [`pick_raw`](Self::pick_raw) with the phone path of a `push` or `pull`, which the protected
-    /// phone checks before its lease (no ask for a path that is refused anyway).
+    /// [`pick_raw`](Self::pick_raw) with the phone path of a `push` or `pull`: on the protected
+    /// phone a push of code is refused before its lease (no ask for a push refused anyway).
     fn pick_raw_path(
         &mut self,
         serial: Option<&str>,
@@ -1051,13 +964,17 @@ impl<T: Transport, C: Clock> Core<T, C> {
                     rule: "shell",
                     why: "raw shell lines never run on the protected phone (a shell can read notifications and app data)".into(),
                 })
-            } else {
-                path.and_then(protected::path_refusal)
+            } else if tool == "push" {
+                // code never goes to the protected phone (review round 3, item 2): the guard
+                // checks the laptop file's name as well
+                path.and_then(|p| agentroid_adb_link::guard::code_push_refusal("", p))
                     .map(|why| Refusal::Protected {
                         tool,
-                        rule: "path",
+                        rule: "code",
                         why,
                     })
+            } else {
+                None
             };
             if let Some(r) = refusal {
                 self.pending = Some((device_name(&info), String::new()));
@@ -1514,24 +1431,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
         match call {
             Call::ListDevices | Call::Wait { .. } => unreachable!("handled above"),
             Call::Screenshot { max_width } => {
-                if let Some(tool) = self.prot_active {
-                    self.prot_xml = None;
-                    self.protected_heads_up(&s, tool, HEADS_UP_RETRIES)?;
-                }
                 let (img, note, shot) = self.shoot(&s, *max_width)?;
-                // the screen may have changed while the shot was taken: check it again, and
-                // drop the image when it now shows what is never shown
-                if let Some(tool) = self.prot_active {
-                    self.protected_heads_up(&s, tool, 0)?;
-                    let xml = self.transport.tree_xml(&s, self.backend).map_err(|_| {
-                        Refusal::Protected {
-                            tool,
-                            rule: "screen",
-                            why: "the screen could not be read again after the shot, so the image was dropped".into(),
-                        }
-                    })?;
-                    self.protected_xml(tool, &xml)?;
-                }
                 Ok(Outcome {
                     text: note,
                     image: Some(img),
@@ -1545,28 +1445,10 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 timeout_ms,
             } => self.ui_tree(&s, *interactive_only, require, *timeout_ms),
             Call::Look { max_width } => {
-                if let Some(tool) = self.prot_active {
-                    // the tree after the shot is read anew, not the one from before it
-                    self.prot_xml = None;
-                    self.protected_heads_up(&s, tool, HEADS_UP_RETRIES)?;
-                }
                 let (img, note, shot) = self.shoot(&s, *max_width)?;
-                if let Some(tool) = self.prot_active {
-                    self.protected_heads_up(&s, tool, 0)?;
-                }
-                // on the protected phone this tree is read after the shot and checked, so a
-                // refusal here drops the image too
                 let listing = match self.read_tree(&s, false) {
                     Ok(t) => t,
                     Err(e @ CoreError::Refused(_)) => return Err(e),
-                    Err(_) if self.prot_active.is_some() => {
-                        return Err(Refusal::Protected {
-                            tool: "look",
-                            rule: "screen",
-                            why: "the screen could not be read again after the shot, so the image was dropped".into(),
-                        }
-                        .into())
-                    }
                     Err(e) => format!("(UI tree unavailable: {e})"),
                 };
                 Ok(Outcome {
@@ -1719,14 +1601,6 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 // the request first (refused before anything is read), then the package it resolves to
                 self.screen_gate_launch_request(&p, call)?;
                 let pkg = self.resolve_package(&s, package)?;
-                // the protected phone: a short name may resolve to a protected app
-                if let Some(tool) = self.prot_active {
-                    if let Some((rule, why)) = protected::launch_refusal(&Call::OpenApp {
-                        package: pkg.clone(),
-                    }) {
-                        return Err(Refusal::Protected { tool, rule, why }.into());
-                    }
-                }
                 self.screen_gate(
                     &p,
                     &Call::OpenApp {
@@ -1774,28 +1648,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
             serial: &p.serial,
             backend,
         };
-        if !(self.protected.is_some() && Self::is_protected(&p)) {
-            return Ok(settle(&mut src, &self.clock, opts));
-        }
-        // the protected phone: every poll is checked, and one refused tree ends the settle
-        let mut checked = ProtectedSource {
-            inner: src,
-            refused: None,
-        };
-        let r = settle(&mut checked, &self.clock, opts);
-        match checked.refused {
-            None => Ok(r),
-            Some((rule, why)) => {
-                let refusal = Refusal::Protected {
-                    tool: "settle",
-                    rule,
-                    why,
-                };
-                self.pending = Some((device_name(&p), String::new()));
-                self.record_refusal(serial, "settle", &refusal, "");
-                Err(refusal.into())
-            }
-        }
+        Ok(settle(&mut src, &self.clock, opts))
     }
 
     fn list_devices(&mut self) -> Result<Outcome, CoreError> {
@@ -1908,11 +1761,7 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// Read, remember and render the tree.
     fn read_tree(&mut self, serial: &str, interactive_only: bool) -> Result<String, CoreError> {
         let t0 = self.clock.now_ms();
-        // the protected phone's check read this call's tree a moment ago: no second dump
-        let xml = match self.prot_xml.take() {
-            Some(x) => x,
-            None => self.transport.tree_xml(serial, self.backend)?,
-        };
+        let xml = self.transport.tree_xml(serial, self.backend)?;
         let took = self.clock.now_ms().saturating_sub(t0);
         self.render_tree(serial, xml, interactive_only, took)
     }
@@ -1924,10 +1773,6 @@ impl<T: Transport, C: Clock> Core<T, C> {
         interactive_only: bool,
         took_ms: u64,
     ) -> Result<String, CoreError> {
-        // the protected phone: checked before anything of it is stored, kept as a snapshot or shown
-        if let Some(tool) = self.prot_active {
-            self.protected_xml(tool, &xml)?;
-        }
         let (listing, snap_id, injection) = {
             let tree = parse(&xml, interactive_only)
                 .map_err(|e| CoreError::Invalid(format!("UI tree unavailable: {e}")))?;
@@ -2120,13 +1965,11 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 ))
             }
             Target::Select(sel) => {
+                // the protected phone's PIN check read this call's tree a moment ago: no second dump
                 let xml = match &self.prot_xml {
                     Some(x) => x.clone(),
                     None => self.transport.tree_xml(serial, self.backend)?,
                 };
-                if let Some(tool) = self.prot_active {
-                    self.protected_xml(tool, &xml)?;
-                }
                 let now = self.clock.now_ms();
                 let stt = self.st(serial);
                 stt.tree = Some((xml.clone(), false));

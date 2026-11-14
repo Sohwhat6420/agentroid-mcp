@@ -73,20 +73,52 @@ pub const DUMP_HELPER_REMOTE: &str = "/data/local/tmp/agentroid-dump.dex";
 /// The fallback screen read, as an `exec-out` line (the dump goes to stdout).
 pub const IDLE_FREE_READ: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump /dev/tty";
 
-/// **Needs the owner's yes before it is merged.** The protected phone's heads-up check, for
-/// core's screenshot guard alone: the dump helper's `--heads-up` mode asks the accessibility
-/// service for every interactive window (`FLAG_RETRIEVE_INTERACTIVE_WINDOWS`, `getWindows()`),
-/// looks on the phone for a notification row or heads-up in any of them, and prints only
-/// `agentroid-hun: yes`, `no` or `unknown`. No text of any notification leaves the phone, and it
-/// changes no setting.
-///
-/// Only a runner built with [`GuardedRunner::with_s24_heads_up`] (the live transport's heads-up
-/// reader, and no other) lets this one line through to the protected phone, and only in the exact
-/// shape [`Checked::is_s24_heads_up`] accepts (`exec-out` plus this one argument). Every other
-/// runner, the plain [`Guard`], `doctor` and the MCP tools still refuse it for the protected phone,
-/// and the lease's own [`protected_policy`] never lets it through. It is not in [`S24_READS`]. The
-/// reader keeps only the parsed yes or no.
-pub const S24_HEADS_UP_READ: &str = "CLASSPATH=/data/local/tmp/agentroid-dump.dex:/system/framework/uiautomator.jar app_process /system/bin dev.agentroid.dump.Dump --heads-up";
+/// The dump helper's hash on a phone, as a `shell` line: the live transport checks the helper on the
+/// protected phone with this before it runs it there, through the helper's own runner
+/// ([`GuardedRunner::with_s24_helper`]) under a lease.
+pub const DUMP_HELPER_HASH_READ: &str = "sha256sum /data/local/tmp/agentroid-dump.dex";
+
+/// File names that carry code a phone could run: a push of one to the protected phone is refused,
+/// lease or not (only the dump helper's own runner puts the helper there).
+const CODE_SUFFIXES: [&str; 12] = [
+    ".dex", ".apk", ".apks", ".apex", ".jar", ".so", ".odex", ".vdex", ".oat", ".art", ".xapk",
+    ".aab",
+];
+
+/// A path as the phone resolves it, for the code-push rule: lower case, `\` as `/`, empty and `.`
+/// segments dropped and `..` taken off the segment before it.
+fn normalise_phone_path(p: &str) -> String {
+    let p = p.trim().to_lowercase().replace('\\', "/");
+    let mut out: Vec<&str> = vec![];
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let lead = if p.starts_with('/') { "/" } else { "" };
+    format!("{lead}{}", out.join("/"))
+}
+
+/// Why a push to the protected phone is refused as code, or `None`. `local` is the file sent and
+/// `remote` the path it lands at: a code file by name (either side, any case), anything into
+/// `/data/local/tmp` (where `app_process` and the shell run code from) or onto the dump helper's
+/// path. A fixed refusal: no lease or approval lifts it.
+pub fn code_push_refusal(local: &str, remote: &str) -> Option<String> {
+    let r = normalise_phone_path(remote);
+    let named_code = [local, remote].iter().any(|p| {
+        let n = normalise_phone_path(p);
+        let base = n.rsplit('/').next().unwrap_or("");
+        CODE_SUFFIXES.iter().any(|s| base.ends_with(s))
+    });
+    let tmp = r == "/data/local/tmp" || r.starts_with("/data/local/tmp/");
+    (named_code || tmp || r == DUMP_HELPER_REMOTE).then(|| {
+        "code is never pushed to the protected phone (a .dex, .apk, .jar, .so or similar, or anything into /data/local/tmp), lease or not".to_string()
+    })
+}
 
 /// A value the protected phone exception may write: a plain decimal (no sign, no leading zero), at most
 /// `i32::MAX` ms for the timeout and at most 15 (the AC, USB, wireless and dock bits) for stay-on.
@@ -356,10 +388,16 @@ impl Checked {
         self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == S24_CALL_STATE_READ
     }
 
-    /// True when this is exactly the protected phone's heads-up check as the live transport sends
-    /// it: `exec-out` plus the one argument [`S24_HEADS_UP_READ`], word for word.
-    pub fn is_s24_heads_up(&self) -> bool {
-        self.sub == "exec-out" && self.rest.len() == 1 && self.rest[0] == S24_HEADS_UP_READ
+    /// True when this is exactly one of the dump helper's two lines for the protected phone: the
+    /// hash read (`shell` plus [`DUMP_HELPER_HASH_READ`]) or the push of `staged`, the daemon's
+    /// own staged copy, to [`DUMP_HELPER_REMOTE`], word for word.
+    pub fn is_s24_helper(&self, staged: &str) -> bool {
+        (self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == DUMP_HELPER_HASH_READ)
+            || (self.sub == "push"
+                && !staged.is_empty()
+                && self.rest.len() == 2
+                && self.rest[0] == staged
+                && self.rest[1] == DUMP_HELPER_REMOTE)
     }
 
     /// True when `sub` + `rest` is exactly one of [`GETEVENT_SHAPES`].
@@ -418,7 +456,9 @@ impl Checked {
 ///   `reverse`, `backup`, `restore` and every other subcommand stay refused;
 /// * no link-pairing shape (the helper's link is never paired with the protected phone);
 /// * a `shell` or `exec-out` line only in one of the exact shapes core and the live transport
-///   send ([`protected_shell_allowed`]); anything else is refused, whatever it does.
+///   send ([`protected_shell_allowed`]); anything else is refused, whatever it does;
+/// * no push of code ([`code_push_refusal`]): only the dump helper's own runner puts the helper
+///   on the phone.
 pub fn protected_policy(c: &Checked) -> Result<(), String> {
     const SUBS: [&str; 4] = ["shell", "exec-out", "push", "pull"];
     if !SUBS.contains(&c.sub.as_str()) {
@@ -437,6 +477,20 @@ pub fn protected_policy(c: &Checked) -> Result<(), String> {
                 "the line is not one of the exact shapes core sends to the protected phone (taps, swipes, keys, text, a screen read, a launch): never on the protected phone, lease or not"
                     .into(),
             );
+        }
+    }
+    if c.sub == "push" {
+        // `push <local>... <remote>`: every word is checked, so no flag or extra source slips by
+        let Some((remote, locals)) = c.rest.split_last() else {
+            return Err("adb push without a destination".into());
+        };
+        if locals.is_empty() {
+            return Err("adb push without a file to send".into());
+        }
+        for l in locals {
+            if let Some(why) = code_push_refusal(l, remote) {
+                return Err(why);
+            }
         }
     }
     Ok(())
@@ -528,8 +582,9 @@ fn int_word(w: &str) -> bool {
 /// Is `line` (the words after `shell` or `exec-out`) one of the exact shapes core and the live
 /// transport send to the protected phone? An allowlist: `input` taps, long presses, swipes, key
 /// events and escaped text; the screen size, rotation, wakefulness and package reads; `getprop` of
-/// one key; a launcher `monkey` of one package; `am start -W` with quoted arguments; and, as
-/// `exec-out`, `screencap -p`, `uiautomator dump /dev/tty` and the fallback reader.
+/// one key; a launcher `monkey` of one package; `am start -W` with quoted arguments; the file
+/// tools' `sha256sum <path>`, `ls -1tp <dir>` and `stat -c %s <path>` (one path word, never a
+/// flag); and, as `exec-out`, `screencap -p`, `uiautomator dump /dev/tty` and the fallback reader.
 pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
     if sub == "exec-out" {
         return PROTECTED_EXACT_EXEC_OUT.contains(&line);
@@ -559,6 +614,8 @@ pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
             && p.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
     };
+    // one path word (plain_words has already refused metacharacters outside quotes): never a flag
+    let path = |p: &str| !p.is_empty() && p.len() <= 1024 && !p.starts_with('-');
     let input = match w.as_slice() {
         ["input", "-d", d, rest @ ..] if d.bytes().all(|b| b.is_ascii_digit()) && !d.is_empty() => {
             rest
@@ -583,6 +640,8 @@ pub fn protected_shell_allowed(sub: &str, line: &str) -> bool {
         }
         ["monkey", "-p", p, "-c", "android.intent.category.LAUNCHER", "1"] => pkg(p),
         ["am", "start", "-W", args @ ..] => !args.is_empty() && args.len() <= 16,
+        // the file tools' reads: push's read-back, and pull_new's listing, size and hash
+        ["sha256sum", p] | ["ls", "-1tp", p] | ["stat", "-c", "%s", p] => path(p),
         _ => false,
     }
 }
@@ -599,9 +658,10 @@ pub struct Guard {
     /// The protected phone call-state read (see [`S24_CALL_STATE_READ`]). Off unless the runner was built
     /// with [`GuardedRunner::with_s24_call_state`].
     s24_call_state: bool,
-    /// The protected phone heads-up check (see [`S24_HEADS_UP_READ`]). Off unless the runner was
-    /// built with [`GuardedRunner::with_s24_heads_up`].
-    s24_heads_up: bool,
+    /// The dump helper's staged copy on the laptop, for its two lines to the protected phone under a
+    /// lease ([`Checked::is_s24_helper`]). `None` unless the runner was built with
+    /// [`GuardedRunner::with_s24_helper`].
+    s24_helper: Option<String>,
 }
 
 fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -641,8 +701,7 @@ impl Guard {
             if let Some(v) = sel.get(1) {
                 let read = probe.is_s24_read()
                     || (self.s24_screen_awake && probe.is_s24_screen_awake())
-                    || (self.s24_call_state && probe.is_s24_call_state())
-                    || (self.s24_heads_up && probe.is_s24_heads_up());
+                    || (self.s24_call_state && probe.is_s24_call_state());
                 // under a lease core bound this name: `GuardedRunner::admit` still reads the
                 // hardware serial and applies `protected_policy`
                 if self.is_forbidden(v) && !read && !self.lease_admits(v) {
@@ -838,14 +897,17 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
-    /// The runner the live transport's heads-up check reads the protected phone through, and
-    /// nothing else: as [`GuardedRunner::new`], plus [`S24_HEADS_UP_READ`], exactly as
-    /// [`Checked::is_s24_heads_up`] accepts it.
-    pub fn with_s24_heads_up(inner: R) -> Self {
+    /// The runner the live transport checks and puts the dump helper on the protected phone
+    /// through, and nothing else: as [`GuardedRunner::with_leases`], plus, under an open lease for
+    /// a bound name, the helper's hash read and the push of `staged` (the daemon's own copy) to
+    /// [`DUMP_HELPER_REMOTE`], exactly as [`Checked::is_s24_helper`] accepts them. Every other code
+    /// push stays refused ([`protected_policy`]).
+    pub fn with_s24_helper(inner: R, staged: String, leases: Arc<LeaseBook>) -> Self {
         Self {
             inner,
             guard: Guard {
-                s24_heads_up: true,
+                leases: Some(leases),
+                s24_helper: Some(staged),
                 ..Guard::default()
             },
         }
@@ -944,8 +1006,7 @@ impl<R: Runner> GuardedRunner<R> {
                         self.guard.deny(v);
                     }
                     let excepted = (self.guard.s24_screen_awake && c.is_s24_screen_awake())
-                        || (self.guard.s24_call_state && c.is_s24_call_state())
-                        || (self.guard.s24_heads_up && c.is_s24_heads_up());
+                        || (self.guard.s24_call_state && c.is_s24_call_state());
                     if !c.is_s24_read() && !excepted {
                         // the lease counts only for a name core checked and bound under it: a
                         // phone core took for an ordinary device never rides on it
@@ -956,7 +1017,14 @@ impl<R: Runner> GuardedRunner<R> {
                                 "target is the read-only S24, never a target".into(),
                             ));
                         }
-                        protected_policy(&c).map_err(RunError::Refused)?;
+                        let helper = self
+                            .guard
+                            .s24_helper
+                            .as_deref()
+                            .is_some_and(|staged| c.is_s24_helper(staged));
+                        if !helper {
+                            protected_policy(&c).map_err(RunError::Refused)?;
+                        }
                     }
                 }
             }
@@ -2256,48 +2324,187 @@ mod tests {
             ("shell", "uiautomator dump /sdcard/x.xml"),
             ("exec-out", "uiautomator dump /dev/tty; cat /sdcard/x"),
             ("exec-out", "cat /data/system/notification_log.db"),
-            ("exec-out", S24_HEADS_UP_READ),
-            ("shell", S24_HEADS_UP_READ),
+            ("exec-out", DUMP_HELPER_HASH_READ),
+            // the file tools' reads: one path word, never a flag, nothing chained
+            ("shell", "sha256sum -c /sdcard/x"),
+            ("shell", "sha256sum --help"),
+            ("shell", "ls -1tp -R"),
+            ("shell", "stat -c %s -L"),
+            ("shell", "sha256sum /sdcard/a /sdcard/b"),
+            ("shell", "sha256sum"),
+            ("shell", "sha256sum /sdcard/a; id"),
+            ("shell", "ls -1tp -R /"),
+            ("shell", "ls -1tp"),
+            ("shell", "ls -la /sdcard"),
+            ("shell", "ls -1tp /sdcard | sh"),
+            ("shell", "stat -c %s"),
+            ("shell", "stat -c %n /sdcard/a"),
+            ("shell", "stat -c %s -L /sdcard/a"),
+            ("shell", "stat -c %s $(id)"),
+            ("shell", "md5sum /sdcard/a"),
         ] {
             assert!(!protected_shell_allowed(sub, line), "{sub} {line}");
         }
+        // review round 3, item 11: push's read-back and pull_new's three reads, as devtools
+        // quotes them
+        for line in [
+            "sha256sum /sdcard/Download/a.png",
+            "sha256sum '/sdcard/Download/my file.png'",
+            "ls -1tp /sdcard/Download",
+            "ls -1tp '/sdcard/Download/it'\\''s'",
+            "stat -c %s /sdcard/Download/a.png",
+            DUMP_HELPER_HASH_READ,
+        ] {
+            assert!(protected_shell_allowed("shell", line), "{line}");
+        }
+        let long = format!("sha256sum /{}", "a".repeat(1024));
+        assert!(!protected_shell_allowed("shell", &long));
+        let at_most = format!("sha256sum /{}", "a".repeat(1023));
+        assert!(protected_shell_allowed("shell", &at_most));
     }
 
-    /// Review round 2, item 10: the heads-up check reaches the protected phone only through its
-    /// own runner, in its one exact shape, and never through a lease or the plain guard.
+    /// Review round 3, item 2: no code reaches the protected phone by push, lease or not, in any
+    /// spelling of its path; only the helper's own runner puts its one staged copy on it.
     #[test]
-    fn the_heads_up_check_has_one_runner_and_one_shape() {
+    fn code_is_never_pushed_to_the_protected_phone() {
+        for (local, remote) in [
+            ("C:/outbox/a.dex", "/sdcard/Download/a.bin"),
+            ("C:/outbox/a.bin", "/sdcard/Download/a.DEX"),
+            ("C:/outbox/app.apk", "/sdcard/Download/app.apk"),
+            ("C:/outbox/lib.so", "/sdcard/lib.so"),
+            ("C:/outbox/x.jar", "/sdcard/x.jar"),
+            ("C:/outbox/x.odex", "/sdcard/x"),
+            ("C:/outbox/x.vdex", "/sdcard/x"),
+            ("C:/outbox/x.oat", "/sdcard/x"),
+            ("C:/outbox/x.apks", "/sdcard/x"),
+            ("C:/outbox/x.apex", "/sdcard/x"),
+            ("C:/outbox/x.art", "/sdcard/x"),
+            ("C:/outbox/x.xapk", "/sdcard/x"),
+            ("C:/outbox/x.aab", "/sdcard/x"),
+            ("C:/outbox/note.txt", "/data/local/tmp"),
+            ("C:/outbox/note.txt", "/data/local/tmp/note.txt"),
+            ("C:/outbox/note.txt", "/DATA/Local/TMP/note.txt"),
+            ("C:/outbox/note.txt", "//data//local/./tmp/x"),
+            ("C:/outbox/note.txt", "/sdcard/../data/local/tmp/x"),
+            ("C:/outbox/note.txt", "\\data\\local\\tmp\\x"),
+            ("C:/outbox/note.txt", DUMP_HELPER_REMOTE),
+            ("C:\\outbox\\a.DeX", "/sdcard/a"),
+        ] {
+            assert!(
+                code_push_refusal(local, remote).is_some(),
+                "{local} {remote}"
+            );
+        }
+        for (local, remote) in [
+            ("C:/outbox/a.png", "/sdcard/Download/a.png"),
+            ("C:/outbox/dex.txt", "/sdcard/Download/dex.txt"),
+            ("C:/outbox/a.sox", "/sdcard/a.sox"),
+            ("C:/outbox/a", "/data/local/tmpx/a"),
+            ("C:/outbox/a", "/data/local/tm"),
+            ("C:/outbox/a", "/sdcard/tmp/x"),
+        ] {
+            assert!(
+                code_push_refusal(local, remote).is_none(),
+                "{local} {remote}"
+            );
+        }
+        assert_eq!(normalise_phone_path("/a/b/../c"), "/a/c");
+        assert_eq!(normalise_phone_path("a//./b"), "a/b");
+
+        // through the lease's policy: refused with nothing sent but the identity probe
+        let (_, book) = book_with_lease(&[S24_IP]);
+        for a in [
+            vec!["-s", S24_IP, "push", "C:/outbox/a.dex", "/sdcard/a.dex"],
+            vec!["-s", S24_IP, "push", "C:/outbox/n.txt", DUMP_HELPER_REMOTE],
+            vec![
+                "-s",
+                S24_IP,
+                "push",
+                "C:/outbox/n.txt",
+                "C:/outbox/b.so",
+                "/sdcard/",
+            ],
+            vec!["-s", S24_IP, "push", "/sdcard/x"],
+            vec!["-s", S24_IP, "push"],
+        ] {
+            let r = leased_s24(&book);
+            assert!(r.run(&args(&a), 1000).is_err(), "{a:?}");
+            assert_eq!(r.inner.calls.borrow().len(), 1, "{a:?}: only the probe");
+        }
+        let ok = args(&["-s", S24_IP, "push", "C:/outbox/n.txt", "/sdcard/n.txt"]);
+        assert!(leased_s24(&book).run(&ok, 1000).is_ok());
+    }
+
+    /// Review round 3, item 2: the helper's runner sends its two exact lines to the protected
+    /// phone under a lease, and nothing more than a leased runner would.
+    #[test]
+    fn the_helper_runner_has_two_exact_lines_under_a_lease() {
+        const STAGED: &str = "C:/state/agentroid-dump.dex";
         let spy = || Spy {
             hw: S24_SERIAL.into(),
             calls: RefCell::new(vec![]),
         };
-        let exact = args(&["-s", S24_IP, "exec-out", S24_HEADS_UP_READ]);
-        let r = GuardedRunner::with_s24_heads_up(spy());
-        assert!(r.run(&exact, 1000).is_ok());
+        let push = args(&["-s", S24_IP, "push", STAGED, DUMP_HELPER_REMOTE]);
+        let hash = args(&["-s", S24_IP, "shell", DUMP_HELPER_HASH_READ]);
+        let (clock, book) = book_with_lease(&[S24_IP]);
+        let helper = || GuardedRunner::with_s24_helper(spy(), STAGED.into(), book.clone());
+        assert!(helper().run(&push, 1000).is_ok());
+        assert!(helper().run(&hash, 1000).is_ok());
         for near in [
-            args(&["-s", S24_IP, "shell", S24_HEADS_UP_READ]),
-            args(&["-s", S24_IP, "exec-out", &format!("{S24_HEADS_UP_READ} ")]),
             args(&[
                 "-s",
                 S24_IP,
-                "exec-out",
-                &format!("{S24_HEADS_UP_READ}; id"),
+                "push",
+                "C:/other/agentroid-dump.dex",
+                DUMP_HELPER_REMOTE,
             ]),
-            args(&["-s", S24_IP, "exec-out", IDLE_FREE_READ]),
+            args(&["-s", S24_IP, "push", STAGED, "/data/local/tmp/other.dex"]),
+            args(&["-s", S24_IP, "push", STAGED, DUMP_HELPER_REMOTE, "x"]),
+            args(&["-s", S24_IP, "push", STAGED]),
+            args(&["-s", S24_IP, "exec-out", DUMP_HELPER_HASH_READ]),
+            args(&["-s", S24_IP, "shell", "install x.apk"]),
+            args(&["-s", "192.0.2.1:5555", "push", STAGED, DUMP_HELPER_REMOTE]),
         ] {
-            let r = GuardedRunner::with_s24_heads_up(spy());
-            assert!(r.run(&near, 1000).is_err(), "{near:?}");
+            assert!(helper().run(&near, 1000).is_err(), "{near:?}");
         }
-        assert!(GuardedRunner::new(spy()).run(&exact, 1000).is_err());
-        assert!(GuardedRunner::with_s24_call_state(spy())
-            .run(&exact, 1000)
+        // an empty staged path matches nothing
+        let blank = GuardedRunner::with_s24_helper(spy(), String::new(), book.clone());
+        assert!(blank
+            .run(&args(&["-s", S24_IP, "push", "", DUMP_HELPER_REMOTE]), 1000)
             .is_err());
-        let (_, book) = book_with_lease(&[S24_IP]);
+        // other runners: the push is code, refused
+        assert!(leased_s24(&book).run(&push, 1000).is_err());
+        assert!(GuardedRunner::new(spy()).run(&push, 1000).is_err());
+        assert!(GuardedRunner::new(spy()).run(&hash, 1000).is_err());
+        // past the lease: refused, nothing sent but the probe
+        clock.advance(30 * 60_000);
+        let r = helper();
+        assert!(r.run(&push, 1000).is_err());
+        assert!(r.run(&hash, 1000).is_err());
+        let sent = r.inner.calls.borrow();
+        assert_eq!(sent.len(), 1, "only the identity probe: {sent:?}");
         assert!(
-            leased_s24(&book).run(&exact, 1000).is_err(),
-            "a lease never lets it through"
+            !sent
+                .iter()
+                .any(|c| c.iter().any(|w| w == "push" || w.contains("sha256sum"))),
+            "{sent:?}"
         );
-        assert!(!S24_READS.contains(&format!("exec-out {S24_HEADS_UP_READ}").as_str()));
+        drop(sent);
+        // and on an ordinary phone the helper runner is a plain runner
+        let poco = GuardedRunner::with_s24_helper(
+            Spy {
+                hw: POCO_HW.into(),
+                calls: RefCell::new(vec![]),
+            },
+            STAGED.into(),
+            book.clone(),
+        );
+        assert!(poco
+            .run(
+                &args(&["-s", "192.0.2.78:37123", "push", STAGED, DUMP_HELPER_REMOTE]),
+                1000
+            )
+            .is_ok());
     }
 
     #[test]

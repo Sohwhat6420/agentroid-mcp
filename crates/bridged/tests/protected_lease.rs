@@ -455,7 +455,8 @@ fn push_and_pull_on_the_protected_phone_reach_core_s_file_gate_under_the_lease()
     run(async {
         let h = start("files");
         let mut c = Client::leased(&h, "lane-a").await;
-        // a protected path is refused before any ask or lease
+        // any folder, a protected app's included, goes to core, which asks for the lease (no
+        // daemon-side wall, and no rule about what a path names)
         let r = c
             .call(
                 "device.call",
@@ -463,9 +464,7 @@ fn push_and_pull_on_the_protected_phone_reach_core_s_file_gate_under_the_lease()
             )
             .await;
         assert!(r["error"].is_object(), "{r}");
-        let msg = r["error"]["message"].as_str().unwrap_or("").to_string();
-        assert!(msg.contains("protected"), "{msg}");
-        assert!(h.sent().is_empty(), "no ask for a refused path");
+        assert_eq!(h.sent().len(), 1, "core asked: {r}");
         assert!(
             !h.phone
                 .lock()
@@ -473,16 +472,7 @@ fn push_and_pull_on_the_protected_phone_reach_core_s_file_gate_under_the_lease()
                 .reached
                 .iter()
                 .any(|l| l.contains("whatsapp")),
-            "nothing reached the phone"
+            "nothing reached the phone before the Allow"
         );
-        // an ordinary folder goes to core, which asks for the lease (no daemon-side wall)
-        let r = c
-            .call(
-                "device.call",
-                json!({ "device": PROT, "call": { "tool": "pull_new", "dir": "/sdcard/Download" } }),
-            )
-            .await;
-        assert!(r["error"].is_object(), "{r}");
-        assert_eq!(h.sent().len(), 1, "core asked: {r}");
     });
 }

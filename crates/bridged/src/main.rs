@@ -69,6 +69,10 @@ use tokio::sync::watch;
 /// Where the protected-device lease keeps a Deny's hold, in the state directory.
 const PROTECTED_HOLDS_FILE: &str = "protected-holds.json";
 
+/// The daemon's staged copy of the dump helper, in the state directory (pushed from here, never
+/// from the temp folder, when the protected-device lease is on).
+const DUMP_HELPER_STAGED: &str = "agentroid-dump.dex";
+
 /// Backend used when neither --fake nor --adb is given: no devices, so nothing can be leased or driven.
 struct NoDevices;
 
@@ -485,11 +489,18 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
             None => GuardedRunner::new(AdbRunner::new(path)),
         };
         let mut transport = bridged::live::AdbTransport::new(runner);
-        if protected_book.is_some() {
-            // the protected phone's heads-up check, through its own single-purpose runner
-            transport = transport.with_heads_up_runner(Box::new(GuardedRunner::with_s24_heads_up(
-                AdbRunner::new(path),
-            )));
+        if let Some(book) = &protected_book {
+            // the dump helper, staged in the state directory and checked by hash on the protected
+            // phone through its own single-purpose runner
+            let staged = args.state_dir.join(DUMP_HELPER_STAGED);
+            transport = transport.with_dump_helper(
+                Box::new(GuardedRunner::with_s24_helper(
+                    AdbRunner::new(path),
+                    staged.to_string_lossy().into_owned(),
+                    book.clone(),
+                )),
+                staged,
+            );
         }
         let mut core = Core::new(transport, SystemClock::new());
         // Nothing is allowed unless named: --allow-serial, the allow file, or --allow-emulators

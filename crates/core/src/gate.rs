@@ -334,9 +334,9 @@ pub enum Refusal {
     /// The protected phone has no open lease and none could be opened (denied, held after a Deny,
     /// no channel, no daemon lease, the clock or the presence file could not be trusted).
     LeaseRefused { tool: &'static str, why: String },
-    /// A fixed protection of the protected phone that no lease lifts (Gmail and WhatsApp, the
-    /// keyguard and notification previews, the owner's PIN, a path naming the protected apps, an unknown
-    /// screen). `rule` is `app`, `preview`, `pin`, `unlock`, `path` or `screen`.
+    /// A fixed engineering protection of the protected phone that no lease lifts (digits on a PIN
+    /// prompt, `unlock`, a code push, a raw shell line, a screen that could not be read for the PIN
+    /// check). `rule` is `pin`, `unlock`, `code`, `shell` or `screen`.
     Protected {
         tool: &'static str,
         rule: &'static str,

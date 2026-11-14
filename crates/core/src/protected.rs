@@ -5,11 +5,18 @@
 //! ruled reads. With it, a call that names the protected phone runs only under an open lease, and
 //! one lease covers a burst of work (30 min by default):
 //!
+//! The gate is the owner's approval, not the screen's content (his ruling of 14 Nov 2026: nothing
+//! on the protected phone is blocked from being seen; a notification asks for his approval before
+//! it is taken over). What stays refused under any lease is engineering safety: digits on a PIN
+//! prompt, `unlock` (it would type his PIN), raw shell lines, scripts, link segments, code pushes
+//! and every adb line outside the guard's exact shapes.
+//!
 //! * **One Allow.** The first call with no lease sends the owner one push (Allow / Deny, answered
 //!   within the ask window, 10 min by default) and is refused as `lease:pending`; the agent retries
 //!   once the owner has tapped Allow. The Allow is followed by one quiet notice ("open until
-//!   HH:MM UTC") with a Deny button. An Allowed lease also satisfies the screen lock's in-use check,
-//!   so one Allow is never asked for twice; an `ask-screen` No still refuses.
+//!   HH:MM SGT") with a Deny button. An Allowed lease also satisfies the screen lock's in-use check,
+//!   so one Allow is never asked for twice; an `ask-screen` No still refuses. An Allow that comes
+//!   after the ask window has closed opens nothing.
 //! * **One ask per phone.** At most one ask is out at a time, whoever it is for; another holder is
 //!   refused without a push, and no new ask goes out within the ask window of the last one.
 //! * **Overnight.** When a presence file signed with the owner's key (HMAC-SHA256), written in the
@@ -25,17 +32,13 @@
 //!   owner is awake; after a daytime Deny (or no answer), for the ask window. The hold is kept in
 //!   the holds file (`--state-dir`'s `protected-holds.json`), so a restart does not lift it; a file
 //!   that cannot be read holds until a trusted presence state changes. The denied holder may lift
-//!   it with a fresh `allow <id>` within the ask window of the Deny. A channel that cannot be read
-//!   for 2 min closes the lease.
-//! * **Never under any lease.** Gmail (and Gmail Go) and WhatsApp (any package naming it, any
-//!   short name resolving to one), their web hosts (`open_url` with any package, and typed text),
-//!   the keyguard, the notification shade, notification rows, heads-up notifications, Recents,
-//!   Notification history and notification-listener screens, any node outside the launcher naming
-//!   a protected app, digits on a PIN prompt (one at a time included), `unlock`, paths naming the
-//!   protected apps, raw shell lines and link segments. Reads are refused on those screens too, and
-//!   a screenshot is checked again after it is taken.
+//!   it with a fresh `allow <id>` within the ask window of the Deny; an ask nobody answered cannot
+//!   be lifted that way. The Deny events already seen are kept with the holds, so an old Deny
+//!   never closes a lease allowed after a restart. A channel that cannot be read for 2 min closes
+//!   the lease.
 //! * **Logged first.** Every lease is written to the audit log before it opens (a failed write
-//!   opens nothing), and every close is logged with its reason.
+//!   opens nothing), and every close is logged with its reason. A close that cannot be written
+//!   stays queued, and every call on the protected phone is refused until it is written.
 
 use crate::approval::{Approver, Outcome as Answer, Request, Style};
 use crate::audit::{AuditLog, Entry};
@@ -64,15 +67,6 @@ pub const PRESENCE_DOMAIN: &str = "agentroid-presence-v1";
 pub const DENY_POLL_MS: u64 = 10_000;
 /// How long the Deny channel may stay unreadable before the lease is closed.
 pub const DENY_POLL_FAIL_MS: u64 = 120_000;
-/// The packages that are never driven, read or opened on the protected phone; any package whose
-/// name contains `whatsapp` is one too.
-pub const PROTECTED_APPS: [&str; 4] = [
-    "com.google.android.gm",
-    "com.google.android.gm.lite",
-    "com.whatsapp",
-    "com.whatsapp.w4b",
-];
-
 /// Clamp an ask window to `1..=MAX_ASK_WINDOW_MIN` minutes.
 pub fn clamp_ask_window_min(m: u64) -> u64 {
     m.clamp(1, MAX_ASK_WINDOW_MIN)
@@ -285,78 +279,9 @@ pub fn read_presence(cfg: &PresenceConfig, now_ms: u64) -> Presence {
 }
 
 // ---------------------------------------------------------------------------------------------
-// what is never done on the protected phone
+// the PIN rule (a credential, not content)
 // ---------------------------------------------------------------------------------------------
 
-/// Gmail, Gmail Go, WhatsApp, WhatsApp Business, and any package naming WhatsApp.
-pub fn is_protected_package(p: &str) -> bool {
-    let p = p.trim().to_ascii_lowercase();
-    PROTECTED_APPS.contains(&p.as_str())
-        || p.starts_with("com.google.android.gm.")
-        || p.contains("whatsapp")
-}
-
-/// Does a label or name mention a protected app (its name, or Gmail's web hosts)?
-pub fn names_protected(s: &str) -> bool {
-    let s = s.to_lowercase();
-    s.contains("whatsapp")
-        || s.contains("gmail")
-        || s.contains("mail.google")
-        || s.contains("inbox.google")
-}
-
-/// The web hosts of the protected apps: a page there shows the same mail and chats in a browser.
-pub const PROTECTED_HOSTS: [&str; 6] = [
-    "mail.google.com",
-    "inbox.google.com",
-    "gmail.com",
-    "web.whatsapp.com",
-    "wa.me",
-    "whatsapp.com",
-];
-
-/// Does `s` (a URI, or typed text) contain one of the [`PROTECTED_HOSTS`], in any case?
-pub fn names_protected_host(s: &str) -> bool {
-    let s = s.to_lowercase();
-    PROTECTED_HOSTS.iter().any(|h| s.contains(h))
-}
-
-/// Resource-id and class fragments of the keyguard (lock screen and bouncer).
-const KEYGUARD_MARKS: [&str; 6] = [
-    "keyguard",
-    "bouncer",
-    "lock_icon",
-    "lockscreen",
-    "lock_screen",
-    "notification_panel_lock",
-];
-/// Fragments of the notification shade, notification rows, heads-up notifications and quick
-/// settings (the status bar's own icon row is not one of them).
-const PREVIEW_MARKS: [&str; 14] = [
-    "expandablenotificationrow",
-    "notification_stack_scroller",
-    "notificationstackscroll",
-    "notification_panel",
-    "notification_container",
-    "notification_main_column",
-    "notification_content",
-    "notification_row",
-    "heads_up",
-    "headsup",
-    "qs_frame",
-    "qs_panel",
-    "quick_settings",
-    "status_bar_expanded",
-];
-/// Fragments of Recents (the overview's app thumbnails), in System UI or a launcher.
-const RECENTS_MARKS: [&str; 6] = [
-    "recents",
-    "overview_panel",
-    "task_thumbnail",
-    "snapshot",
-    "task_view",
-    "taskview",
-];
 /// Fragments of a PIN or passcode prompt.
 const PIN_MARKS: [&str; 6] = [
     "pinentry",
@@ -367,58 +292,15 @@ const PIN_MARKS: [&str; 6] = [
     "pin_pad",
 ];
 const PIN_TEXTS: [&str; 4] = ["enter pin", "enter your pin", "pin code", "passcode"];
-/// Resource-id and class fragments of a screen that lists past notifications: Settings'
-/// Notification history and notification log, and the notification-listener (notification
-/// access) screens.
-const NOTIFICATION_LOG_MARKS: [&str; 9] = [
-    "notification_history",
-    "notificationhistory",
-    "notification_log",
-    "notificationlog",
-    "notificationstation",
-    "notification_station",
-    "notification_listener",
-    "notificationlistener",
-    "notification_access",
-];
-/// The titles of those screens, as a title bar shows them.
-const NOTIFICATION_LOG_TITLES: [&str; 6] = [
-    "notification history",
-    "notification log",
-    "notification access",
-    "device & app notifications",
-    "device and app notifications",
-    "notification read, reply & control",
-];
-/// Resource-id fragments of a screen's title bar (not a list row's `android:id/title`).
-const TITLE_BAR_MARKS: [&str; 4] = ["toolbar", "action_bar", "appbar", "collapsing"];
 
-/// What the protected phone's screen shows that matters to the lease.
+/// What the protected phone's screen shows that matters to the lease: a PIN prompt, and where its
+/// digit keys sit. Nothing else on the screen is judged (the owner's ruling of 14 Nov 2026:
+/// nothing is blocked from being seen; the gate is his Allow).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScreenFacts {
-    /// A protected app's package on screen.
-    pub protected_app: Option<String>,
-    pub keyguard: bool,
-    pub preview: bool,
-    pub recents: bool,
-    /// Notification history, the notification log, or a notification-listener screen.
-    pub notification_log: bool,
-    /// A node outside the launcher (a status-bar icon's description, a toast, a share target, a
-    /// list of apps, a browser tab) names a protected app.
-    pub protected_mention: bool,
     pub pin_prompt: bool,
-    /// Where a node naming a protected app sits (a launcher icon, a share target): no touch there.
-    pub protected_bounds: Vec<(i32, i32, i32, i32)>,
     /// Where a single-digit key sits on a PIN prompt.
     pub digit_bounds: Vec<(i32, i32, i32, i32)>,
-}
-
-fn is_systemui(pkg: &str) -> bool {
-    pkg == "com.android.systemui"
-}
-
-fn is_launcher(pkg: &str) -> bool {
-    pkg.contains("launcher") || pkg.ends_with(".home") || pkg.contains("quickstep")
 }
 
 /// Read the facts from a uiautomator dump. `Err`: the dump did not parse (the message never
@@ -428,53 +310,20 @@ pub fn screen_facts(xml: &str) -> Result<ScreenFacts, String> {
         crate::tree::parse(xml, false).map_err(|_| "the screen did not parse".to_string())?;
     let mut f = ScreenFacts::default();
     for n in &tree.nodes {
-        let pkg = n.package.to_ascii_lowercase();
         let rid = n.rid.to_ascii_lowercase();
         let class = n.class.to_ascii_lowercase();
-        let marks = |list: &[&str]| list.iter().any(|m| rid.contains(m) || class.contains(m));
-        if !pkg.is_empty() && is_protected_package(&pkg) && f.protected_app.is_none() {
-            f.protected_app = Some(pkg.clone());
-        }
-        if is_systemui(&pkg) {
-            if marks(&KEYGUARD_MARKS) {
-                f.keyguard = true;
-            }
-            if marks(&PREVIEW_MARKS) {
-                f.preview = true;
-            }
-        }
-        // any package: a past notification's text is no safer in Settings than in System UI
-        if marks(&NOTIFICATION_LOG_MARKS) {
-            f.notification_log = true;
-        }
-        let title_bar = TITLE_BAR_MARKS.iter().any(|m| rid.contains(m));
-        let is_title = |s: &str| {
-            let s = s.trim().to_lowercase();
-            NOTIFICATION_LOG_TITLES.contains(&s.as_str())
-        };
-        if title_bar && (is_title(&n.text) || is_title(&n.desc)) {
-            f.notification_log = true;
-        }
-        // a launcher's icon of a protected app is no read of its content (a touch there is
-        // refused below); a node naming one anywhere else may be its content
-        if !is_launcher(&pkg) && (names_protected(&n.text) || names_protected(&n.desc)) {
-            f.protected_mention = true;
-        }
-        if (is_systemui(&pkg) || is_launcher(&pkg)) && marks(&RECENTS_MARKS) {
-            f.recents = true;
-        }
         let label = format!("{} {}", n.text, n.desc).to_lowercase();
-        if marks(&PIN_MARKS) || n.flags.password || PIN_TEXTS.iter().any(|t| label.contains(t)) {
+        if PIN_MARKS
+            .iter()
+            .any(|m| rid.contains(m) || class.contains(m))
+            || n.flags.password
+            || PIN_TEXTS.iter().any(|t| label.contains(t))
+        {
             f.pin_prompt = true;
         }
         if let Some(b) = n.bounds {
-            if names_protected(&n.text) || names_protected(&n.desc) || names_protected(&rid) {
-                f.protected_bounds.push((b.l, b.t, b.r, b.b));
-            }
-            let t = n.text.trim();
-            let d = n.desc.trim();
             let one_digit = |s: &str| s.len() == 1 && s.chars().all(|c| c.is_ascii_digit());
-            if one_digit(t) || one_digit(d) {
+            if one_digit(n.text.trim()) || one_digit(n.desc.trim()) {
                 f.digit_bounds.push((b.l, b.t, b.r, b.b));
             }
         }
@@ -500,157 +349,78 @@ pub fn digit_key(name: &str) -> bool {
     n.len() == 1 && n.chars().all(|c| c.is_ascii_digit())
 }
 
-/// A refusal for any call on this screen, reads included: the keyguard, notification previews,
-/// Recents, a system bar naming a protected app, or a protected app on screen.
-pub fn read_refusal(f: &ScreenFacts) -> Option<(&'static str, String)> {
-    if f.keyguard {
-        return Some((
-            "preview",
-            "the keyguard is showing (notification previews and the PIN pad live there)".into(),
-        ));
+/// Does `call` need the PIN check before it is sent (it could enter a digit)? Typing, a key other
+/// than an exit key, a tap, a long press and a swipe; reads and launches do not.
+pub fn needs_pin_check(call: &Call) -> bool {
+    match call {
+        Call::TypeText { .. } | Call::Tap { .. } | Call::LongPress { .. } | Call::Swipe { .. } => {
+            true
+        }
+        Call::Key { name } => !exit_key(name),
+        _ => false,
     }
-    if f.preview {
-        return Some((
-            "preview",
-            "the notification shade or a notification is showing".into(),
-        ));
-    }
-    if f.recents {
-        return Some(("preview", "Recents is showing (app thumbnails)".into()));
-    }
-    if f.notification_log {
-        return Some((
-            "preview",
-            "Notification history, a notification log or a notification-listener screen is showing"
-                .into(),
-        ));
-    }
-    if f.protected_mention {
-        return Some((
-            "preview",
-            "something on screen outside the launcher names a protected app (a notification, a share target, a page of it)".into(),
-        ));
-    }
-    if let Some(p) = &f.protected_app {
-        return Some(("app", format!("{p} is on screen")));
-    }
-    None
 }
 
-/// The screen check for `call` before it is sent: exit keys always go; then [`read_refusal`]; then
-/// digits on a PIN prompt (typed, pressed or tapped, one at a time included).
-pub fn screen_refusal(
+/// The PIN check for `call` before it is sent: digits on a PIN prompt (typed, pressed or tapped,
+/// one at a time included) are refused. Exit keys always go. `at` is a touch's device point.
+pub fn pin_refusal(
     f: &ScreenFacts,
     call: &Call,
     at: Option<(i32, i32)>,
 ) -> Option<(&'static str, String)> {
+    if !f.pin_prompt {
+        return None;
+    }
     if let Call::Key { name } = call {
         if exit_key(name) {
             return None;
         }
     }
-    if let Some(r) = read_refusal(f) {
-        return Some(r);
-    }
-    if f.pin_prompt {
-        let digits = match call {
-            Call::TypeText { text, .. } => text.chars().any(|c| c.is_ascii_digit()),
-            Call::Key { name } => digit_key(name),
-            _ => false,
-        };
-        if digits {
-            return Some((
-                "pin",
-                "a PIN prompt is showing, and digits are never entered there".into(),
-            ));
-        }
-    }
-    if let Some((x, y)) = at {
-        let inside = |b: &(i32, i32, i32, i32)| x >= b.0 && x < b.2 && y >= b.1 && y < b.3;
-        if f.protected_bounds.iter().any(inside) {
-            return Some(("app", "the touch lands on a protected app".into()));
-        }
-        if f.digit_bounds.iter().any(inside) {
-            return Some((
-                "pin",
-                "the touch lands on a PIN digit, and digits are never entered there".into(),
-            ));
-        }
-    }
-    None
-}
-
-/// Does a URI open a protected app or its web pages (its scheme, host or package, whatever app
-/// would open it)? `mailto:` counts: it opens the mail app.
-pub fn uri_names_protected(uri: &str) -> bool {
-    let u = uri.trim().to_lowercase();
-    names_protected(&u)
-        || names_protected_host(&u)
-        || u.contains("com.google.android.gm")
-        || u.starts_with("mailto:")
-}
-
-/// Typed text naming a protected app's web host (`type_text`, and `set_value`, which the daemon
-/// sends as a `type_text`): typed into an address bar, it would open the protected app's pages.
-pub fn typed_refusal(call: &Call) -> Option<(&'static str, String)> {
-    let Call::TypeText { text, .. } = call else {
-        return None;
+    let digits = match call {
+        Call::TypeText { text, .. } => text.chars().any(|c| c.is_ascii_digit()),
+        Call::Key { name } => digit_key(name),
+        _ => false,
     };
-    names_protected_host(text).then(|| {
+    let on_digit = at.is_some_and(|(x, y)| {
+        f.digit_bounds
+            .iter()
+            .any(|b| x >= b.0 && x < b.2 && y >= b.1 && y < b.3)
+    });
+    (digits || on_digit).then(|| {
         (
-            "app",
-            "the text names a protected app's web host (it would open its pages)".to_string(),
+            "pin",
+            "a PIN prompt is showing, and digits are never entered there".to_string(),
         )
     })
 }
 
-/// A launch that would open a protected app: `open_app`, `open_url`, `start_activity`.
-pub fn launch_refusal(call: &Call) -> Option<(&'static str, String)> {
-    let hit = match call {
-        Call::OpenApp { package } => is_protected_package(package) || names_protected(package),
-        Call::OpenUrl { uri, package } => {
-            uri_names_protected(uri)
-                || package
-                    .as_deref()
-                    .is_some_and(|p| is_protected_package(p) || names_protected(p))
-        }
-        Call::StartActivity {
-            component,
-            action: _,
-            data,
-        } => {
-            let pkg = component.split('/').next().unwrap_or_default();
-            is_protected_package(pkg)
-                || names_protected(component)
-                || data.as_deref().is_some_and(uri_names_protected)
-        }
-        _ => false,
-    };
-    hit.then(|| ("app", "it would open a protected app".to_string()))
-}
-
-/// A phone path as the protected-path check compares it: lower case, `\` as `/`, `//` and `/./`
-/// collapsed.
-pub fn normalise_path(p: &str) -> String {
-    let p = p.trim().to_lowercase().replace('\\', "/");
-    let mut out: Vec<&str> = vec![];
-    for seg in p.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        out.push(seg);
+/// The holder's name as the owner's push shows it (review round 3, item 13): words with a URL in
+/// them dropped (a scheme, `www.`, or a dot and a slash), control characters and runs of spaces
+/// taken out, at most 24 characters, after "Agent session:" so it never reads as the daemon's own
+/// words.
+pub fn push_holder(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| {
+            let l = w.to_ascii_lowercase();
+            !w.is_empty()
+                && !l.contains("://")
+                && !l.starts_with("www.")
+                && !(l.contains('.') && l.contains('/'))
+        })
+        .collect();
+    let clean: String = words
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(24)
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        "Agent session: (no name)".into()
+    } else {
+        format!("Agent session: {clean}")
     }
-    let lead = if p.starts_with('/') { "/" } else { "" };
-    format!("{lead}{}", out.join("/"))
-}
-
-/// A push or pull path that names a protected app (`whatsapp`, `gmail`, `com.google.android.gm`,
-/// which also catches `com.google.android.gms`) is refused on the protected phone, in any case or
-/// spelling of its separators.
-pub fn path_refusal(p: &str) -> Option<String> {
-    let n = normalise_path(p);
-    (n.contains("whatsapp") || n.contains("gmail") || n.contains("com.google.android.gm"))
-        .then(|| "the path names a protected app".to_string())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,6 +456,9 @@ struct Held {
     holder: Option<Holder>,
     at_ms: u64,
     until: Until,
+    /// May the denied holder lift the hold with a fresh `allow <id>`? Only after a Deny: an ask
+    /// nobody answered is never re-allowed (review round 3, item 9).
+    reallow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -695,8 +468,11 @@ struct Running {
     fail_since: Option<u64>,
 }
 
-/// The holds file's format version.
-pub const HOLDS_VERSION: u64 = 1;
+/// The holds file's format version (2 adds `reallow` and the Deny events seen; a version-1 file
+/// is still read, its hold not re-allowable).
+pub const HOLDS_VERSION: u64 = 2;
+/// How many Deny event ids the holds file keeps (the newest).
+pub const SEEN_DENIES_KEPT: usize = 64;
 
 /// The lease's state in core.
 pub struct Protected {
@@ -710,6 +486,11 @@ pub struct Protected {
     running: Option<Running>,
     /// When the last ask went out: no other goes out within the ask window of it.
     last_ask_ms: Option<u64>,
+    /// The Deny events already applied (newest last), kept in the holds file so an old Deny never
+    /// closes a lease re-allowed after a restart (review round 3, item 8).
+    seen_denies: Vec<String>,
+    /// `seen_denies` has been handed to the approver since start-up.
+    seen_fed: bool,
 }
 
 impl std::fmt::Debug for Protected {
@@ -743,14 +524,17 @@ fn clean(s: &str, n: usize) -> String {
         .collect::<String>()
 }
 
-/// `HH:MM UTC` for Unix ms (the push says when the lease ends).
-pub fn utc_hhmm(ms: u64) -> String {
-    let m = ms / 60_000;
-    format!("{:02}:{:02} UTC", (m / 60) % 24, m % 60)
+/// Singapore's offset from UTC (no daylight saving).
+const SGT_OFFSET_MIN: u64 = 8 * 60;
+
+/// `HH:MM SGT` for Unix ms (the push says when the lease ends, in the owner's own time zone).
+pub fn sgt_hhmm(ms: u64) -> String {
+    let m = (ms / 60_000 + SGT_OFFSET_MIN) % (24 * 60);
+    format!("{:02}:{:02} SGT", m / 60, m % 60)
 }
 
-/// The holds file's text for `held` (`None`: no hold).
-fn holds_json(held: Option<&Held>) -> String {
+/// The holds file's text for `held` (`None`: no hold) and the Deny events seen.
+fn holds_json(held: Option<&Held>, seen: &[String]) -> String {
     let hold = held.map(|h| {
         let (until, until_ms, state) = match &h.until {
             Until::Window(t) => ("window", Some(*t), None),
@@ -766,21 +550,35 @@ fn holds_json(held: Option<&Held>) -> String {
             "until": until,
             "until_ms": until_ms,
             "presence_state": state,
+            "reallow": h.reallow,
         })
     });
-    serde_json::json!({ "version": HOLDS_VERSION, "hold": hold }).to_string()
+    serde_json::json!({ "version": HOLDS_VERSION, "hold": hold, "seen_denies": seen }).to_string()
 }
 
-/// Read a holds file's text. `Ok(None)`: no hold. `Err`: it could not be read as one (the caller
-/// holds until the presence state changes).
-fn parse_holds(text: &str) -> Result<Option<Held>, String> {
+/// What a holds file says: the hold (`None`: none) and the Deny events seen.
+type Holds = (Option<Held>, Vec<String>);
+
+/// Read a holds file's text. `Err`: it could not be read as one (the caller holds until the
+/// presence state changes).
+fn parse_holds(text: &str) -> Result<Holds, String> {
     let v: serde_json::Value =
         serde_json::from_str(text.trim()).map_err(|_| "the holds file is not JSON".to_string())?;
-    if v.get("version").and_then(serde_json::Value::as_u64) != Some(HOLDS_VERSION) {
+    let version = v.get("version").and_then(serde_json::Value::as_u64);
+    if version != Some(HOLDS_VERSION) && version != Some(1) {
         return Err("the holds file has another version".into());
     }
+    let seen = match v.get("seen_denies") {
+        None if version == Some(1) => vec![],
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .map(|x| x.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "the holds file's seen Deny events are malformed".to_string())?,
+        _ => return Err("the holds file's seen Deny events are malformed".into()),
+    };
     let h = match v.get("hold") {
-        Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Null) => return Ok((None, seen)),
         Some(h) => h,
         None => return Err("the holds file has no hold".into()),
     };
@@ -815,7 +613,13 @@ fn parse_holds(text: &str) -> Result<Option<Held>, String> {
         ),
         _ => return Err(bad()),
     };
-    Ok(Some(Held {
+    // version 1 kept no `reallow`: its hold is not lifted by an Allow
+    let reallow = match h.get("reallow") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        None if version == Some(1) => false,
+        _ => return Err(bad()),
+    };
+    let held = Held {
         req: Request {
             id: id.to_string(),
             device: String::new(),
@@ -830,7 +634,9 @@ fn parse_holds(text: &str) -> Result<Option<Held>, String> {
         holder,
         at_ms: at,
         until,
-    }))
+        reallow,
+    };
+    Ok((Some(held), seen))
 }
 
 /// Write `text` to `path` atomically: a temporary file beside it, then a rename over it.
@@ -860,20 +666,24 @@ impl Protected {
             held: None,
             running: None,
             last_ask_ms: None,
+            seen_denies: vec![],
+            seen_fed: false,
         };
-        p.held = p.load_holds();
+        (p.held, p.seen_denies) = p.load_holds();
         p
     }
 
-    fn load_holds(&self) -> Option<Held> {
-        let path = self.cfg.holds_file.as_ref()?;
+    fn load_holds(&self) -> Holds {
+        let Some(path) = self.cfg.holds_file.as_ref() else {
+            return (None, vec![]);
+        };
         let unknown = |why: String| {
             let now = self.book.now_ms().unwrap_or(0);
             let state = match self.presence(now) {
                 Presence::Untrusted(_) => None,
                 p => Some(p.to_string()),
             };
-            Some(Held {
+            let hold = Held {
                 req: Request {
                     id: format!("unknown hold ({why})"),
                     device: String::new(),
@@ -888,14 +698,13 @@ impl Protected {
                 holder: None,
                 at_ms: now,
                 until: Until::Unknown(state),
-            })
+                reallow: false,
+            };
+            (Some(hold), vec![])
         };
         match std::fs::read_to_string(path) {
-            Ok(text) => match parse_holds(&text) {
-                Ok(h) => h,
-                Err(why) => unknown(why),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(text) => parse_holds(&text).unwrap_or_else(unknown),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, vec![]),
             Err(e) => unknown(format!("the holds file could not be read: {}", e.kind())),
         }
     }
@@ -905,9 +714,21 @@ impl Protected {
     fn set_held(&mut self, h: Option<Held>) -> Result<(), String> {
         self.held = h;
         match &self.cfg.holds_file {
-            Some(path) => write_atomic(path, &holds_json(self.held.as_ref()))
+            Some(path) => write_atomic(path, &holds_json(self.held.as_ref(), &self.seen_denies))
                 .map_err(|e| format!("the holds file could not be written: {}", e.kind())),
             None => Ok(()),
+        }
+    }
+
+    /// Keep a Deny event as applied (written with the next [`Self::set_held`]).
+    fn note_deny(&mut self, event_id: &str) {
+        if event_id.is_empty() || self.seen_denies.iter().any(|e| e == event_id) {
+            return;
+        }
+        self.seen_denies.push(event_id.to_string());
+        if self.seen_denies.len() > SEEN_DENIES_KEPT {
+            let extra = self.seen_denies.len() - SEEN_DENIES_KEPT;
+            self.seen_denies.drain(..extra);
         }
     }
 
@@ -947,7 +768,9 @@ impl Protected {
     }
 
     /// Write every lease the book closed without core (it ran out, its holder released the phone
-    /// or went) to the audit log. `Err`: a write failed (the rest are dropped).
+    /// or went) to the audit log, oldest first. `Err`: a write failed; that close and every later
+    /// one go back in the queue (review round 3, item 10), and the caller refuses until they are
+    /// written.
     pub fn audit_closes(
         &mut self,
         audit: Option<&mut AuditLog>,
@@ -966,8 +789,9 @@ impl Protected {
         let Some(a) = audit else {
             return Ok(());
         };
-        for (l, why) in ended {
-            a.append(&Entry {
+        let mut rest = ended.into_iter();
+        while let Some((l, why)) = rest.next() {
+            let written = a.append(&Entry {
                 device: String::new(),
                 tool: tool.to_string(),
                 decision: "blocked".into(),
@@ -980,11 +804,18 @@ impl Protected {
                 ),
                 target: String::new(),
                 screen: String::new(),
-            })
-            .map_err(|e| Refusal::Audit {
-                tool,
-                why: e.to_string(),
-            })?;
+            });
+            if let Err(e) = written {
+                let mut unwritten = vec![(l, why)];
+                unwritten.extend(rest);
+                self.book.requeue_ended(unwritten);
+                return Err(Refusal::Audit {
+                    tool,
+                    why: format!(
+                        "a lease close could not be written to the audit log ({e}); it is kept, and the protected phone is refused until it is written"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -1031,7 +862,7 @@ impl Protected {
         n.expires_ms = now.saturating_add(self.cfg.lease_ms);
         n.reason = format!(
             "Lease on the protected phone open until {} ({} min).",
-            utc_hhmm(n.expires_ms),
+            sgt_hhmm(n.expires_ms),
             self.cfg.lease_ms / 60_000
         );
         a.send(&n)
@@ -1053,6 +884,12 @@ impl Protected {
         let device = device_name(d);
         let refused = |why: String| Refusal::LeaseRefused { tool, why };
         self.audit_closes(audit.as_deref_mut(), tool)?;
+        if !self.seen_fed {
+            if let Some(a) = approver.as_deref_mut() {
+                a.mark_seen(&self.seen_denies);
+                self.seen_fed = true;
+            }
+        }
         let Some(now) = self.book.now_ms() else {
             return Err(refused("the wall clock cannot be read".into()));
         };
@@ -1114,10 +951,11 @@ impl Protected {
                             None => Err("no approval channel".into()),
                         };
                         match polled {
-                            Ok(false) => run.fail_since = None,
-                            Ok(true) => {
+                            Ok(None) => run.fail_since = None,
+                            Ok(Some(event_id)) => {
                                 let req = run.req.clone();
                                 self.running = None;
+                                self.note_deny(&event_id);
                                 self.book.close();
                                 let asleep = lease.granted == Granted::Overnight
                                     || self.presence(now).asleep();
@@ -1130,6 +968,7 @@ impl Protected {
                                     } else {
                                         Until::Window(now.saturating_add(self.cfg.ask_window_ms))
                                     },
+                                    reallow: true,
                                 }));
                                 log(
                                     audit.as_deref_mut(),
@@ -1204,8 +1043,9 @@ impl Protected {
 
         // 2. a hold after a Deny (or no answer), for every holder: a new holder inherits it
         if let Some(h) = self.held.clone() {
-            // only the denied holder, within the ask window after the Deny, may re-allow
-            let own = h.holder.as_ref() == Some(&holder);
+            // only the denied holder, within the ask window after the Deny, may re-allow; an ask
+            // nobody answered is never re-allowed
+            let own = h.reallow && h.holder.as_ref() == Some(&holder);
             let until = h.at_ms.saturating_add(self.cfg.ask_window_ms);
             if let Some(ev) = approver
                 .as_deref_mut()
@@ -1376,7 +1216,8 @@ impl Protected {
                         ),
                     )?;
                 }
-                Some(Answer::Denied { .. }) => {
+                Some(Answer::Denied { event_id }) => {
+                    self.note_deny(&event_id);
                     let asleep = self.presence(now).asleep();
                     let saved = self.set_held(Some(Held {
                         req: p.req.clone(),
@@ -1387,6 +1228,7 @@ impl Protected {
                         } else {
                             Until::Window(now.saturating_add(self.cfg.ask_window_ms))
                         },
+                        reallow: true,
                     }));
                     log(
                         audit.as_deref_mut(),
@@ -1406,6 +1248,7 @@ impl Protected {
                         holder: Some(p.holder.clone()),
                         at_ms: now,
                         until: Until::Window(now.saturating_add(self.cfg.ask_window_ms)),
+                        reallow: false,
                     }));
                     log(
                         audit.as_deref_mut(),
@@ -1428,7 +1271,7 @@ impl Protected {
         };
         let presence = self.presence(now);
         let minutes = self.cfg.lease_ms / 60_000;
-        let who = clean(&holder.name, 40);
+        let who = push_holder(&holder.name);
         let job = self
             .jobs
             .get(&holder.epoch)
@@ -1440,7 +1283,7 @@ impl Protected {
                 tool,
                 "lease",
                 &format!(
-                    "Overnight: {who}{job} opened a {minutes}-minute lease on the protected phone (the presence file says asleep). Gmail, WhatsApp, the lock screen, notifications and PIN entry stay off-limits."
+                    "Overnight: {who}{job} took over the protected phone for {minutes} min (the presence file says asleep). Tap Deny to end it."
                 ),
                 "",
             );
@@ -1484,7 +1327,7 @@ impl Protected {
             tool,
             "lease",
             &format!(
-                "{who}{job} asks for a {minutes}-minute lease on the protected phone (first call: {tool}). Allow covers every call for {minutes} min; Gmail, WhatsApp, the lock screen, notifications and PIN entry stay off-limits."
+                "{who}{job} asks to take over the protected phone for {minutes} min (first call: {tool}). Allow covers every call for {minutes} min; Deny refuses."
             ),
             "",
         );
@@ -1614,76 +1457,71 @@ mod tests {
         )
     }
 
-    #[test]
-    fn previews_are_system_ui_rows_and_the_status_bar_is_not_one() {
-        let bar = node(
-            "com.android.systemui",
-            "com.android.systemui:id/notification_icon_area",
-            "",
-            "",
-            "[0,0][100,40]",
-        );
-        let home = node("com.example.home", "", "Clock", "", "[0,100][100,200]");
-        let f = screen_facts(&screen(&[bar.clone(), home.clone()])).unwrap();
-        assert_eq!(read_refusal(&f), None, "a status bar and a home screen");
-        for rid in [
-            "com.android.systemui:id/expandableNotificationRow",
-            "com.android.systemui:id/notification_stack_scroller",
-            "com.android.systemui:id/keyguard_status_view",
-            "com.android.systemui:id/qs_frame",
-        ] {
-            let n = node("com.android.systemui", rid, "Hi", "", "[0,0][10,10]");
-            let f = screen_facts(&screen(&[bar.clone(), n])).unwrap();
-            assert_eq!(read_refusal(&f).map(|r| r.0), Some("preview"), "{rid}");
+    fn tap() -> Call {
+        Call::Tap {
+            target: crate::gate::Target::Index(0),
         }
-        let recents = node(
-            "com.google.android.apps.nexuslauncher",
-            "com.google.android.apps.nexuslauncher:id/task_thumbnail",
-            "",
-            "",
-            "[0,0][10,10]",
-        );
-        assert!(screen_facts(&screen(&[recents])).unwrap().recents);
-        let icon = node(
-            "com.android.systemui",
-            "com.android.systemui:id/icon",
-            "",
-            "WhatsApp notification: Dinner?",
-            "[0,0][10,10]",
-        );
-        assert!(screen_facts(&screen(&[icon])).unwrap().protected_mention);
     }
 
-    #[test]
-    fn protected_apps_include_gmail_go_and_any_whatsapp() {
-        for p in [
-            "com.google.android.gm",
-            "com.google.android.gm.lite",
-            "COM.WHATSAPP",
-            "com.whatsapp.w4b",
-            "com.gbwhatsapp",
-        ] {
-            assert!(is_protected_package(p), "{p}");
+    fn typed(t: &str) -> Call {
+        Call::TypeText {
+            text: t.into(),
+            index: None,
+            submit: false,
         }
-        assert!(!is_protected_package("com.google.android.gms"));
-        assert!(!is_protected_package("com.android.settings"));
-        let f = screen_facts(&screen(&[node(
-            "com.google.android.gm.lite",
-            "",
-            "Inbox",
-            "",
-            "[0,0][10,10]",
-        )]))
-        .unwrap();
-        assert_eq!(read_refusal(&f).map(|r| r.0), Some("app"));
-        let back = Call::Key {
-            name: "KEYCODE_BACK".into(),
-        };
-        assert_eq!(screen_refusal(&f, &back, None), None, "exit keys go");
-        let recents = Call::Key {
-            name: "recents".into(),
-        };
-        assert!(screen_refusal(&f, &recents, None).is_some());
+    }
+
+    /// The owner's ruling of 14 Nov 2026: nothing is blocked from being seen. The screens the
+    /// earlier rounds refused (a protected app, the shade, the keyguard, Recents, notification
+    /// history, a node naming a protected app) give no fact and no refusal now.
+    #[test]
+    fn no_screen_is_refused_for_what_it_shows() {
+        for n in [
+            node("com.whatsapp", "", "Dinner?", "", "[0,0][10,10]"),
+            node("com.google.android.gm", "", "Inbox", "", "[0,0][10,10]"),
+            node(
+                "com.android.systemui",
+                "com.android.systemui:id/expandableNotificationRow",
+                "Hi",
+                "",
+                "[0,0][10,10]",
+            ),
+            node(
+                "com.android.systemui",
+                "com.android.systemui:id/keyguard_status_view",
+                "",
+                "",
+                "[0,0][10,10]",
+            ),
+            node(
+                "com.google.android.apps.nexuslauncher",
+                "com.google.android.apps.nexuslauncher:id/task_thumbnail",
+                "",
+                "",
+                "[0,0][10,10]",
+            ),
+            node(
+                "com.android.settings",
+                "com.android.settings:id/notification_history",
+                "",
+                "",
+                "[0,0][10,10]",
+            ),
+            node(
+                "com.android.systemui",
+                "com.android.systemui:id/icon",
+                "",
+                "WhatsApp notification: Dinner?",
+                "[0,0][10,10]",
+            ),
+        ] {
+            let f = screen_facts(&screen(std::slice::from_ref(&n))).unwrap();
+            assert_eq!(f, ScreenFacts::default(), "{n}");
+            for c in [tap(), typed("hello 5"), Call::Key { name: "5".into() }] {
+                assert_eq!(pin_refusal(&f, &c, Some((5, 5))), None, "{n} {c:?}");
+            }
+        }
+        assert!(screen_facts("not xml").is_err());
     }
 
     #[test]
@@ -1702,92 +1540,233 @@ mod tests {
             "",
             "[0,100][50,150]",
         );
-        let f = screen_facts(&screen(&[prompt, two])).unwrap();
+        let f = screen_facts(&screen(&[prompt.clone(), two.clone()])).unwrap();
         assert!(f.pin_prompt);
+        assert_eq!(f.digit_bounds, vec![(0, 100, 50, 150)]);
         for call in [
-            Call::TypeText {
-                text: "7".into(),
-                index: None,
-                submit: false,
-            },
-            Call::TypeText {
-                text: "ab3".into(),
-                index: None,
-                submit: false,
-            },
+            typed("7"),
+            typed("ab3"),
             Call::Key {
                 name: "KEYCODE_5".into(),
             },
             Call::Key {
                 name: "KEYCODE_NUMPAD_0".into(),
             },
+            Call::Key { name: "9".into() },
         ] {
             assert_eq!(
-                screen_refusal(&f, &call, None).map(|r| r.0),
+                pin_refusal(&f, &call, None).map(|r| r.0),
                 Some("pin"),
                 "{call:?}"
             );
         }
-        let tap = Call::Tap {
-            target: crate::gate::Target::Index(0),
-        };
         assert_eq!(
-            screen_refusal(&f, &tap, Some((10, 120))).map(|r| r.0),
+            pin_refusal(&f, &tap(), Some((10, 120))).map(|r| r.0),
             Some("pin")
         );
-        assert_eq!(screen_refusal(&f, &tap, Some((10, 300))), None);
-        let letters = Call::TypeText {
-            text: "abc".into(),
-            index: None,
-            submit: false,
-        };
-        assert_eq!(screen_refusal(&f, &letters, None), None);
+        // the bounds are half-open: the right and bottom edges are outside
+        assert_eq!(
+            pin_refusal(&f, &tap(), Some((0, 100))).map(|r| r.0),
+            Some("pin")
+        );
+        assert_eq!(
+            pin_refusal(&f, &tap(), Some((49, 149))).map(|r| r.0),
+            Some("pin")
+        );
+        assert_eq!(pin_refusal(&f, &tap(), Some((50, 120))), None);
+        assert_eq!(pin_refusal(&f, &tap(), Some((10, 150))), None);
+        assert_eq!(pin_refusal(&f, &tap(), Some((-1, 120))), None);
+        assert_eq!(pin_refusal(&f, &tap(), Some((10, 99))), None);
+        assert_eq!(pin_refusal(&f, &tap(), Some((10, 300))), None);
+        assert_eq!(pin_refusal(&f, &tap(), None), None);
+        assert_eq!(pin_refusal(&f, &typed("abc"), None), None);
+        for exit in ["KEYCODE_BACK", "home", "Escape"] {
+            let k = Call::Key { name: exit.into() };
+            assert_eq!(pin_refusal(&f, &k, None), None, "{exit}");
+        }
+        // no prompt: digits go, and no digit key is kept
+        let f = screen_facts(&screen(std::slice::from_ref(&two))).unwrap();
+        assert!(!f.pin_prompt && f.digit_bounds.is_empty());
+        assert_eq!(pin_refusal(&f, &typed("1234"), Some((10, 120))), None);
+        // a prompt by its text, or by a password field
+        for n in [
+            node("com.example.bank", "", "Enter PIN", "", "[0,0][10,10]"),
+            node("com.example.bank", "", "", "Passcode", "[0,0][10,10]"),
+            node("com.example.bank", "x:id/PIN_PAD", "", "", "[0,0][10,10]"),
+        ] {
+            assert!(
+                screen_facts(&screen(std::slice::from_ref(&n)))
+                    .unwrap()
+                    .pin_prompt,
+                "{n}"
+            );
+        }
+        let pw = "<node index=\"0\" text=\"\" resource-id=\"\" class=\"android.widget.EditText\" package=\"a\" content-desc=\"\" password=\"true\" bounds=\"[0,0][10,10]\" />";
+        assert!(screen_facts(&screen(&[pw.to_string()])).unwrap().pin_prompt);
+        // a two-digit label is not a key
+        let f = screen_facts(&screen(&[
+            prompt,
+            node("a", "", "12", "", "[0,0][10,10]"),
+            node("a", "", "", "3", "[20,0][30,10]"),
+        ]))
+        .unwrap();
+        assert_eq!(f.digit_bounds, vec![(20, 0, 30, 10)]);
     }
 
     #[test]
-    fn launches_and_paths_naming_a_protected_app_are_refused() {
-        let refused = [
-            Call::OpenApp {
-                package: "whatsapp".into(),
+    fn only_calls_that_could_enter_a_digit_need_the_pin_check() {
+        for c in [
+            tap(),
+            typed("a"),
+            Call::Key { name: "5".into() },
+            Call::Key {
+                name: "KEYCODE_ENTER".into(),
             },
-            Call::OpenApp {
-                package: "com.google.android.gm.lite".into(),
+            Call::LongPress {
+                target: crate::gate::Target::Index(0),
+                ms: 600,
             },
-            Call::OpenUrl {
-                uri: "https://wa.me/15550000".into(),
-                package: None,
+            Call::Swipe {
+                x1: 1.0,
+                y1: 2.0,
+                x2: 3.0,
+                y2: 4.0,
+                ms: 300,
+                space: None,
+                image_width: None,
             },
-            Call::OpenUrl {
-                uri: "mailto:a@example.com".into(),
-                package: None,
-            },
-            Call::OpenUrl {
-                uri: "https://example.com".into(),
-                package: Some("com.whatsapp".into()),
-            },
-            Call::StartActivity {
-                component: "com.google.android.gm/.ConversationListActivityGmail".into(),
-                action: None,
-                data: None,
-            },
-        ];
-        for c in &refused {
-            assert!(launch_refusal(c).is_some(), "{c:?}");
-        }
-        assert!(launch_refusal(&Call::OpenApp {
-            package: "com.android.settings".into()
-        })
-        .is_none());
-        for p in [
-            "/sdcard/WhatsApp/Media/x.jpg",
-            "/SDCARD//Android/media/COM.WHATSAPP/x",
-            "\\sdcard\\Android\\data\\com.google.android.gm\\x",
-            "/sdcard/./Gmail/x",
-            "/sdcard/Android/data/com.google.android.gms/x",
         ] {
-            assert!(path_refusal(p).is_some(), "{p}");
+            assert!(needs_pin_check(&c), "{c:?}");
         }
-        assert!(path_refusal("/sdcard/DCIM/Camera/x.jpg").is_none());
-        assert_eq!(normalise_path("/A//b/./c\\D"), "/a/b/c/d");
+        for c in [
+            Call::Key {
+                name: "KEYCODE_BACK".into(),
+            },
+            Call::Key {
+                name: "home".into(),
+            },
+            Call::OpenApp {
+                package: "com.android.settings".into(),
+            },
+            Call::Screenshot { max_width: 540 },
+        ] {
+            assert!(!needs_pin_check(&c), "{c:?}");
+        }
+        assert!(digit_key("KEYCODE_NUMPAD_7") && digit_key(" 3 ") && !digit_key("12"));
+        assert!(exit_key("KEYCODE_HOME") && !exit_key("KEYCODE_ENTER"));
+    }
+
+    /// Review round 3, item 13: the push names the holder as an agent session, briefly, with no
+    /// link and no line break.
+    #[test]
+    fn the_push_names_the_holder_briefly_and_with_no_link() {
+        assert_eq!(push_holder("lane-7"), "Agent session: lane-7");
+        assert_eq!(
+            push_holder("tap https://evil.example/x now"),
+            "Agent session: tap now"
+        );
+        assert_eq!(push_holder("see www.evil.example"), "Agent session: see");
+        assert_eq!(push_holder("go evil.example/login"), "Agent session: go");
+        assert_eq!(push_holder("a\nb\r\tc\u{7}d"), "Agent session: a b c d");
+        assert_eq!(push_holder("  a   b  "), "Agent session: a b");
+        assert_eq!(
+            push_holder(&"x".repeat(40)),
+            format!("Agent session: {}", "x".repeat(24))
+        );
+        assert_eq!(push_holder("v1.2 lane"), "Agent session: v1.2 lane");
+        assert_eq!(push_holder(""), "Agent session: (no name)");
+        assert_eq!(push_holder("https://x.y"), "Agent session: (no name)");
+        assert_eq!(push_holder("HTTP://X.Y ok"), "Agent session: ok");
+        assert_eq!(push_holder("WWW.x ok"), "Agent session: ok");
+    }
+
+    /// The orchestrator's ruling (14 Nov 2026): the notice gives Singapore time, labelled SGT.
+    #[test]
+    fn the_notice_time_is_singapore_time() {
+        // 1_700_000_000_000 ms is 22:13:20 UTC on 14 Nov 2023, 06:13 SGT on the 15th
+        assert_eq!(sgt_hhmm(NOW), "06:13 SGT");
+        assert_eq!(sgt_hhmm(0), "08:00 SGT");
+        assert_eq!(sgt_hhmm(16 * 3_600_000 - 1), "23:59 SGT");
+        assert_eq!(sgt_hhmm(16 * 3_600_000), "00:00 SGT");
+        assert_eq!(sgt_hhmm(16 * 3_600_000 + 61_000), "00:01 SGT");
+    }
+
+    fn held(reallow: bool) -> Held {
+        Held {
+            req: Request {
+                id: "abcdefghijklmnopqrst".into(),
+                device: String::new(),
+                tool: String::new(),
+                kind: "lease".into(),
+                reason: String::new(),
+                target: String::new(),
+                created_ms: 1,
+                expires_ms: 2,
+                style: Style::Lease,
+            },
+            holder: Some(Holder {
+                name: "lane".into(),
+                epoch: 4,
+            }),
+            at_ms: 3,
+            until: Until::Window(9),
+            reallow,
+        }
+    }
+
+    /// Review round 3, items 8 and 9: the holds file keeps whether the hold may be re-allowed
+    /// and the Deny events seen; a version-1 file is read with neither.
+    #[test]
+    fn the_holds_file_keeps_reallow_and_the_denies_seen() {
+        let seen = vec!["e1".to_string(), "e2".to_string()];
+        for r in [true, false] {
+            let (h, s) = parse_holds(&holds_json(Some(&held(r)), &seen)).unwrap();
+            let h = h.unwrap();
+            assert_eq!((h.reallow, h.until, h.at_ms), (r, Until::Window(9), 3));
+            assert_eq!(s, seen);
+        }
+        let (h, s) = parse_holds(&holds_json(None, &seen)).unwrap();
+        assert!(h.is_none());
+        assert_eq!(s, seen);
+        // version 1 (round 2): no reallow, no seen list
+        let v1 = r#"{"version":1,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"window","until_ms":9}}"#;
+        let (h, s) = parse_holds(v1).unwrap();
+        assert!(!h.unwrap().reallow);
+        assert!(s.is_empty());
+        assert!(parse_holds(r#"{"version":1,"hold":null}"#)
+            .unwrap()
+            .0
+            .is_none());
+        // version 2 needs both
+        for bad in [
+            r#"{"version":2,"hold":null}"#,
+            r#"{"version":2,"hold":null,"seen_denies":"e1"}"#,
+            r#"{"version":2,"hold":null,"seen_denies":[1]}"#,
+            r#"{"version":2,"seen_denies":[]}"#,
+            r#"{"version":3,"hold":null,"seen_denies":[]}"#,
+            r#"{"version":2,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"window","until_ms":9},"seen_denies":[]}"#,
+            r#"{"version":2,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"window","until_ms":9,"reallow":"yes"},"seen_denies":[]}"#,
+        ] {
+            assert!(parse_holds(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_denies_seen_are_kept_once_and_only_the_newest() {
+        let book = Arc::new(LeaseBook::new(Arc::new(leasebook::ManualClock::new(NOW))));
+        let mut p = Protected::new(ProtectedConfig::new(30, 10, None), book);
+        p.note_deny("");
+        p.note_deny("a");
+        p.note_deny("a");
+        assert_eq!(p.seen_denies, ["a"]);
+        for i in 0..SEEN_DENIES_KEPT {
+            p.note_deny(&format!("e{i}"));
+        }
+        assert_eq!(p.seen_denies.len(), SEEN_DENIES_KEPT);
+        assert_eq!(p.seen_denies[0], "e0");
+        assert_eq!(
+            p.seen_denies.last().map(String::as_str),
+            Some(format!("e{}", SEEN_DENIES_KEPT - 1).as_str())
+        );
     }
 }
