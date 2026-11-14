@@ -36,7 +36,14 @@
 //!                                             counted and logged, the call goes ahead
 //!          --audit-anchor-required            ... refuse the call when the anchor cannot be written
 //!          --audit-anchor-best-effort         accepted for compatibility (it is the default)
+//!          --ask-screen-state-dir DIR         where `agentroid ask-screen` keeps its leases (default:
+//!                                             its own default); the screen lock reads them there
 //! ```
+//!
+//! **The screen lock** (with `--adb`): every screen-changing call to a real phone is refused unless
+//! `agentroid ask-screen` gave a lease that is still live, or the phone is not in use at the time
+//! of the call (then the agent's own burst goes on until someone else touches it). Emulators are
+//! not locked. See `agentroid_core::screenlock`.
 //!
 //! care (2.13) runs inside a job only when `JobsConfig.care` is set; `--adb` wires the transport and
 //! `agentroid.shell` but not care yet (heat guard and battery floor are step 11, on the POCO), so
@@ -104,6 +111,8 @@ struct Args {
     audit_anchor: Option<PathBuf>,
     /// Off by default: a failed anchor write is counted, not refused (by design).
     audit_anchor_required: bool,
+    /// `--ask-screen-state-dir`: where the screen lock reads ask-screen's leases.
+    ask_screen_state_dir: Option<PathBuf>,
 }
 
 fn num(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u16, String> {
@@ -141,6 +150,7 @@ fn parse_args() -> Result<Args, String> {
         ntfy_base: None,
         audit_anchor: None,
         audit_anchor_required: false,
+        ask_screen_state_dir: None,
     };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
@@ -179,6 +189,12 @@ fn parse_args() -> Result<Args, String> {
             "--profiles" => {
                 a.profiles = Some(PathBuf::from(
                     it.next().ok_or("--profiles needs a directory")?,
+                ))
+            }
+            "--ask-screen-state-dir" => {
+                a.ask_screen_state_dir = Some(PathBuf::from(
+                    it.next()
+                        .ok_or("--ask-screen-state-dir needs a directory")?,
                 ))
             }
             "--approval-topic-file" => {
@@ -474,6 +490,21 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
                 "approval channel: none (every `asked` verdict is refused; pass --approval-topic-file)",
             ),
         }
+        // The screen lock (13 Nov 2026): no screen-changing call to a real phone unless
+        // ask-screen gave a live lease or the phone is not in use at the time of the call. There
+        // is no switch to turn it off.
+        let lock_dir = args
+            .ask_screen_state_dir
+            .clone()
+            .unwrap_or_else(agentroid_core::askscreen::default_state_dir);
+        log(
+            &args.state_dir,
+            &format!(
+                "screen lock: on (leases from {}; emulators that say they are one are not locked)",
+                lock_dir.display()
+            ),
+        );
+        bridged::live::install_screen_lock(&mut core, lock_dir, path);
         Box::new(CoreBackend::new(core))
     } else {
         Box::new(NoDevices)

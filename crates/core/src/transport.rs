@@ -12,6 +12,10 @@ use crate::frame::{Frame, FrameError, Shot};
 use crate::gate::{self, Call, DeviceMode, Refusal, Subject, Target};
 use crate::require::{read_require, RequireOpts, Required};
 use crate::screenguard::{self, Decision, Screen, Touch};
+use crate::screenlock::{
+    phone_key, Admitted, MonoClock, ScreenLock, BURST_GAP_MS, FREE_SEGMENT_MAX_S,
+    FREE_SEGMENT_MAX_STEPS,
+};
 use crate::selector::{resolve, Chosen, Resolution, ResolveError, Selector, Status};
 use crate::settle::{settle, Settle, SettleOpts, TreeSource};
 use crate::shell;
@@ -343,6 +347,76 @@ pub struct Core<T: Transport, C: Clock> {
     approver: Option<Approver>,
     /// Set by the screen guard for the refusal record: (device, screen summary).
     pending: Option<(String, String)>,
+    /// The screen lock: `None` (tests, the fake device) lets every acting call through to the
+    /// other gates; the daemon sets one for real phones.
+    lock: Option<ScreenLock>,
+    /// The phone (adb serial, hardware serial) the lock last admitted an acting call for because
+    /// of the phone's own state (free, or the agent's burst), so the end of that call counts as
+    /// the agent's own activity. A lease or an emulator admits without setting it.
+    lock_admitted: Option<(String, String)>,
+    /// Screen-changing work the lock admitted outside [`Core::call`] (a script's shell line, a
+    /// link segment) that has not reported its end yet, by the serial it was named with: the
+    /// ticket's number and the phone. Only [`Core::lock_done`] with that very ticket makes the
+    /// end the agent's own activity; any newer screen-changing call on the phone (under any adb
+    /// name) or any newer call under the same name drops the entry.
+    lock_running: HashMap<String, (u64, String, String)>,
+    /// The last ticket number handed out.
+    lock_tickets: u64,
+    /// The ms left on the lease the lock's last check let a call through by (on the wall clock).
+    lock_lease_ms: Option<u64>,
+    /// Link segments let through without a lease whose answer is in but whose report is not, by
+    /// (the serial they were named with, segment id): the phone, and the latest monotonic time
+    /// their report may date the agent's own activity at (admission + [`FREE_SEGMENT_MAX_S`]).
+    lock_tails: HashMap<(String, String), (String, String, u64)>,
+}
+
+/// How many link segments may wait for their report at once (the oldest goes first).
+const LOCK_TAILS_KEPT: usize = 64;
+
+/// What the screen lock says about a link segment ([`Core::lock_admit_segment`]).
+#[derive(Debug, Default)]
+pub struct SegmentAdmission {
+    /// Let through because the phone is not in use now (or by the agent's burst): give the ticket
+    /// to [`Core::lock_done_segment`] once the phone has taken the segment, or drop it.
+    pub ticket: Option<LockTicket>,
+    /// The longest the segment may live, in seconds: give it this life when it asks for none (or
+    /// for longer than the link's default). `None`: no limit from the lock.
+    pub max_life_s: Option<u64>,
+}
+
+/// One piece of screen-changing work the screen lock let through outside [`Core::call`] (a link
+/// segment, a script's shell line). Call [`LockTicket::finished`] the moment the work has run
+/// (before taking the daemon's lock again), then give it back to [`Core::lock_done`]; drop it when
+/// the work never ran. It counts only while it is the newest work on its phone.
+pub struct LockTicket {
+    id: u64,
+    serial: String,
+    clock: MonoClock,
+    /// When the lock let the work through, on its monotonic clock.
+    admitted: u64,
+    ended: Option<u64>,
+}
+
+impl LockTicket {
+    /// The work has just ended: stamp the time on the lock's own clock, so a ticket handed back
+    /// late (the daemon busy with something else) is dated by the end of the work. The first
+    /// stamp counts.
+    pub fn finished(&mut self) {
+        if self.ended.is_none() {
+            self.ended = Some(self.clock.now());
+        }
+    }
+}
+
+impl fmt::Debug for LockTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LockTicket")
+            .field("id", &self.id)
+            .field("serial", &self.serial)
+            .field("admitted", &self.admitted)
+            .field("ended", &self.ended)
+            .finish()
+    }
 }
 
 impl<T: Transport, C: Clock> Core<T, C> {
@@ -359,7 +433,237 @@ impl<T: Transport, C: Clock> Core<T, C> {
             audit: None,
             approver: None,
             pending: None,
+            lock: None,
+            lock_admitted: None,
+            lock_running: HashMap::new(),
+            lock_tickets: 0,
+            lock_lease_ms: None,
+            lock_tails: HashMap::new(),
         }
+    }
+
+    /// Lock the screen (`screenlock.rs`): every acting call, and every script shell line that is
+    /// not on the read-only list, needs a live `ask-screen` lease or a phone not in use.
+    pub fn set_screen_lock(&mut self, lock: ScreenLock) {
+        self.lock = Some(lock);
+    }
+
+    pub fn screen_lock(&self) -> Option<&ScreenLock> {
+        self.lock.as_ref()
+    }
+
+    /// The lock's check for an acting call on `d`. Without a lock: allowed.
+    fn lock_check(&mut self, d: &DeviceInfo, tool: &'static str) -> Result<(), Refusal> {
+        let Some(lock) = self.lock.as_mut() else {
+            return Ok(());
+        };
+        // any earlier work on this phone (under any of its adb names) that never reported its end
+        // is stale now
+        let phone = phone_key(&d.hw_serial, &d.serial);
+        self.lock_running
+            .retain(|_, (_, s, h)| phone_key(h, s) != phone);
+        match lock.admit(&d.serial, &d.hw_serial) {
+            Ok(a) => {
+                // only the phone's own state (free, or the agent's burst) makes the end of the
+                // call the agent's own: a lease never starts or carries on a burst
+                if matches!(a, Admitted::Free(_) | Admitted::Burst) {
+                    self.lock_admitted = Some((d.serial.clone(), d.hw_serial.clone()));
+                }
+                if let Admitted::Lease(ms) = a {
+                    self.lock_lease_ms = Some(ms);
+                    // the lease drops any burst from before it, so a segment report still to
+                    // come from before it may not bring that burst back
+                    self.lock_tails
+                        .retain(|_, (s, h, _)| phone_key(h, s) != phone);
+                }
+                Ok(())
+            }
+            // a refusal keeps a pending segment report: dropping it would refuse the agent that
+            // calls before it pulls its own report (the README says how far it can reach)
+            Err(why) => Err(Refusal::ScreenLock { tool, why }),
+        }
+    }
+
+    /// A ticket for work the lock admitted for `serial` (the key it was named with). The lock's
+    /// kept verdict for the phone goes: the work may change it whether it runs or not.
+    /// Only called when a lock admitted the work, so there is a lock.
+    fn lock_ticket(&mut self, serial: &str, phone: (String, String)) -> Option<LockTicket> {
+        let lock = self.lock.as_mut()?;
+        lock.forget(&phone.0, &phone.1);
+        let clock = lock.clock();
+        let admitted = clock.now();
+        self.lock_tickets += 1;
+        let id = self.lock_tickets;
+        self.lock_running
+            .insert(serial.to_string(), (id, phone.0, phone.1));
+        Some(LockTicket {
+            id,
+            serial: serial.to_string(),
+            clock,
+            admitted,
+            ended: None,
+        })
+    }
+
+    /// The screen lock alone, for screen-changing work that does not go through [`Core::call`]
+    /// (a link segment, which the link signs and sends itself). `Ok`: it may go. `Ok(Some)`: give
+    /// the ticket to [`Core::lock_done`] once the work has been sent and answered, or drop it if
+    /// it never ran. `Ok(None)`: nothing to report (no lock, a lease, an emulator). A refusal is
+    /// logged.
+    pub fn lock_admit(
+        &mut self,
+        serial: Option<&str>,
+        tool: &'static str,
+    ) -> Result<Option<LockTicket>, CoreError> {
+        self.pending = None;
+        self.lock_admitted = None;
+        self.lock_lease_ms = None;
+        // (the lock's own check drops any older ticket for this phone, under any name)
+        let key = serial.unwrap_or_default();
+        let r = self
+            .find(serial, tool)
+            .and_then(|d| self.lock_check(&d, tool).map_err(CoreError::from));
+        let ticket = match (&r, self.lock_admitted.take()) {
+            (Ok(()), Some(phone)) => self.lock_ticket(key, phone),
+            _ => None,
+        };
+        if let Err(CoreError::Refused(refusal)) = &r {
+            self.record_refusal(serial, tool, refusal, "");
+        }
+        r.map(|()| ticket)
+    }
+
+    /// The screen lock for a link segment of `steps` steps that asks to live `expires_s` seconds
+    /// (`None`: the link's default). A segment is checked once, before it is sent, so:
+    /// * let through because the phone is not in use now (or by the agent's burst), not by a lease,
+    ///   it must be short: at most [`FREE_SEGMENT_MAX_STEPS`] steps, and it may not ask for more than
+    ///   [`FREE_SEGMENT_MAX_S`] seconds;
+    /// * let through by a lease, it may not outlive the lease: its life is cut to the whole seconds
+    ///   left on it (under a second left: refused).
+    ///
+    /// Otherwise it is refused (logged) and nothing is sent. `max_life_s` is the longest life the
+    /// segment may be given: the caller cuts what it asks for (or the link's default) to that.
+    pub fn lock_admit_segment(
+        &mut self,
+        serial: Option<&str>,
+        steps: usize,
+        expires_s: Option<u64>,
+    ) -> Result<SegmentAdmission, CoreError> {
+        let tool = "link.segment";
+        let ticket = self.lock_admit(serial, tool)?;
+        let lease_ms = self.lock_lease_ms.take();
+        let device = serial.unwrap_or("<device>");
+        let asks = expires_s.map_or("the default life".to_string(), |s| format!("{s} s"));
+        let why = if let Some(t) = ticket {
+            let too_long = expires_s.is_some_and(|s| s > FREE_SEGMENT_MAX_S);
+            if steps <= FREE_SEGMENT_MAX_STEPS && !too_long {
+                return Ok(SegmentAdmission {
+                    ticket: Some(t),
+                    max_life_s: Some(FREE_SEGMENT_MAX_S),
+                });
+            }
+            // the admission's own entry goes with the refused segment
+            drop(t);
+            self.lock_running.remove(serial.unwrap_or_default());
+            format!(
+                "the phone was let through because it is not in use now, not by a lease, so a segment may carry at most {FREE_SEGMENT_MAX_STEPS} steps and live at most {FREE_SEGMENT_MAX_S} s (this one: {steps} steps, {asks}); split it, or run `agentroid ask-screen --device {device} --minutes N --why \"...\"` for a lease"
+            )
+        } else if let Some(ms) = lease_ms {
+            // the owner's call (14 Nov 2026): under a lease, cut the life rather than refuse
+            let left_s = ms / 1000;
+            if left_s > 0 {
+                return Ok(SegmentAdmission {
+                    ticket: None,
+                    max_life_s: Some(left_s),
+                });
+            }
+            format!(
+                "the ask-screen lease that lets the phone through ends in under a second, so nothing was sent (this segment asks for {asks}); run `agentroid ask-screen --device {device} --minutes N --why \"...\"` again for a new lease"
+            )
+        } else {
+            // no lock, or an emulator
+            return Ok(SegmentAdmission::default());
+        };
+        let refusal = Refusal::ScreenLock { tool, why };
+        self.record_refusal(serial, tool, &refusal, "");
+        Err(refusal.into())
+    }
+
+    /// The work `ticket` names (from [`Core::lock_admit`] or [`Core::shell_gate`]) has run (the
+    /// runner or the link has returned): its end is the agent's own activity, so the burst goes on
+    /// past it. A ticket that is no longer the newest work on its phone records nothing.
+    pub fn lock_done(&mut self, ticket: LockTicket) {
+        self.lock_done_phone(ticket);
+    }
+
+    /// [`Core::lock_done`]: the phone (adb serial, hardware serial) when the ticket counted.
+    fn lock_done_phone(&mut self, ticket: LockTicket) -> Option<(String, String)> {
+        if !self
+            .lock_running
+            .get(&ticket.serial)
+            .is_some_and(|(id, _, _)| *id == ticket.id)
+        {
+            return None;
+        }
+        let (_, s, h) = self.lock_running.remove(&ticket.serial)?;
+        let lock = self.lock.as_mut()?;
+        // dated by the work's own end when it was stamped, never by a late report
+        lock.acted_at(&s, &h, ticket.ended.unwrap_or(u64::MAX));
+        Some((s, h))
+    }
+
+    /// [`Core::lock_done`] for link segment `segment_id`, which the phone has taken: its answer is
+    /// the agent's own activity, and so, once it comes, is its report
+    /// ([`Core::lock_segment_reported`]): the segment's own steps run after the answer, and the
+    /// phone may count them as touches.
+    pub fn lock_done_segment(&mut self, ticket: LockTicket, segment_id: &str) {
+        let serial = ticket.serial.clone();
+        let until = ticket
+            .admitted
+            .saturating_add(FREE_SEGMENT_MAX_S.saturating_mul(1000));
+        let now = ticket.clock.now();
+        let Some((s, h)) = self.lock_done_phone(ticket) else {
+            return;
+        };
+        // a report later than the burst gap would change nothing
+        self.lock_tails
+            .retain(|_, (_, _, u)| u.saturating_add(BURST_GAP_MS) > now);
+        while self.lock_tails.len() >= LOCK_TAILS_KEPT {
+            let Some(oldest) = self
+                .lock_tails
+                .iter()
+                .min_by_key(|(_, (_, _, u))| *u)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.lock_tails.remove(&oldest);
+        }
+        self.lock_tails
+            .insert((serial, segment_id.to_string()), (s, h, until));
+    }
+
+    /// The report of link segment `segment_id` (named `serial`, as when it was let through) came
+    /// in at `at` on the lock's monotonic clock (`None`: now): the segment has ended, so its end
+    /// is the agent's own activity, dated no later than [`FREE_SEGMENT_MAX_S`] after the lock let
+    /// it through (the longest it may live). Only a segment the phone took after a free or burst
+    /// admission counts, once; a lease never starts or carries on a burst.
+    pub fn lock_segment_reported(&mut self, serial: &str, segment_id: &str, at: Option<u64>) {
+        let Some((s, h, until)) = self
+            .lock_tails
+            .remove(&(serial.to_string(), segment_id.to_string()))
+        else {
+            return;
+        };
+        if let Some(lock) = self.lock.as_mut() {
+            lock.acted_at(&s, &h, at.unwrap_or(u64::MAX).min(until));
+        }
+    }
+
+    /// The lock's monotonic clock, to stamp when a report came in before the daemon's lock is
+    /// taken again. `None`: no lock.
+    pub fn lock_clock(&self) -> Option<MonoClock> {
+        self.lock.as_ref().map(ScreenLock::clock)
     }
 
     /// Turn `asked` verdicts into a real question to a human (D3b). Without one they are refused.
@@ -430,6 +734,9 @@ impl<T: Transport, C: Clock> Core<T, C> {
             allowed: self.allowed(&info),
         };
         gate::check(&subject, mode, call)?;
+        if call.is_acting() {
+            self.lock_check(&info, call.name())?;
+        }
         Ok(info)
     }
 
@@ -487,9 +794,21 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// and `wait` take no target. Every refusal is written to the audit log when one is set.
     pub fn call(&mut self, serial: Option<&str>, call: &Call) -> Result<Outcome, CoreError> {
         self.pending = None;
+        self.lock_admitted = None;
+        // a ticket handed out before this call is stale now, whatever the call is
+        self.lock_running.remove(serial.unwrap_or_default());
         let r = self.call_inner(serial, call);
         if let Err(CoreError::Refused(refusal)) = &r {
             self.record_refusal(serial, call.name(), refusal, "");
+        }
+        // anything that got past every gate may have touched the screen, even if it then failed:
+        // its end is the agent's own activity, so the burst goes on past it
+        if let Some((s, h)) = self.lock_admitted.take() {
+            if !matches!(r, Err(CoreError::Refused(_))) {
+                if let Some(lock) = self.lock.as_mut() {
+                    lock.acted(&s, &h);
+                }
+            }
         }
         r
     }
@@ -525,16 +844,38 @@ impl<T: Transport, C: Clock> Core<T, C> {
     /// A raw shell line (the sandbox's `shell` bridge call) through the device gate, the shell guard
     /// (D3b), the approval channel and the audit log. `Ok` means the runner may send it; every
     /// refusal is logged. The guard sees the whole line, so a refused line never reaches adb.
-    pub fn shell_gate(&mut self, serial: Option<&str>, line: &str) -> Result<(), CoreError> {
+    /// `Ok(Some(ticket))`: the screen lock admitted the line; once the runner has returned, give
+    /// the ticket to [`Core::lock_done`] (only then does the line count as the agent's own
+    /// activity). `Ok(None)`: a read-only line (or no lock): there is nothing to report.
+    pub fn shell_gate(
+        &mut self,
+        serial: Option<&str>,
+        line: &str,
+    ) -> Result<Option<LockTicket>, CoreError> {
         self.pending = None;
-        let r = self
-            .pick_raw(serial, "shell")
-            .and_then(|d| self.raw_gate(&d, "shell", shellguard::classify_shell(line)));
+        self.lock_admitted = None;
+        let key = serial.unwrap_or_default();
+        // a ticket handed out before this line is stale now
+        self.lock_running.remove(key);
+        let r = self.pick_raw(serial, "shell").and_then(|d| {
+            // the lock first, so a phone in use never gets an approval push for a line
+            // a line on the read-only list changes nothing; any other may (an `input tap`)
+            let argv: Vec<&str> = line.split(' ').filter(|a| !a.is_empty()).collect();
+            if !shellguard::is_read_only(&argv) {
+                self.lock_check(&d, "shell")?;
+            }
+            self.raw_gate(&d, "shell", shellguard::classify_shell(line))
+        });
+        // a line the lock admitted counts only once every gate has allowed it and it has run
+        let ticket = match (&r, self.lock_admitted.take()) {
+            (Ok(()), Some(phone)) => self.lock_ticket(key, phone),
+            _ => None,
+        };
         if let Err(CoreError::Refused(refusal)) = &r {
             let target = shellguard::classify_shell(line).target;
             self.record_refusal(serial, "shell", refusal, &target);
         }
-        r
+        r.map(|()| ticket)
     }
 
     /// `push` to or `pull` from `phone_path` through the device gate, the file guard (D3b), the
@@ -2096,4 +2437,815 @@ mod tests {
     }
 
     const S24: &str = agentroid_adb_link::guard::S24_SERIAL;
+
+    #[test]
+    fn the_screen_lock_refuses_acting_calls_and_shell_lines_on_a_phone_in_use_and_never_reads() {
+        use crate::askscreen::Signals;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let on = |focus: &str, ime: bool, idle_ms: u64| Signals {
+            wakefulness: Some("Awake".into()),
+            idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
+            focus: Some(focus.into()),
+            ime_shown: Some(ime),
+            keyguard: Some(false),
+            in_call: Some(false),
+        };
+        let phone = Arc::new(Mutex::new(on("com.anthropic.claude", true, 1_000)));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir = std::env::temp_dir().join(format!("agentroid-core-lock-{}", std::process::id()));
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // in use: refused, and nothing reached the phone
+        let r = c.call(None, &back);
+        match &r {
+            Err(CoreError::Refused(Refusal::ScreenLock { tool: "key", why })) => {
+                assert!(why.contains("agentroid ask-screen"), "{why}")
+            }
+            other => panic!("expected a screen-lock refusal, got {other:?}"),
+        }
+        assert!(c.transport.acted.is_empty(), "{:?}", c.transport.acted);
+        assert!(r.unwrap_err().to_string().contains("screen lock"));
+        // a script's `input tap` is refused too; a read-only line is not locked
+        assert!(matches!(
+            c.shell_gate(None, "input tap 10 20"),
+            Err(CoreError::Refused(Refusal::ScreenLock {
+                tool: "shell",
+                ..
+            }))
+        ));
+        assert!(c.shell_gate(None, "getprop ro.build.version.sdk").is_ok());
+        // reads still answer
+        assert!(c
+            .call(
+                None,
+                &Call::Getprop {
+                    key: "ro.serialno".into()
+                }
+            )
+            .is_ok());
+        assert!(c.call(None, &Call::ListDevices).is_ok());
+        let n = c.transport.acted.len();
+        // put down: allowed, and the key reaches the phone
+        *phone.lock().unwrap() = Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        };
+        assert!(c.call(None, &back).is_ok());
+        assert_eq!(c.transport.acted.len(), n + 1);
+        // its own key woke the phone and dated the last touch: the burst goes on
+        clock.store(T0 + 3_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on("com.whatsapp", true, 3_000);
+        assert!(c.call(None, &back).is_ok());
+        // someone touches it 500 ms ago, after the agent's last key: refused again
+        clock.store(T0 + 6_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on("com.whatsapp", true, 500);
+        assert!(matches!(
+            c.call(None, &back),
+            Err(CoreError::Refused(Refusal::ScreenLock { .. }))
+        ));
+        assert_eq!(c.transport.acted.len(), n + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A screen lock over a fake phone; one fake clock serves as both the wall and the monotonic
+    /// clock, and the power read is instant.
+    fn test_lock(
+        dir: &std::path::Path,
+        phone: &std::sync::Arc<std::sync::Mutex<crate::askscreen::Signals>>,
+        clock: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> ScreenLock {
+        use std::sync::atomic::Ordering;
+        let (p, k1, k2) = (phone.clone(), clock.clone(), clock.clone());
+        ScreenLock::new(
+            dir.to_path_buf(),
+            Box::new(move |_, mono| {
+                let at = mono();
+                Some(crate::screenlock::Reading {
+                    signals: p.lock().unwrap().clone(),
+                    power_from: at,
+                    power_to: at,
+                })
+            }),
+            Box::new(move || k1.load(Ordering::SeqCst)),
+            Box::new(move || k2.load(Ordering::SeqCst)),
+        )
+    }
+
+    #[test]
+    fn a_shell_line_counts_as_the_agents_own_only_once_it_was_allowed_and_has_run() {
+        use crate::approval::{Approver, FakeChannel, Inbound};
+        use crate::askscreen::Signals;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let on = |idle_ms: u64| Signals {
+            wakefulness: Some("Awake".into()),
+            idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
+            focus: Some("com.whatsapp".into()),
+            ime_shown: Some(true),
+            keyguard: Some(false),
+            in_call: Some(false),
+        };
+        let phone = Arc::new(Mutex::new(Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        }));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-sh-{}", std::process::id()));
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // free: the key goes; its end (T0) starts the burst
+        assert!(c.call(None, &back).is_ok());
+        // inside the burst, a line the shell guard refuses outright (input injection): the lock
+        // admitted it, but it never ran, so it gives no ticket and is not the agent's own activity
+        clock.store(T0 + 2_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(2_000);
+        assert!(matches!(
+            c.shell_gate(None, "input tap 10 20"),
+            Err(CoreError::Refused(Refusal::Screen { .. }))
+        ));
+        // someone touches it at T0 + 3000: that touch came after the key, refused
+        clock.store(T0 + 4_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(1_000);
+        assert!(matches!(
+            c.shell_gate(None, "input tap 10 20"),
+            Err(CoreError::Refused(Refusal::ScreenLock { .. }))
+        ));
+        // an allowed line (a human says yes) that has run: its end continues the burst
+        let ch = FakeChannel {
+            answer_with: Some(Box::new(|r, _| {
+                vec![Inbound {
+                    event_id: format!("e-{}", r.id),
+                    time_ms: r.created_ms + 1,
+                    message: format!("allow {}", r.id),
+                }]
+            })),
+            ..FakeChannel::default()
+        };
+        c.set_approver(Approver::new(Box::new(ch)));
+        clock.store(T0 + 10_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        };
+        assert!(c.call(None, &back).is_ok());
+        clock.store(T0 + 12_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(2_000);
+        let ticket = match c.shell_gate(None, "some_unknown_binary --flag") {
+            Ok(Some(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        clock.store(T0 + 15_000, Ordering::SeqCst);
+        c.lock_done(ticket);
+        // the line ended at T0 + 15000 and its own touch was at T0 + 14000: the burst goes on
+        clock.store(T0 + 17_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(3_000);
+        let r = c.shell_gate(None, "some_unknown_binary --flag");
+        assert!(r.is_ok(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_segment_needs_the_lock_and_its_end_continues_the_burst() {
+        use crate::askscreen::Signals;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let on = |idle_ms: u64| Signals {
+            wakefulness: Some("Awake".into()),
+            idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
+            focus: Some("com.whatsapp".into()),
+            ime_shown: Some(true),
+            keyguard: Some(false),
+            in_call: Some(false),
+        };
+        let phone = Arc::new(Mutex::new(on(1_000)));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-seg-{}", std::process::id()));
+        let mut c = core();
+        // no lock: allowed, with nothing to report
+        assert!(matches!(c.lock_admit(None, "link.segment"), Ok(None)));
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        match c.lock_admit(None, "link.segment") {
+            Err(CoreError::Refused(Refusal::ScreenLock {
+                tool: "link.segment",
+                ..
+            })) => {}
+            other => panic!("{other:?}"),
+        }
+        // put down: allowed; the segment's answer at T0 + 1000 starts the burst
+        *phone.lock().unwrap() = Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..Signals::default()
+        };
+        let t = c.lock_admit(None, "link.segment").unwrap().unwrap();
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        c.lock_done(t);
+        clock.store(T0 + 4_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = on(3_000);
+        assert!(matches!(c.lock_admit(None, "link.segment"), Ok(Some(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A screen-on phone with an app and the keyboard up, last touched `idle_ms` ago.
+    fn busy(idle_ms: u64) -> crate::askscreen::Signals {
+        crate::askscreen::Signals {
+            wakefulness: Some("Awake".into()),
+            idle_ms: Some(idle_ms),
+            screen_kept_on: Some(false),
+            focus: Some("com.whatsapp".into()),
+            ime_shown: Some(true),
+            keyguard: Some(false),
+            in_call: Some(false),
+        }
+    }
+
+    fn put_down() -> crate::askscreen::Signals {
+        crate::askscreen::Signals {
+            wakefulness: Some("Asleep".into()),
+            in_call: Some(false),
+            ..crate::askscreen::Signals::default()
+        }
+    }
+
+    #[test]
+    fn a_stale_ticket_never_turns_a_humans_touch_into_the_agents_own() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let phone = Arc::new(Mutex::new(put_down()));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-stale-{}", std::process::id()));
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        let at = |t: u64, s: crate::askscreen::Signals| {
+            clock.store(t, Ordering::SeqCst);
+            *phone.lock().unwrap() = s;
+        };
+        let refused = |r: Result<Outcome, CoreError>| {
+            matches!(r, Err(CoreError::Refused(Refusal::ScreenLock { .. })))
+        };
+        // the review's probe: a real key at T0 starts the burst
+        at(T0, put_down());
+        assert!(c.call(None, &back).is_ok());
+        // a segment admitted at T0 + 1 s (its touch is the key's) fails before it runs: the
+        // link drops its ticket
+        at(T0 + 1_000, busy(1_000));
+        let seg = c.lock_admit(None, "link.segment").unwrap();
+        assert!(seg.is_some());
+        drop(seg);
+        // a human touches it at T0 + 20 s; at T0 + 21 s a read-only shell line runs: it has no
+        // ticket, so there is nothing for it to report
+        at(T0 + 21_000, busy(1_000));
+        assert!(matches!(
+            c.shell_gate(None, "getprop ro.build.version.sdk"),
+            Ok(None)
+        ));
+        // at T0 + 22 s the human's touch is still nobody's but theirs: refused
+        at(T0 + 22_000, busy(2_000));
+        assert!(refused(c.call(None, &back)));
+        // a ticket given back after newer work on the phone records nothing (a shell gate that
+        // timed out and answered late; a segment whose answer came after another call)
+        for newer in 0..4u64 {
+            let base = T0 + 40_000 * (newer + 1);
+            at(base, put_down());
+            assert!(c.call(None, &back).is_ok());
+            at(base + 1_000, busy(1_000));
+            let late = c.lock_admit(None, "link.segment").unwrap().unwrap();
+            match newer {
+                0 => assert!(matches!(
+                    c.shell_gate(None, "getprop ro.build.version.sdk"),
+                    Ok(None)
+                )),
+                1 => assert!(c
+                    .call(
+                        None,
+                        &Call::Getprop {
+                            key: "ro.serialno".into()
+                        }
+                    )
+                    .is_ok()),
+                2 => {
+                    // a second admission replaces the first; only the newer ticket counts
+                    let _newer = c.lock_admit(None, "link.segment").unwrap().unwrap();
+                }
+                _ => {
+                    // ... also when it names the same phone another way
+                    let _newer = c
+                        .lock_admit(Some(crate::fake::FAKE_POCO_ADB), "link.segment")
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            // the human at base + 20 s; the late ticket comes back at base + 21 s
+            at(base + 21_000, busy(1_000));
+            c.lock_done(late);
+            at(base + 22_000, busy(2_000));
+            assert!(refused(c.call(None, &back)), "newer work {newer}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ticket_given_back_after_its_work_ran_carries_the_burst_on() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let phone = Arc::new(Mutex::new(put_down()));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-ticket-{}", std::process::id()));
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        assert!(c.call(None, &back).is_ok());
+        // the segment runs from T0 + 1 s to T0 + 21 s; its own touch is at T0 + 20.9 s
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(1_000);
+        let seg = c.lock_admit(None, "link.segment").unwrap().unwrap();
+        clock.store(T0 + 21_000, Ordering::SeqCst);
+        c.lock_done(seg);
+        clock.store(T0 + 22_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(1_100);
+        assert!(c.call(None, &back).is_ok());
+        // the same for a second admission: the newer ticket counts
+        clock.store(T0 + 23_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(1_000);
+        let _old = c.lock_admit(None, "link.segment").unwrap().unwrap();
+        let new = c.lock_admit(None, "link.segment").unwrap().unwrap();
+        clock.store(T0 + 40_000, Ordering::SeqCst);
+        c.lock_done(new);
+        clock.store(T0 + 41_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(1_100);
+        assert!(c.call(None, &back).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ticket_handed_back_late_is_dated_by_the_end_of_its_work() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        for stamped in [true, false] {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-late-{stamped}-{}",
+                std::process::id()
+            ));
+            let mut c = core();
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            assert!(c.call(None, &back).is_ok());
+            clock.store(T0 + 1_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(1_000);
+            let mut t = c.lock_admit(None, "link.segment").unwrap().unwrap();
+            // the review's probe C: the work ends at T0 + 2 s; the daemon is busy, so the
+            // ticket comes back at T0 + 20 s; a human touched the phone at T0 + 10 s
+            clock.store(T0 + 2_000, Ordering::SeqCst);
+            if stamped {
+                t.finished();
+            }
+            clock.store(T0 + 20_000, Ordering::SeqCst);
+            c.lock_done(t);
+            clock.store(T0 + 21_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(11_000);
+            let r = c.call(None, &back);
+            if stamped {
+                assert!(
+                    matches!(r, Err(CoreError::Refused(Refusal::ScreenLock { .. }))),
+                    "{r:?}"
+                );
+            } else {
+                // the positive control: unstamped, the late report would have taken the touch
+                assert!(r.is_ok(), "{r:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_segment_a_free_phone_let_through_must_be_short_and_a_lease_lifts_the_limit() {
+        use crate::askscreen::{save_memory, Memory};
+        use crate::screenlock::{FREE_SEGMENT_MAX_S, FREE_SEGMENT_MAX_STEPS};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let mut c = core();
+        // no lock: no limit
+        assert!(matches!(
+            c.lock_admit_segment(None, 500, Some(3_600)),
+            Ok(SegmentAdmission {
+                ticket: None,
+                max_life_s: None
+            })
+        ));
+        let phone = Arc::new(Mutex::new(put_down()));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-segcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        // a free phone: too many steps, or asking to live too long, is refused
+        let why = seg_refused(c.lock_admit_segment(None, FREE_SEGMENT_MAX_STEPS + 1, None));
+        assert!(
+            why.contains("at most 10 steps") && why.contains("ask-screen"),
+            "{why}"
+        );
+        seg_refused(c.lock_admit_segment(
+            None,
+            FREE_SEGMENT_MAX_STEPS,
+            Some(FREE_SEGMENT_MAX_S + 1),
+        ));
+        // the positive control: at the limits, and with no life asked for, it goes, for 10 s
+        let free = |r: Result<SegmentAdmission, CoreError>| matches!(r, Ok(SegmentAdmission { ticket: Some(_), max_life_s: Some(s) }) if s == FREE_SEGMENT_MAX_S);
+        assert!(free(c.lock_admit_segment(
+            None,
+            FREE_SEGMENT_MAX_STEPS,
+            Some(FREE_SEGMENT_MAX_S)
+        )));
+        assert!(free(c.lock_admit_segment(None, 1, None)));
+        // a lease lifts the step limit, and the segment may live as long as the lease
+        let mut m = Memory::default();
+        m.leases.insert("0123456789abcdef".into(), T0 + 600_000);
+        save_memory(&dir, POCO_SERIAL, &m).unwrap();
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(500);
+        assert!(matches!(
+            c.lock_admit_segment(None, 500, Some(599)),
+            Ok(SegmentAdmission {
+                ticket: None,
+                max_life_s: Some(599)
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The screen lock's refusal of a link segment: its reason.
+    fn seg_refused(r: Result<SegmentAdmission, CoreError>) -> String {
+        match r {
+            Err(CoreError::Refused(Refusal::ScreenLock {
+                tool: "link.segment",
+                why,
+            })) => why,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_segment_a_lease_let_through_may_not_outlive_the_lease() {
+        use crate::askscreen::{save_memory, Memory};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let phone = Arc::new(Mutex::new(busy(500)));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir = std::env::temp_dir().join(format!(
+            "agentroid-core-lock-seglease-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let mut m = Memory::default();
+        m.leases.insert("0123456789abcdef".into(), T0 + 60_000);
+        save_memory(&dir, POCO_SERIAL, &m).unwrap();
+        // the review's probe: 50 steps asking for 600 s, 1 s before a 60 s lease ends: it goes,
+        // with its life cut to what is left of the lease (the owner's call: cut, not refused)
+        clock.store(T0 + 59_000, Ordering::SeqCst);
+        assert!(matches!(
+            c.lock_admit_segment(None, 50, Some(600)),
+            Ok(SegmentAdmission {
+                ticket: None,
+                max_life_s: Some(1)
+            })
+        ));
+        // asking for no life: the same
+        assert!(matches!(
+            c.lock_admit_segment(None, 50, None),
+            Ok(SegmentAdmission {
+                ticket: None,
+                max_life_s: Some(1)
+            })
+        ));
+        // under a second left: nothing may run
+        clock.store(T0 + 59_500, Ordering::SeqCst);
+        let why = seg_refused(c.lock_admit_segment(None, 1, None));
+        assert!(
+            why.contains("under a second") && why.contains("ask-screen"),
+            "{why}"
+        );
+        // the positive control: early in the lease, the same segment goes, with its own life
+        clock.store(T0, Ordering::SeqCst);
+        assert!(matches!(
+            c.lock_admit_segment(None, 50, Some(60)),
+            Ok(SegmentAdmission {
+                ticket: None,
+                max_life_s: Some(60)
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_call_under_another_adb_name_voids_an_older_ticket() {
+        use crate::fake::FAKE_POCO_USB;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        for newer in [true, false] {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-names-{newer}-{}",
+                std::process::id()
+            ));
+            let mut c = core();
+            // one phone on USB and on Wi-Fi: two adb names, one hardware serial
+            c.transport.poco_usb = true;
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            assert!(c.call(Some(FAKE_POCO_ADB), &back).is_ok());
+            // a shell line or segment admitted under the USB name inside the burst
+            clock.store(T0 + 1_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(1_000);
+            let late = c
+                .lock_admit(Some(FAKE_POCO_USB), "link.segment")
+                .unwrap()
+                .unwrap();
+            if newer {
+                // newer screen-changing work on the same phone under its Wi-Fi name
+                clock.store(T0 + 2_000, Ordering::SeqCst);
+                *phone.lock().unwrap() = busy(2_000);
+                assert!(c.call(Some(FAKE_POCO_ADB), &back).is_ok());
+            }
+            // a human touches it at T0 + 20 s; the old ticket comes back at T0 + 21 s
+            clock.store(T0 + 21_000, Ordering::SeqCst);
+            c.lock_done(late);
+            clock.store(T0 + 22_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(2_000);
+            let r = c.call(Some(FAKE_POCO_ADB), &back);
+            if newer {
+                assert!(
+                    matches!(r, Err(CoreError::Refused(Refusal::ScreenLock { .. }))),
+                    "{r:?}"
+                );
+            } else {
+                // the positive control: with no newer work, the ticket counts
+                assert!(r.is_ok(), "{r:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_segments_report_carries_the_burst_on_no_later_than_its_cap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // (when the report comes in, when the phone was last touched, admitted?)
+        let cases = [
+            // the review's probe E: accepted at T0 + 0.2 s, its own steps touch the phone at
+            // T0 + 5 s, its report at T0 + 5.5 s, then a key at T0 + 6 s
+            (Some(5_500), 5_000, true),
+            // the positive control: no report, so the step reads as someone else's touch
+            (None, 5_000, false),
+            // a report long after: dated no later than admission + 10 s, so a touch at
+            // T0 + 20 s is not covered
+            (Some(30_000), 20_000, false),
+            // ... but a touch inside the 10 s is
+            (Some(30_000), 9_500, true),
+        ];
+        for (i, (report, touch, ok)) in cases.into_iter().enumerate() {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-report-{i}-{}",
+                std::process::id()
+            ));
+            let mut c = core();
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            let mut t = c.lock_admit_segment(None, 3, None).unwrap().ticket.unwrap();
+            clock.store(T0 + 200, Ordering::SeqCst);
+            t.finished();
+            c.lock_done_segment(t, "seg-1");
+            if let Some(at) = report {
+                clock.store(T0 + 1_000, Ordering::SeqCst);
+                let early = c.lock_clock().map(|k| k.now());
+                clock.store(T0 + at, Ordering::SeqCst);
+                let stamped = c.lock_clock().map(|k| k.now());
+                // another segment's report, or this one's under another name, comes in earlier:
+                // it records nothing, and leaves this segment's own report to count
+                c.lock_segment_reported("", "seg-2", early);
+                c.lock_segment_reported(FAKE_POCO_ADB, "seg-1", early);
+                c.lock_segment_reported("", "seg-1", stamped);
+            }
+            let key_at = report.unwrap_or(5_500).max(touch) + 500;
+            clock.store(T0 + key_at, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(key_at - touch);
+            let r = c.call(None, &back);
+            assert_eq!(r.is_ok(), ok, "case {i}: {r:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_lease_drops_a_segment_report_still_to_come_from_before_it() {
+        use crate::askscreen::{save_memory, Memory};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        for leased in [true, false] {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-tail-lease-{leased}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut c = core();
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            // the review's probe: S1 let through at T0 (the phone is free)
+            let mut t = c.lock_admit_segment(None, 3, None).unwrap().ticket.unwrap();
+            clock.store(T0 + 200, Ordering::SeqCst);
+            t.finished();
+            c.lock_done_segment(t, "seg-1");
+            if leased {
+                let mut m = Memory::default();
+                m.leases.insert("0123456789abcdef".into(), T0 + 60_000);
+                save_memory(&dir, POCO_SERIAL, &m).unwrap();
+            }
+            // a call at T0 + 2 s (by the lease, or in the positive control by the burst)
+            clock.store(T0 + 2_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(1_800);
+            assert!(c.call(None, &back).is_ok());
+            // S1's report at T0 + 9 s
+            clock.store(T0 + 9_000, Ordering::SeqCst);
+            let stamped = c.lock_clock().map(|k| k.now());
+            c.lock_segment_reported("", "seg-1", stamped);
+            // after the lease, at T0 + 70 s: an app and the keyboard up, the last touch at T0 + 8 s
+            clock.store(T0 + 70_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(62_000);
+            let r = c.call(None, &back);
+            if leased {
+                assert!(
+                    matches!(r, Err(CoreError::Refused(Refusal::ScreenLock { .. }))),
+                    "{r:?}"
+                );
+            } else {
+                assert!(r.is_ok(), "{r:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Deliberate, and in the README: a refusal keeps a segment's pending report, so the report can
+    /// reopen, within 10 s of the segment's admission, a burst that the refusal ended.
+    #[test]
+    fn a_pending_segment_report_can_reopen_a_burst_a_refusal_ended_within_its_cap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // (someone's touch, the report, admitted after the report?)
+        for (touch, report, ok) in [(3_000, 6_000, true), (11_000, 12_000, false)] {
+            let phone = Arc::new(Mutex::new(put_down()));
+            let clock = Arc::new(AtomicU64::new(T0));
+            let dir = std::env::temp_dir().join(format!(
+                "agentroid-core-lock-tail-refused-{touch}-{}",
+                std::process::id()
+            ));
+            let mut c = core();
+            c.set_screen_lock(test_lock(&dir, &phone, &clock));
+            let mut t = c.lock_admit_segment(None, 3, None).unwrap().ticket.unwrap();
+            clock.store(T0 + 200, Ordering::SeqCst);
+            t.finished();
+            c.lock_done_segment(t, "seg-1");
+            // someone picks the phone up; a key a second later is refused
+            clock.store(T0 + touch + 1_000, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(1_000);
+            assert!(matches!(
+                c.call(None, &back),
+                Err(CoreError::Refused(Refusal::ScreenLock { .. }))
+            ));
+            // the segment's report is pulled, and a key half a second later
+            clock.store(T0 + report, Ordering::SeqCst);
+            let stamped = c.lock_clock().map(|k| k.now());
+            c.lock_segment_reported("", "seg-1", stamped);
+            clock.store(T0 + report + 500, Ordering::SeqCst);
+            *phone.lock().unwrap() = busy(report + 500 - touch);
+            let r = c.call(None, &back);
+            // inside the 10 s the report reopens the burst while someone holds the phone; a touch
+            // after the cap (admission + 10 s) is never covered
+            assert_eq!(r.is_ok(), ok, "touch {touch}: {r:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn work_let_through_drops_the_kept_verdict_even_if_it_never_runs() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        let phone = Arc::new(Mutex::new(put_down()));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-forget-{}", std::process::id()));
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        // the positive control: a check inside the kept second is answered from the kept verdict
+        assert!(c.admit(None, &back).is_ok());
+        *phone.lock().unwrap() = busy(100);
+        clock.store(T0 + 200, Ordering::SeqCst);
+        assert!(c.admit(None, &back).is_ok(), "kept verdict");
+        // a segment let through, then dropped (it failed before it ran): the phone is read again,
+        // and someone picked it up
+        clock.store(T0 + 2_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = put_down();
+        let seg = c.lock_admit(None, "link.segment").unwrap();
+        assert!(seg.is_some());
+        drop(seg);
+        clock.store(T0 + 2_200, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(100);
+        assert!(matches!(
+            c.call(None, &back),
+            Err(CoreError::Refused(Refusal::ScreenLock { .. }))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_call_a_lease_let_through_never_starts_or_carries_on_a_burst() {
+        use crate::askscreen::{save_memory, Memory};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        const T0: u64 = 1_800_000_000_000;
+        let phone = Arc::new(Mutex::new(busy(1_000)));
+        let clock = Arc::new(AtomicU64::new(T0));
+        let dir =
+            std::env::temp_dir().join(format!("agentroid-core-lock-lease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut m = Memory::default();
+        m.leases.insert("0123456789abcdef".into(), T0 + 60_000);
+        save_memory(&dir, POCO_SERIAL, &m).unwrap();
+        let mut c = core();
+        c.set_screen_lock(test_lock(&dir, &phone, &clock));
+        let back = Call::Key {
+            name: "back".into(),
+        };
+        // the review's probe: the phone in use, the agent acts under the lease at T0 + 59 s
+        clock.store(T0 + 59_000, Ordering::SeqCst);
+        assert!(c.call(None, &back).is_ok());
+        // a segment under the lease gives no ticket
+        assert!(matches!(c.lock_admit(None, "link.segment"), Ok(None)));
+        // at T0 + 120 s the lease is over; an app and the keyboard are up and the agent's touch
+        // (T0 + 59 s) is the last one: in use, not a burst
+        clock.store(T0 + 120_000, Ordering::SeqCst);
+        *phone.lock().unwrap() = busy(61_000);
+        match c.call(None, &back) {
+            Err(CoreError::Refused(Refusal::ScreenLock { why, .. })) => {
+                assert!(why.contains("in use"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

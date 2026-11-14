@@ -77,6 +77,14 @@ impl Runner for DynRunner {
     ) -> Result<agentroid_adb_link::runner::BytesOutput, RunError> {
         self.0.run_bytes(args, timeout_ms)
     }
+    fn run_marked(
+        &self,
+        args: &[String],
+        timeout_ms: u64,
+        mark: &mut dyn FnMut(),
+    ) -> Result<RunOutput, RunError> {
+        self.0.run_marked(args, timeout_ms, mark)
+    }
     fn deny(&self, token: &str) {
         self.0.deny(token);
     }
@@ -2004,16 +2012,19 @@ impl sandbox::Bridge for DaemonBridge {
             }
         }
         // D3b: core's shell guard (deny-by-default families, approval for `asked`, audit log).
-        // Nothing reaches the runner unless it says yes.
-        {
+        // Nothing reaches the runner unless it says yes. `Some(ticket)`: the screen lock admitted
+        // this very line (a gate that answers after the timeout keeps its ticket to itself, and a
+        // newer call on the phone makes it count for nothing)
+        let ticket = {
             let (daemon, serial, line) = (self.daemon.clone(), self.serial.clone(), argv.join(" "));
             with_timeout(SHELL_GATE_TIMEOUT_MS, move || {
                 daemon
                     .backend()
                     .shell_gate(&serial, &line)
                     .map_err(|e| format!("refused by the shell guard: {e}"))
-            })?;
-        }
+            })?
+        };
+        // no runner: nothing is sent, and the ticket is dropped unused
         let runner = self
             .shell
             .clone()
@@ -2030,7 +2041,7 @@ impl sandbox::Bridge for DaemonBridge {
             line,
         ];
         let t = self.shell_timeout_ms;
-        with_timeout(t + 1_000, move || match runner.run(&args, t) {
+        let out = with_timeout(t + 1_000, move || match runner.run(&args, t) {
             Ok(o) if o.ok() => Ok(o.stdout),
             Ok(o) => Err(format!(
                 "adb shell exited {:?}: {}",
@@ -2038,7 +2049,15 @@ impl sandbox::Bridge for DaemonBridge {
                 o.stderr.trim()
             )),
             Err(e) => Err(e.to_string()),
-        })
+        });
+        // a line the lock admitted has run (or timed out running): only now is its end the
+        // agent's own activity for the screen lock's burst, dated now, before the daemon's lock is
+        // taken (it may be busy for a while). A read-only line has no ticket.
+        if let Some(mut t) = ticket {
+            t.finished();
+            self.daemon.backend().lock_done(t);
+        }
+        out
     }
 
     fn shell_refused(&mut self, cmd: &str, reason: &str) {

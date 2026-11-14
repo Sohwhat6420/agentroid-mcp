@@ -48,6 +48,18 @@ pub const S24_SCREEN_AWAKE_KEYS: [(&str, &str); 2] = [
     ("global", "stay_on_while_plugged_in"),
 ];
 
+/// The protected phone's call state, for the screen lock and `ask-screen` alone. Added 14 Nov 2026 on the
+/// owner's yes: the call state only, for the screen lock. Without it the protected phone's call state is
+/// unknown, so it always reads as in use.
+///
+/// Only a runner built with [`GuardedRunner::with_s24_call_state`] (the screen lock's and `ask-screen`'s own
+/// phone reader, and no other) lets this one line through to the protected phone, and only in the exact
+/// shape [`Checked::is_s24_call_state`] accepts (`shell` plus this one argument: no flag, pipe or other
+/// service). Every other runner, the plain [`Guard`], `doctor` and the MCP tools still refuse it for the
+/// protected phone, so the full dump never reaches an agent: the reader keeps only the parsed call state
+/// (`askscreen::parse_call_state`) and drops the text. It is not in [`S24_READS`].
+pub const S24_CALL_STATE_READ: &str = "dumpsys telephony.registry";
+
 /// A value the protected phone exception may write: a plain decimal (no sign, no leading zero), at most
 /// `i32::MAX` ms for the timeout and at most 15 (the AC, USB, wireless and dock bits) for stay-on.
 fn screen_awake_value(key: &str, v: &str) -> bool {
@@ -310,6 +322,12 @@ impl Checked {
         }
     }
 
+    /// True when this is exactly the protected phone's call-state read as the screen lock sends it:
+    /// `shell` plus the one argument [`S24_CALL_STATE_READ`], word for word.
+    pub fn is_s24_call_state(&self) -> bool {
+        self.sub == "shell" && self.rest.len() == 1 && self.rest[0] == S24_CALL_STATE_READ
+    }
+
     /// True when `sub` + `rest` is exactly one of [`GETEVENT_SHAPES`].
     pub fn is_getevent_shape(&self) -> bool {
         let mut words = vec![self.sub.as_str()];
@@ -366,6 +384,9 @@ pub struct Guard {
     /// The protected phone screen-awake exception (see [`S24_SCREEN_AWAKE_KEYS`]). Off unless the runner was
     /// built with [`GuardedRunner::with_s24_screen_awake`].
     s24_screen_awake: bool,
+    /// The protected phone call-state read (see [`S24_CALL_STATE_READ`]). Off unless the runner was built
+    /// with [`GuardedRunner::with_s24_call_state`].
+    s24_call_state: bool,
 }
 
 fn lock(m: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -397,8 +418,9 @@ impl Guard {
         };
         if let Some(sel) = &selector {
             if let Some(v) = sel.get(1) {
-                let read =
-                    probe.is_s24_read() || (self.s24_screen_awake && probe.is_s24_screen_awake());
+                let read = probe.is_s24_read()
+                    || (self.s24_screen_awake && probe.is_s24_screen_awake())
+                    || (self.s24_call_state && probe.is_s24_call_state());
                 if self.is_forbidden(v) && !read {
                     return refuse(format!("{v} is the read-only S24, never a target"));
                 }
@@ -571,15 +593,37 @@ impl<R: Runner> GuardedRunner<R> {
         }
     }
 
+    /// The runner the screen lock and `ask-screen` read the phone through, and nothing else: as
+    /// [`GuardedRunner::new`], plus the protected phone's call-state read ([`S24_CALL_STATE_READ`],
+    /// exactly as [`Checked::is_s24_call_state`] accepts it).
+    pub fn with_s24_call_state(inner: R) -> Self {
+        Self {
+            inner,
+            guard: Guard {
+                s24_call_state: true,
+                ..Guard::default()
+            },
+        }
+    }
+
     pub fn guard(&self) -> &Guard {
         &self.guard
     }
 
     fn hardware_serial(&self, selector: &[String]) -> Result<String, RunError> {
+        self.hardware_serial_within(selector, 15_000)
+    }
+
+    /// [`Self::hardware_serial`], giving the read at most `timeout_ms`.
+    fn hardware_serial_within(
+        &self,
+        selector: &[String],
+        timeout_ms: u64,
+    ) -> Result<String, RunError> {
         let mut a: Vec<String> = selector.to_vec();
         a.push("shell".into());
         a.push("getprop ro.serialno".into());
-        let out = self.inner.run(&a, 15_000)?;
+        let out = self.inner.run(&a, timeout_ms)?;
         let val = out.stdout.trim().to_string();
         let plain = !val.is_empty()
             && val.len() <= 64
@@ -625,19 +669,25 @@ impl<R: Runner> GuardedRunner<R> {
     /// The checks every command passes before it is sent: the argv guard, then the target's real
     /// hardware serial (fails closed).
     fn admit(&self, args: &[String]) -> Result<(), RunError> {
+        self.admit_within(args, 15_000)
+    }
+
+    /// [`Self::admit`], giving its serial read at most `probe_ms`.
+    fn admit_within(&self, args: &[String], probe_ms: u64) -> Result<(), RunError> {
         let c = self.guard.check(args).map_err(|e| RunError::Refused(e.0))?;
         if let Some(sel) = &c.selector {
             if !c.is_identity_probe()
                 && !HOST_CMDS.contains(&c.sub.as_str())
                 && !GLOBAL_SAFE.contains(&c.sub.as_str())
             {
-                let hw = self.hardware_serial(sel)?;
+                let hw = self.hardware_serial_within(sel, probe_ms)?;
                 if hw.eq_ignore_ascii_case(S24_SERIAL) {
                     if let Some(v) = sel.get(1) {
                         self.guard.deny(v);
                     }
-                    if !c.is_s24_read() && !(self.guard.s24_screen_awake && c.is_s24_screen_awake())
-                    {
+                    let excepted = (self.guard.s24_screen_awake && c.is_s24_screen_awake())
+                        || (self.guard.s24_call_state && c.is_s24_call_state());
+                    if !c.is_s24_read() && !excepted {
                         return Err(RunError::Refused(
                             "target is the read-only S24, never a target".into(),
                         ));
@@ -666,6 +716,26 @@ impl<R: Runner> Runner for GuardedRunner<R> {
 
     fn deny(&self, token: &str) {
         self.guard.deny(token);
+    }
+
+    fn run_marked(
+        &self,
+        args: &[String],
+        timeout_ms: u64,
+        mark: &mut dyn FnMut(),
+    ) -> Result<RunOutput, RunError> {
+        // the checks (and their serial read) first, outside the marked window; the serial read and
+        // the command share `timeout_ms`, so a caller with a deadline keeps it
+        let t0 = std::time::Instant::now();
+        self.admit_within(args, timeout_ms.min(15_000))?;
+        let spent = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let left = timeout_ms.saturating_sub(spent);
+        if left == 0 {
+            return Err(RunError::Io(format!(
+                "no time left after the target check ({timeout_ms} ms); nothing was sent"
+            )));
+        }
+        self.inner.run_marked(args, left, mark)
     }
 }
 
@@ -914,6 +984,75 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    #[test]
+    fn a_marked_run_marks_after_the_serial_read_and_not_at_all_when_refused() {
+        let r = GuardedRunner::new(Spy {
+            hw: "R5CX12345AB".into(),
+            calls: RefCell::new(vec![]),
+        });
+        let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys power"]);
+        let marked_after = RefCell::new(None);
+        r.run_marked(&argv, 1000, &mut || {
+            *marked_after.borrow_mut() = Some(r.inner.calls.borrow().len())
+        })
+        .unwrap();
+        let calls = r.inner.calls.borrow().clone();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].last().unwrap(), "getprop ro.serialno");
+        assert_eq!(calls[1].last().unwrap(), "dumpsys power");
+        // marked once the serial read was done, before the command
+        assert_eq!(*marked_after.borrow(), Some(1));
+        // the protected phone: refused before anything is sent, and never marked
+        let s24 = GuardedRunner::new(Spy {
+            hw: S24_SERIAL.into(),
+            calls: RefCell::new(vec![]),
+        });
+        let mut marked = false;
+        let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys window"]);
+        assert!(s24.run_marked(&argv, 1000, &mut || marked = true).is_err());
+        assert!(!marked);
+    }
+
+    #[test]
+    fn a_marked_runs_serial_read_and_command_share_its_timeout() {
+        /// Records each timeout; the serial read takes 30 ms.
+        struct Timed(RefCell<Vec<(String, u64)>>);
+        impl Runner for Timed {
+            fn run(&self, a: &[String], t: u64) -> Result<RunOutput, RunError> {
+                let cmd = a.last().cloned().unwrap_or_default();
+                self.0.borrow_mut().push((cmd.clone(), t));
+                let out = if cmd == "getprop ro.serialno" {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    "R5CX12345AB\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(RunOutput {
+                    code: Some(0),
+                    stdout: out,
+                    stderr: String::new(),
+                })
+            }
+        }
+        let r = GuardedRunner::new(Timed(RefCell::new(vec![])));
+        let argv = args(&["-s", "192.0.2.9:5555", "shell", "dumpsys power"]);
+        r.run_marked(&argv, 700, &mut || {}).unwrap();
+        let calls = r.inner.0.borrow().clone();
+        assert_eq!(calls[0], ("getprop ro.serialno".to_string(), 700));
+        assert_eq!(calls[1].0, "dumpsys power");
+        assert!(calls[1].1 <= 670, "{calls:?}");
+        // no time left after the serial read: nothing is sent
+        let r = GuardedRunner::new(Timed(RefCell::new(vec![])));
+        let mut marked = false;
+        assert!(r.run_marked(&argv, 20, &mut || marked = true).is_err());
+        assert!(!marked);
+        assert_eq!(r.inner.0.borrow().len(), 1);
+        // a plain run keeps the serial read's own 15 s
+        let r = GuardedRunner::new(Timed(RefCell::new(vec![])));
+        r.run(&argv, 700).unwrap();
+        assert_eq!(r.inner.0.borrow()[0].1, 15_000);
     }
 
     #[test]
@@ -1571,6 +1710,112 @@ mod tests {
             )
             .is_err());
         assert!(r.run(&link_dump_argv(S24_SERIAL), 1000).is_err());
+    }
+
+    #[test]
+    fn only_the_call_state_runner_lets_the_call_state_read_reach_the_s24() {
+        let exact = S24_CALL_STATE_READ.to_string();
+        for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+            let argv = args(&["-s", sel, "shell", &exact]);
+            // the screen lock's reader: through, as sent
+            let r = GuardedRunner::with_s24_call_state(s24_spy());
+            r.run(&argv, 1000)
+                .unwrap_or_else(|e| panic!("{sel}: {e:?}"));
+            assert_eq!(r.inner.calls.borrow().last(), Some(&argv), "{sel}");
+            let mut marked = false;
+            assert!(r.run_marked(&argv, 1000, &mut || marked = true).is_ok());
+            assert!(marked);
+            // every other runner, and the plain guard, refuse it
+            for other in [
+                GuardedRunner::new(s24_spy()),
+                GuardedRunner::with_s24_screen_awake(s24_spy()),
+            ] {
+                assert!(
+                    matches!(other.run(&argv, 1000), Err(RunError::Refused(_))),
+                    "{sel}"
+                );
+                assert!(!other
+                    .inner
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|c| c.contains(&exact)));
+            }
+            if sel == S24_SERIAL {
+                assert!(Guard::new().check(&argv).is_err());
+            }
+        }
+        // the positive control's neighbour: the read is not one of the approved reads
+        assert!(!S24_READS.iter().any(|r| r.contains("telephony")));
+    }
+
+    #[test]
+    fn the_call_state_runner_refuses_everything_else_on_the_s24() {
+        let near = [
+            "dumpsys telephony.registry -a",
+            "dumpsys telephony.registry|cat",
+            "dumpsys telephony.registry | cat",
+            "dumpsys telephony.registry2",
+            "dumpsys telephony.registry ",
+            " dumpsys telephony.registry",
+            "dumpsys  telephony.registry",
+            "dumpsys telephony.registry; input tap 1 1",
+            "dumpsys telephony",
+            "dumpsys phone",
+            "dumpsys isub",
+            "dumpsys window",
+            "settings put system screen_off_timeout 1800000",
+            "input tap 1 1",
+        ];
+        for line in near {
+            for sel in [S24_SERIAL, "192.0.2.99:40000"] {
+                let r = GuardedRunner::with_s24_call_state(s24_spy());
+                let argv = args(&["-s", sel, "shell", line]);
+                assert!(
+                    matches!(r.run(&argv, 1000), Err(RunError::Refused(_))),
+                    "{sel} {line}"
+                );
+                assert!(
+                    !r.inner
+                        .calls
+                        .borrow()
+                        .iter()
+                        .any(|c| c.contains(&line.to_string())),
+                    "{line} reached adb"
+                );
+            }
+        }
+        // the multi-word spelling and exec-out are not the shape the lock sends
+        for a in [
+            &["-s", S24_SERIAL, "shell", "dumpsys", "telephony.registry"][..],
+            &["-s", S24_SERIAL, "exec-out", "dumpsys telephony.registry"][..],
+        ] {
+            let r = GuardedRunner::with_s24_call_state(s24_spy());
+            assert!(r.run(&args(a), 1000).is_err(), "{a:?}");
+        }
+        // the approved reads still pass, and getevent and link pairing stay refused
+        let r = GuardedRunner::with_s24_call_state(s24_spy());
+        assert!(r
+            .run(&args(&["-s", S24_SERIAL, "shell", "dumpsys power"]), 1000)
+            .is_ok());
+        assert!(r
+            .admit_getevent(
+                &args(&["-s", "192.0.2.99:40000", "exec-out", "getevent", "-lt"]),
+                true
+            )
+            .is_err());
+        assert!(r.run(&link_dump_argv(S24_SERIAL), 1000).is_err());
+        // and on other phones it drives as before
+        let r = GuardedRunner::with_s24_call_state(Spy {
+            hw: POCO_HW.into(),
+            calls: RefCell::new(vec![]),
+        });
+        assert!(r
+            .run(
+                &args(&["-s", "192.0.2.78:37123", "shell", "input tap 1 1"]),
+                1000
+            )
+            .is_ok());
     }
 
     #[test]

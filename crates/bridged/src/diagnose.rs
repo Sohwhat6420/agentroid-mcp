@@ -411,6 +411,8 @@ mod tests {
             "getprop ro.product.manufacturer",
             "getprop ro.serial",
             "dumpsys window",
+            // the screen lock's own reader may read the call state (14 Nov 2026); doctor may not
+            "dumpsys telephony.registry",
             "settings get system a",
             "pm list packages",
             "ime list -s",

@@ -545,7 +545,7 @@ fn shell_guard_through_core_blocks_the_dangerous_families_and_asks_for_the_rest(
         let before = core.transport.acted.len();
         let r = core.shell_gate(s, line);
         let actual = match &r {
-            Ok(()) => "allowed".to_string(),
+            Ok(_) => "allowed".to_string(),
             Err(CoreError::Refused(rf)) => rf.verdict().to_string(),
             Err(e) => format!("error: {e}"),
         };

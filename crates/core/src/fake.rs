@@ -90,6 +90,8 @@ impl TreeSource for ScriptedSource<'_> {
 
 pub const FAKE_POCO_ADB: &str = "192.0.2.50:37123";
 pub const FAKE_S24_ADB: &str = "192.0.2.60:5555";
+/// The fake POCO's second adb name, as when it is on USB and Wi-Fi at once ([`FakeDevice::poco_usb`]).
+pub const FAKE_POCO_USB: &str = "usb-fake-poco-1";
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -111,6 +113,8 @@ pub struct FakeDevice {
     pub token_lost: bool,
     pub token_pushes: u32,
     pub s24_connected: bool,
+    /// List the POCO a second time, under [`FAKE_POCO_USB`] (one phone, two adb names).
+    pub poco_usb: bool,
     /// Serve this tree from the uiautomator backend instead of the built-in Settings screen.
     pub xml_override: Option<String>,
     /// Every transport method called, by name.
@@ -135,6 +139,7 @@ impl Default for FakeDevice {
             token_lost: false,
             token_pushes: 0,
             s24_connected: true,
+            poco_usb: false,
             xml_override: None,
             calls: vec![],
             acted: vec![],
@@ -181,6 +186,13 @@ impl Transport for FakeDevice {
             model: "23113RKC6G".into(),
             hw_serial: POCO_SERIAL.into(),
         }];
+        if self.poco_usb {
+            v.push(DeviceInfo {
+                serial: FAKE_POCO_USB.into(),
+                model: "23113RKC6G".into(),
+                hw_serial: POCO_SERIAL.into(),
+            });
+        }
         if self.s24_connected {
             v.push(DeviceInfo {
                 serial: FAKE_S24_ADB.into(),

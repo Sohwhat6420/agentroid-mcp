@@ -321,6 +321,8 @@ pub enum Refusal {
     },
     /// The audit log could not record the call, so it was not sent (no unlogged action).
     Audit { tool: &'static str, why: String },
+    /// The screen lock (`screenlock.rs`): the phone is in use and `ask-screen` gave no lease.
+    ScreenLock { tool: &'static str, why: String },
 }
 
 impl Refusal {
@@ -331,7 +333,8 @@ impl Refusal {
             _ => "blocked",
         }
     }
-    /// The rule family that refused: `s24`, `allowlist`, `read_only`, `helper`, `screen:<kind>`, `audit`.
+    /// The rule family that refused: `s24`, `allowlist`, `read_only`, `helper`, `screen:<kind>`, `audit`,
+    /// `screen_lock`.
     pub fn rule(&self) -> String {
         match self {
             Refusal::S24 { .. } => "s24".into(),
@@ -340,6 +343,7 @@ impl Refusal {
             Refusal::NeedsAdbShell { .. } => "helper".into(),
             Refusal::Screen { kind, .. } => format!("screen:{kind}"),
             Refusal::Audit { .. } => "audit".into(),
+            Refusal::ScreenLock { .. } => "screen_lock".into(),
         }
     }
 }
@@ -387,6 +391,7 @@ impl fmt::Display for Refusal {
             Refusal::NotAllowed { serial } => write!(f, "{serial} is not on the allowlist. Start bridged with --allow-serial <hardware serial> (or list it in allow.txt) to drive it."),
             Refusal::ReadOnly { tool } => write!(f, "{tool} refused: this device is read_only, so it only answers reads"),
             Refusal::NeedsAdbShell { tool } => write!(f, "{tool} refused: this device is in helper mode and {tool} needs adb shell"),
+            Refusal::ScreenLock { tool, why } => write!(f, "{tool} refused by the screen lock, nothing was sent: {why}"),
         }
     }
 }
