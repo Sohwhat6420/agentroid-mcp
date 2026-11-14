@@ -70,7 +70,7 @@ public final class GuardService extends Service {
     private String home;
     private boolean polling;
     private String shownText;
-    private long ticks, tickNanos;
+    private long ticks, tickNanos, clockDraws;
 
     private final Runnable poll = new Runnable() { public void run() { pollOnce(); } };
 
@@ -79,9 +79,28 @@ public final class GuardService extends Service {
             h.post(new Runnable() { public void run() {
                 interactive = !Intent.ACTION_SCREEN_OFF.equals(i.getAction());
                 onScreen();
+                if (Intent.ACTION_SCREEN_ON.equals(i.getAction())) drawClocks();
             } });
         }
     };
+
+    /**
+     * The dot clocks' minute: the system's own ACTION_TIME_TICK (a non-wakeup broadcast the system sends anyway, and
+     * only to a receiver registered at run time). Ignored while the screen is off, and redrawn once at screen-on, so
+     * a clock costs nothing in the pocket. No alarm of this app's.
+     */
+    private final BroadcastReceiver clock = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, final Intent i) {
+            h.post(new Runnable() { public void run() {
+                if (interactive || !Intent.ACTION_TIME_TICK.equals(i.getAction())) drawClocks();
+            } });
+        }
+    };
+
+    private void drawClocks() {
+        clockDraws++;
+        ClockWidget.renderAll(this);
+    }
 
     private final ConnectivityManager.NetworkCallback net = new ConnectivityManager.NetworkCallback() {
         @Override public void onAvailable(Network n) {
@@ -123,8 +142,15 @@ public final class GuardService extends Service {
         f.addAction(Intent.ACTION_SCREEN_OFF);
         f.addAction(Intent.ACTION_USER_PRESENT);
         registerReceiver(screen, f);
+        IntentFilter t = new IntentFilter();
+        t.addAction(Intent.ACTION_TIME_TICK);
+        t.addAction(Intent.ACTION_TIME_CHANGED);
+        t.addAction(Intent.ACTION_TIMEZONE_CHANGED);
+        t.addAction(Intent.ACTION_DATE_CHANGED);
+        registerReceiver(clock, t);
         PowerManager pm = getSystemService(PowerManager.class);
         interactive = pm == null || pm.isInteractive();
+        h.post(new Runnable() { public void run() { drawClocks(); } });
         core.prefs().registerOnSharedPreferenceChangeListener(prefsChanged);
     }
 
@@ -351,13 +377,15 @@ public final class GuardService extends Service {
         w.print(core.dump());
         w.println("interactive=" + interactive + " wifi_networks=" + wifiUp.size() + " polling=" + polling
                 + " top=" + visible.top + " visible=" + visible.size() + " home=" + home
-                + " ticks=" + ticks + " mean_tick_us=" + (ticks == 0 ? 0 : tickNanos / ticks / 1000));
+                + " ticks=" + ticks + " mean_tick_us=" + (ticks == 0 ? 0 : tickNanos / ticks / 1000)
+                + " clock_draws=" + clockDraws);
     }
 
     @Override
     public void onDestroy() {
         polling = false;
         try { unregisterReceiver(screen); } catch (Throwable ignored) { }
+        try { unregisterReceiver(clock); } catch (Throwable ignored) { }
         try { cm.unregisterNetworkCallback(net); } catch (Throwable ignored) { }
         core.prefs().unregisterOnSharedPreferenceChangeListener(prefsChanged);
         if (thread != null) thread.quitSafely();

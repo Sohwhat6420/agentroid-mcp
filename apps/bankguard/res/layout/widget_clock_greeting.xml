@@ -2,8 +2,9 @@
 <!-- Dot clock (greeting): the owner's own clock, matched from the owner's S24 home screen (14 Nov 2026). No surface: white
      dot type straight on the wallpaper, left-aligned, three lines: HELLO! / 06:47 / SAT, 14 NOV.
      Sizes from the screenshot: caps 109 px and 42 px at 2.8125 px/dp, DotoClock caps 0.69 em, so 56 sp and 22 sp.
-     The negative margins pull the lines to the reference's 14 dp ink gaps (each line box carries 0.255 em above and below).
-     TextClocks only: no alarm, no wakeup. -->
+     Each line is a bitmap drawn by ClockWidget (a launcher ignores an app's font inside a widget). A line bitmap is
+     1.2 em tall like the font's own line box, so the negative margins still pull the lines to the reference's 14 dp
+     ink gaps. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/w_root"
     android:layout_width="match_parent"
@@ -13,48 +14,27 @@
     android:paddingStart="8dp"
     android:paddingEnd="8dp">
 
-    <TextView
+    <ImageView
         android:id="@+id/w_greeting"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/clock_greeting_text"
-        android:includeFontPadding="false"
-        android:maxLines="1"
-        android:fontFamily="@font/doto_clock"
-        android:textColor="@color/w_ink"
-        android:textSize="22sp"
-        android:shadowColor="#59000000"
-        android:shadowRadius="6"
+        android:adjustViewBounds="true"
+        android:scaleType="fitStart"
         android:importantForAccessibility="no" />
 
-    <TextClock
+    <ImageView
         android:id="@+id/w_time"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="-6dp"
-        android:includeFontPadding="false"
-        android:maxLines="1"
-        android:format12Hour="hh:mm"
-        android:format24Hour="HH:mm"
-        android:fontFamily="@font/doto_clock"
-        android:textColor="@color/w_ink"
-        android:textSize="56sp"
-        android:shadowColor="#59000000"
-        android:shadowRadius="8" />
+        android:adjustViewBounds="true"
+        android:scaleType="fitStart" />
 
-    <TextClock
+    <ImageView
         android:id="@+id/w_date"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="-6dp"
-        android:includeFontPadding="false"
-        android:maxLines="1"
-        android:format12Hour="EEE, d MMM"
-        android:format24Hour="EEE, d MMM"
-        android:textAllCaps="true"
-        android:fontFamily="@font/doto_clock"
-        android:textColor="@color/w_ink"
-        android:textSize="22sp"
-        android:shadowColor="#59000000"
-        android:shadowRadius="6" />
+        android:adjustViewBounds="true"
+        android:scaleType="fitStart" />
 </LinearLayout>

@@ -33,9 +33,19 @@ Nothing OS's dot-matrix language, kept quiet and exact:
 ## The widgets
 | Widget | Size | How it stays at 0 wakeups |
 | --- | --- | --- |
-| Dot clock: hello (the owner's) | 3x2 | `HELLO!`, then two `TextClock`s: `hh:mm` at 56 sp, `EEE, d MMM` at 22 sp. No surface, no alarm |
-| Dot clock: time, date, day | 4x1 | Three `TextClock`s tick inside the launcher; `updatePeriodMillis` 0, no alarm |
+| Dot clock: hello (the owner's) | 3x2 | `HELLO!`, `hh:mm` at 56 sp, `EEE, d MMM` at 22 sp. No surface, no alarm |
+| Dot clock: time, date, day | 4x1 | Three pills, redrawn on the system's minute tick while the screen is on; no alarm |
 | Dot clock: large | 4x2 | The same, with `HH:mm` over `EEE d MMM` |
+
+**Why the clocks are bitmaps.** A launcher inflates a widget in a restricted context, and TextView loads a resource
+font only in an unrestricted one. So `android:fontFamily="@font/doto_clock"` showed the system font in a widget (seen
+on the POCO, 14 Nov 2026), while it works in the app's own screens. Each clock line is drawn in the app's process
+with the font (`ClockRender`) and set as an image.
+
+**What redraws them.** GuardService, the foreground service the bank guard already runs, registers for
+`ACTION_TIME_TICK`, the system's own non-wakeup minute broadcast. It redraws while the screen is on, and once at
+screen-on; off, it does nothing. A clock change, timezone or locale change also redraws. The app sets no alarm, and
+`updatePeriodMillis` stays 0. The service's dump counts the redraws (`clock_draws`).
 | App dock | 4x1 | Up to six buttons drawn once, when the owner changes the list; no timer |
 
 - The time follows the phone's 12 or 24-hour setting. In 12-hour it is `hh:mm`, with no am/pm, like the reference.
@@ -53,11 +63,13 @@ None, on purpose. These are restrained surfaces under rule 4 of the design stand
 
 ## Accessibility
 - Each dock button carries its app's name as its content description, for TalkBack and for Agentroid's own taps.
-- The clocks are `TextClock`s, which TalkBack reads.
+- Each clock image carries its time and full date as a content description; the greeting is decorative.
 - White on `#CD3733` is about 4.6:1, and on `#1B1B1D` about 16:1.
 - In the config screen, rows are 56 dp and buttons at least 44 dp.
 
 ## Open
 - The row and large clocks keep the POCO palette and the red date. They are extras; the greeting clock is the owner's own.
-- Check on the device that the launcher loads `@font/doto_clock` inside RemoteViews. If it does not, the fallback is
-  a bitmap clock redrawn on a non-wakeup `RTC` minute alarm (never `RTC_WAKEUP`).
+- If the system stops GuardService, the clocks keep the last minute drawn until it restarts (`START_STICKY`, the boot
+  receiver, opening the app, or placing a clock).
+- Confirm on the device, after 24 hours, that `dumpsys alarm` shows no wakeup alarm for the clocks. The bank guard's
+  own release alarm runs only while a bank holds debugging off at screen-off.

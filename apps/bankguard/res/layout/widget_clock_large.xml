@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Dot clock (large): a big dot-matrix time over "SAT 14 NOV", the date in red, a red dot in the corner.
-     TextClocks only: no alarm, no wakeup. -->
+     Both lines are bitmaps of DotoClock text drawn by ClockWidget. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/w_root"
     android:layout_width="match_parent"
@@ -25,58 +25,19 @@
         android:paddingTop="22dp"
         android:paddingBottom="18dp">
 
-        <TextClock
+        <ImageView
             android:id="@+id/w_time"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:gravity="center"
-            android:maxLines="1"
-            android:format12Hour="hh:mm"
-            android:format24Hour="HH:mm"
-            android:fontFamily="@font/doto_clock"
-            android:textColor="@color/w_ink"
-            android:autoSizeTextType="uniform"
-            android:autoSizeMinTextSize="24sp"
-            android:autoSizeMaxTextSize="120sp" />
+            android:scaleType="fitCenter" />
 
-        <LinearLayout
+        <ImageView
+            android:id="@+id/w_sub"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="center_horizontal"
             android:layout_marginTop="6dp"
-            android:orientation="horizontal">
-
-            <TextClock
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:format12Hour="EEE"
-                android:format24Hour="EEE"
-                android:textAllCaps="true"
-                android:fontFamily="@font/doto_clock"
-                android:textColor="@color/w_ink_dim"
-                android:textSize="26sp" />
-
-            <TextClock
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="16dp"
-                android:layout_marginEnd="16dp"
-                android:format12Hour="d"
-                android:format24Hour="d"
-                android:fontFamily="@font/doto_clock"
-                android:textColor="@color/w_red"
-                android:textSize="26sp" />
-
-            <TextClock
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:format12Hour="MMM"
-                android:format24Hour="MMM"
-                android:textAllCaps="true"
-                android:fontFamily="@font/doto_clock"
-                android:textColor="@color/w_ink_dim"
-                android:textSize="26sp" />
-        </LinearLayout>
+            android:adjustViewBounds="true" />
     </LinearLayout>
 </FrameLayout>
