@@ -58,7 +58,7 @@ Use Agentroid on devices you own or are authorised to test. It does not bypass a
 
 ## Setup notes
 
-The short version is in the [README](../README.md#install-and-quick-start). The full notes:
+The short version is in the [README](../README.md#quick-start). The full notes:
 
 **Requirements**
 
