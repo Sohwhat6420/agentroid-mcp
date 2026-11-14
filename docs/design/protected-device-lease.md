@@ -62,7 +62,10 @@ overnight notice) at priority 2. One ask goes at priority 2 too: the ask that fo
 lease that ended because the presence file could no longer be trusted (stale, missing or badly
 signed), while it still cannot be. The last trusted reading said asleep, so this is a hiccup at
 night, and the ask waits quietly in the shade, answerable in the morning (round 4; the owner may
-reverse this default). That mark is not kept across a restart.
+reverse this default). That mark is not kept across a restart, and it lapses so that daytime asks
+are never stuck at priority 2 (round 4e): outside the quiet hours, 22:00 to 08:00 Singapore time,
+and 8 hours after it was set, whatever the hour. Past a night's sleep, a presence file that still
+cannot be trusted is an outage rather than a hiccup, and the owner should hear the ask.
 
 The code: `crates/core/src/protected.rs` (the lease, the PIN rule, the holds file and the presence
 file), `crates/adb-link/src/lease.rs` (the lease book that core and the adb guard share),
@@ -90,7 +93,8 @@ The checks run in this order, and the first one that refuses ends the call:
      `.xapk` or `.aab` (any case), and any push into `/data/local/tmp` (where `app_process` and the
      shell run code from) or onto the dump helper's path. The path is normalised first (`\`
      becomes `/`; empty, `.` and `..` segments are resolved; a leading `/proc/<any>/root` or
-     `/proc/<any>/cwd`, a process's view of `/`, is taken off, however often it repeats), so
+     `/proc/<any>/cwd`, a process's view of `/`, is taken off, however often it repeats, and so is
+     a thread's, `/proc/<any>/task/<any>/root` or `cwd` (round 4e)), so
      `/sdcard/../data/local/tmp/x` and `/proc/self/root/data/local/tmp/x` are caught. Core checks the phone path; the adb guard checks both sides again. Pulls are reads and
      are not refused.
 3. **The daemon lease.** The caller must hold the daemon's device lease on the protected phone
@@ -181,7 +185,14 @@ selector then use the same tree. So:
 | `key back`, `scroll`, `open_app` | 0 | 0 |
 
 `crates/core/tests/protected_lease.rs`, `each_call_reads_the_protected_screen_at_most_once`, holds
-these numbers.
+these numbers. They count screen dumps only. Two other costs come on top (round 4e):
+
+- **Overnight, an acting call with the screen on** also costs the screen lock's own four reads
+  (power, telephony, `window` for the focused app and `input_method` for the keyboard; see "The
+  screen lock's own reads" below).
+- **A touch on a dark screen** (`tap`, `long_press`, `swipe`) costs one failed dump plus one
+  wakefulness read: a screen that is off or dozing shows no PIN prompt, so the touch goes on to
+  the usual guards (see "Known limits" for the race this leaves).
 
 ## The adb guard under the lease
 
@@ -309,7 +320,13 @@ lease's answer comes over the approval channel's separate inbound topic.
 - **A Deny overnight** (on the overnight notice) closes the lease and holds **until presence is no
   longer `asleep`**: the presence file says another state, freshly signed. Time passing does not
   end it. A stale, missing or badly signed file does not end it either, because the owner is not
-  known to be awake. The overnight rule never reopens a lease while that hold stands.
+  known to be awake. The overnight rule never reopens a lease while that hold stands. It also
+  lasts **at least the ask window** after the Deny (round 4e), so a presence file that turns
+  `present` a few seconds later does not let a loud ask follow the Deny at once.
+- **A Deny tapped while a trusted presence file says the owner is up** holds for the ask window,
+  as in the day, even when it is on an overnight notice (last night's notice, found in the shade
+  in the morning). Before round 4e such a Deny held "until awake", which a `present` file ended
+  on the very next call.
 - **A hold is for every holder.** Another holder, or the same lane under a new grant, inherits it.
 - **An explicit re-allow** ends a hold after a Deny at once, but only for **the holder and epoch
   that were denied**, and only **within the ask window after the Deny**. The owner replies
@@ -318,10 +335,14 @@ lease's answer comes over the approval channel's separate inbound topic.
   call is no re-allow.
 - **An ask that ends unanswered** starts a daytime hold of one ask window, so an agent cannot send
   the owner a new push every few seconds, and **no Allow lifts it**: a late Allow is no answer.
+  The hold runs from the ask's own end, not from when it was looked at (round 4e): an ask first
+  looked at three hours after it ended leaves no hold, and the call after it may ask again.
   Separately, no ask goes out within the ask window of the last one, for any holder.
 - **An ask is strict about its end.** An Allow dated after the ask's window never opens the
   phone, even when it arrives while the ask still looks open on the laptop's clock (a phone clock
-  that runs ahead). Other approval asks keep their 60-second grace.
+  that runs ahead). Other approval asks keep their 60-second grace. A channel that cannot be read
+  is no answer either way: the ask stays pending, even after its window, and the next call reads
+  again, so an Allow tapped in time is not lost to a failed read (round 4e).
 - **A Deny counts once, across restarts too.** Each Deny event is applied once, so an old Deny
   cannot close a lease that the owner re-allowed later. The Deny event ids seen are kept in the
   holds file (the newest 64) and handed back to the approver at the first call after a restart.
@@ -336,8 +357,11 @@ lease's answer comes over the approval channel's separate inbound topic.
   closes the open lease (whichever push it was on) and holds; with no lease open it holds too. A
   Deny on an overnight notice is an overnight Deny: it holds until the owner is awake. All kept
   pushes are read in one poll, from the oldest one's time. A hold already standing is never cut
-  short by a weaker one. A Deny found with no lease open cannot be re-allowed (its holder is not
-  known); it ends like any hold.
+  short by a weaker one (round 4e): a daytime Deny keeps a later window, or an "until awake" hold,
+  that already stands; an overnight Deny carries a standing window's end over as the earliest
+  time its own hold may end. Only a hold from an unreadable holds file is not merged: a daytime
+  Deny leaves it standing, and an overnight Deny replaces it. A Deny found with no lease open
+  cannot be re-allowed (its holder is not known); it ends like any hold.
 
 ### The holds file
 
@@ -359,7 +383,9 @@ daemon starts:
 ```
 
 `"hold": null` is no hold. `until` says what ends it: `window` at `until_ms`, `awake` when a
-trusted presence file says a state other than `asleep`, `presence_change` when a trusted presence
+trusted presence file says a state other than `asleep` and not before `until_ms` nor before the
+ask window after `denied_at_ms` (an `awake` hold written before round 4e has `until_ms: null`,
+read as 0), `presence_change` when a trusted presence
 file's state differs from `presence_state` (the first trusted state seen, if none was known).
 `reallow` is true only for a hold after a Deny. A version-1 file (round 2) is still read: its hold
 cannot be re-allowed, and it lists no Deny events. A version-2 file (round 3) is still read too:
@@ -420,6 +446,18 @@ These are not fixed by this design, and are recorded so nobody relies on them:
   topic can therefore post an answer. The separate topic stops an agent that only has the outbound
   topic file; it does not stop one that reads the push itself. The 6-character reference narrows
   what an agent learns from Agentroid, but it is not a secret from a reader of the push.
+- **A Deny older than the push server's message cache.** After a restart, the Denies on the kept
+  pushes are read back from the push server, which keeps messages only so long (ntfy.sh keeps
+  them 12 hours by default; a self-hosted server sets its own `cache-duration`). A Deny tapped
+  longer ago than that while the daemon was down is not seen. A Deny applied before the restart
+  is kept in the holds file, and its hold with it, so this only affects a Deny the daemon never
+  saw.
+- **A touch on a dark screen.** A `tap`, `long_press` or `swipe` on a screen that is off or dozing
+  goes on to the usual guards without a PIN check, because there is no screen to read. Between
+  the wakefulness read and the touch, the screen can come on (the owner picks the phone up, or the
+  touch itself wakes it) and show a PIN prompt. At most that one touch lands unchecked; the next
+  call reads the screen, and overnight the screen lock's in-use check refuses once the owner is
+  using the phone.
 
 ## Holder and job
 
@@ -453,7 +491,22 @@ Every lease event is an audit entry (`allowed`, `blocked` or `asked`), with thes
   unreadable`. A release is logged at once; a dropped connection at once when
   the backend is free, else at the next call; an expiry at the next call. **A close is never
   dropped**: one that cannot be written goes back to the front of the queue, and calls on the
-  protected phone are refused until it is written.
+  protected phone are refused until it is written. A close whose record is written but whose head
+  file or required anchor is not ("record written, anchor not", `audit::record_written`) is not
+  queued again, so it is never in the log twice; that call is still refused (round 4e).
+
+The log itself (`crates/core/src/audit.rs`), round 4e:
+
+- An append that fails takes its line out again. If the line could not be taken out and it was
+  not wholly written, flushed and synced, the log is **poisoned**: every later append is refused
+  with a clear error, so nothing is chained after a part of a record. A whole, synced line whose
+  head write failed and that could not be taken out stays, and the chain moves on from it.
+- On open, **exactly one whole, chained record past the head file** (a crash between the log's
+  sync and the head's rename) is accepted, and the head (and an anchor one behind with it) is
+  written up to it. Anything else that disagrees with the head is refused, as before.
+- The head file is written beside itself and renamed over the old one. On Windows that rename can
+  be refused for a moment while another process has the file open (access denied, or a sharing
+  violation, os errors 5 and 32), so it is tried again after 20, 50 and 100 ms, then fails closed.
 
 If an audit entry cannot be written, the call is refused. None of these writes is ignored.
 

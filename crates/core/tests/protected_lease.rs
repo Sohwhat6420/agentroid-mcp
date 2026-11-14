@@ -22,6 +22,9 @@ const POCO: &str = "192.0.2.50:37123";
 const T0: u64 = 1_800_000_000_000;
 const MIN: u64 = 60_000;
 const KEY: &str = "presence-key-0123456789abcdef";
+/// `T0` is 16:00 SGT; these are 02:00 and 22:30 SGT after it.
+const SGT_0200: u64 = T0 + 10 * 60 * MIN;
+const SGT_2230: u64 = T0 + 6 * 60 * MIN + 30 * MIN;
 
 // ---------------------------------------------------------------------------------------------
 // a scripted phone pair
@@ -2083,6 +2086,8 @@ fn after_a_restart_a_deny_on_the_old_ask_holds_and_no_new_push_goes_in_the_cool_
 fn an_overnight_lease_ended_by_an_unreadable_presence_file_asks_quietly() {
     let mut r = rig("r4-quiet");
     let log = r.audit();
+    // (02:00 SGT: inside the quiet hours, review round 4e, L9)
+    r.wall.set(Some(SGT_0200));
     r.presence("asleep", r.now());
     r.call(&at(100.0, 300.0)).unwrap();
     // the presence file goes stale (15 min): the lease ends, and the ask that follows is quiet
@@ -2342,4 +2347,255 @@ fn an_overnight_lease_covers_no_pull_and_no_link() {
     assert!(matches!(e, Refusal::Screen { .. }), "{e:?}");
     assert_eq!(r.sent().len(), before, "nothing is asked overnight");
     assert!(reasons(&log, "lease:covered").is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// round 4e
+// ---------------------------------------------------------------------------------------------
+
+/// Round 4e, M1: a Deny tapped in the day on last night's notice holds for the ask window, so no
+/// loud ask goes out seconds after it.
+#[test]
+fn a_daytime_deny_on_last_nights_notice_holds_for_the_ask_window() {
+    let mut r = rig("r4e-day-on-night");
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0)).expect("the overnight lease");
+    let notice = r.sent()[0].clone();
+    // morning: the overnight lease has long run out, the owner is up, and taps Deny on its notice
+    r.wall.advance(8 * 60 * MIN);
+    r.presence("present", r.now());
+    r.answer("deny", &notice.id, r.now());
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("Deny"), "{e}");
+    // 30 s on: still held, and no ask goes out
+    r.wall.advance(30_000);
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("held"), "{e}");
+    assert!(r.asks().is_empty(), "no ask seconds after a Deny");
+    // the hold lasts the ask window (10 min), then the next call asks
+    r.wall.advance(9 * MIN);
+    r.presence("present", r.now());
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("held"), "{e}");
+    assert!(r.asks().is_empty());
+    // a daytime hold ends with its window, whatever the presence file says by then (here it
+    // cannot be trusted, which would keep an "until awake" hold standing)
+    r.wall.advance(MIN);
+    std::fs::write(
+        &r.presence_file,
+        sign_presence(b"some-other-key-0123456789", "present", r.now()),
+    )
+    .unwrap();
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+    assert_eq!(r.asks().len(), 1);
+}
+
+/// Round 4e, M1: with no trusted presence file at the Deny, a Deny on an overnight notice still
+/// holds until the owner is awake, past the ask window.
+#[test]
+fn a_deny_on_an_overnight_notice_with_no_trusted_presence_holds_until_awake() {
+    let mut r = rig("r4e-night-notice-untrusted");
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0)).expect("the overnight lease");
+    let notice = r.sent()[0].clone();
+    // the lease runs out and the presence file goes stale; the owner taps Deny on the notice
+    r.wall.advance(60 * MIN);
+    r.answer("deny", &notice.id, r.now());
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("Deny"), "{e}");
+    // past the ask window, still no trusted presence: held, and no ask
+    r.wall.advance(30 * MIN);
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("held"), "{e}");
+    assert!(r.asks().is_empty());
+    // the owner is up: the next call asks
+    r.presence("present", r.now());
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+}
+
+/// Round 4e, M1: a Deny on the lease-open notice, then one on an older overnight notice: the
+/// second never cuts the first's hold short. With the owner up it holds for its own ask window;
+/// with the presence file untrusted it holds until he is up, and never less than that window.
+#[test]
+fn a_deny_on_an_old_overnight_notice_never_cuts_a_daytime_hold_short() {
+    for forged in [false, true] {
+        let mut r = rig(&format!("r4e-two-denies-{forged}"));
+        r.presence("asleep", r.now());
+        r.call(&at(100.0, 300.0)).expect("the overnight lease");
+        let night = r.sent()[0].clone();
+        r.wall.advance(8 * 60 * MIN);
+        r.presence("present", r.now());
+        let ask = r.open_lease();
+        // 15 min into the lease (past the one-ask-per-window throttle), Deny on its notice
+        r.wall.advance(15 * MIN);
+        r.presence("present", r.now());
+        r.answer("deny", &ask.id, r.now());
+        r.call(&at(100.0, 300.0)).unwrap_err();
+        assert!(r.book.active().is_none(), "{forged}");
+        // a minute on, Deny on last night's notice too
+        r.wall.advance(MIN);
+        if forged {
+            std::fs::write(
+                &r.presence_file,
+                sign_presence(b"some-other-key-0123456789", "present", r.now()),
+            )
+            .unwrap();
+        }
+        r.answer("deny", &night.id, r.now());
+        let e = refused(r.call(&at(100.0, 300.0)));
+        assert!(e.to_string().contains("Deny"), "{forged}: {e}");
+        let asks = r.asks().len();
+        // 1.5 and 10.5 min after the first Deny: held, no ask
+        for step in [30_000, 9 * MIN] {
+            r.wall.advance(step);
+            r.presence("present", r.now());
+            let e = refused(r.call(&at(100.0, 300.0)));
+            assert!(e.to_string().contains("held"), "{forged} {step}: {e}");
+            assert_eq!(r.asks().len(), asks, "{forged} {step}: no ask");
+        }
+        // the second Deny's window ends (11 min after the first): the next call asks
+        r.wall.advance(MIN);
+        r.presence("present", r.now());
+        assert!(
+            matches!(
+                refused(r.call(&at(100.0, 300.0))),
+                Refusal::LeasePending { .. }
+            ),
+            "{forged}"
+        );
+        assert_eq!(r.asks().len(), asks + 1, "{forged}");
+    }
+}
+
+/// Round 4e, L1: an ask nobody answered, looked at three hours on, leaves no fresh hold: the call
+/// after it asks at once.
+#[test]
+fn an_unanswered_ask_looked_at_hours_later_leaves_no_fresh_hold() {
+    let mut r = rig("r4e-late-look");
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    assert_eq!(r.asks().len(), 1);
+    r.wall.advance(3 * 60 * MIN);
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("unanswered"), "{e}");
+    r.wall.advance(30_000);
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+    assert_eq!(r.asks().len(), 2);
+}
+
+/// Round 4e, L2: a channel that cannot be read once the ask's window has closed is no answer: an
+/// Allow tapped in time is found on a later call, and the lease opens.
+#[test]
+fn an_allow_in_time_survives_a_channel_that_fails_after_the_window() {
+    let mut r = rig("r4e-late-read");
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    let ask = r.asks()[0].clone();
+    r.answer("allow", &ask.id, r.now() + MIN);
+    r.inbox.lock().unwrap().poll_fails = true;
+    r.wall.advance(11 * MIN);
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+    r.inbox.lock().unwrap().poll_fails = false;
+    r.wall.advance(30_000);
+    r.call(&at(100.0, 300.0))
+        .expect("the Allow dated in time opens the lease");
+    assert!(matches!(
+        r.book.active().unwrap().granted,
+        Granted::Approved { .. }
+    ));
+}
+
+/// Round 4e, L4: a close whose record is written but whose required anchor is not is not queued
+/// again: it is in the log once, however many calls follow.
+#[test]
+fn a_close_written_without_its_anchor_is_not_written_again() {
+    let mut r = rig("r4e-anchor");
+    r.open_lease();
+    let path = r.dir.join("audit.log");
+    let blocker = r.dir.join("anchor-dir");
+    std::fs::write(&blocker, "a file where the anchor's folder should be").unwrap();
+    let anchor = blocker.join("agentroid.head");
+    let opts = agentroid_core::audit::Options {
+        rotation: None,
+        anchor: Some(agentroid_core::audit::Anchor {
+            path: anchor.clone(),
+            required: true,
+        }),
+    };
+    r.core
+        .set_audit(agentroid_core::audit::AuditLog::open_with(&path, opts).unwrap());
+    assert!(r.core.protected_mut().unwrap().close_epoch(1).is_some());
+    let released = |log: &std::path::Path| {
+        audit_rules(log)
+            .iter()
+            .filter(|(rule, why)| rule == "lease:closed" && why.ends_with("closed: released"))
+            .count()
+    };
+    // the next call writes the close: it is in the log, its anchor is not, and the call is refused
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(matches!(e, Refusal::Audit { .. }), "{e:?}");
+    assert!(e.to_string().contains("is in the audit log"), "{e}");
+    assert_eq!(released(&path), 1, "{:?}", audit_rules(&path));
+    // (then an ask is sent but its record's anchor is not written, then it is pending)
+    for _ in 0..3 {
+        r.wall.advance(MIN);
+        r.call(&at(100.0, 300.0)).unwrap_err();
+    }
+    assert_eq!(released(&path), 1, "written once: {:?}", audit_rules(&path));
+    // the anchor can be written again: calls are judged as usual, and the close is still once
+    std::fs::remove_file(&blocker).unwrap();
+    std::fs::create_dir_all(&blocker).unwrap();
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(!matches!(e, Refusal::Audit { .. }), "{e:?}");
+    assert_eq!(released(&path), 1);
+    assert!(agentroid_core::audit::verify_chain(&path, Some(&anchor)).is_ok());
+}
+
+/// An overnight lease from `start` that ends on a stale presence file 16 min on: the ask after
+/// it goes quietly.
+fn quiet_night(name: &str, start: u64) -> Rig {
+    let mut r = rig(name);
+    r.wall.set(Some(start));
+    r.presence("asleep", r.now());
+    r.call(&at(100.0, 300.0)).expect("the overnight lease");
+    r.wall.advance(16 * MIN);
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    assert!(r.asks().last().unwrap().quiet, "{name}");
+    r
+}
+
+/// `after` on, the ask out has ended unanswered; the call after that sends the next ask.
+fn next_ask(r: &mut Rig, after: u64) -> Request {
+    r.wall.advance(after);
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(e.to_string().contains("unanswered"), "{e}");
+    assert!(matches!(
+        refused(r.call(&at(100.0, 300.0))),
+        Refusal::LeasePending { .. }
+    ));
+    r.asks().last().cloned().unwrap()
+}
+
+/// Round 4e, L9: with the presence file still untrusted, a quiet ask lapses at 08:00 SGT, and
+/// eight hours after it was set inside the quiet hours.
+#[test]
+fn a_quiet_ask_lapses_in_the_morning_and_after_eight_hours() {
+    // set at 02:16 SGT: quiet at 05:00, loud at 08:30
+    let mut r = quiet_night("r4e-quiet-morning", SGT_0200);
+    assert!(next_ask(&mut r, 2 * 60 * MIN + 44 * MIN).quiet, "05:00");
+    assert!(!next_ask(&mut r, 3 * 60 * MIN + 30 * MIN).quiet, "08:30");
+    // set at 22:46 SGT: quiet at 06:31 (7 h 45 min on), loud at 06:51 (8 h 5 min on)
+    let mut q = quiet_night("r4e-quiet-eight-hours", SGT_2230);
+    assert!(next_ask(&mut q, 7 * 60 * MIN + 45 * MIN).quiet, "06:31");
+    assert!(!next_ask(&mut q, 20 * MIN).quiet, "06:51");
 }

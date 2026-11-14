@@ -312,16 +312,16 @@ impl Approver {
     /// (`Expired`); `None` while it is still open, including when the channel cannot be read just
     /// now. The channel is read first even once the window has closed (review round 4, item 3):
     /// an answer DATED inside the window counts however late the caller looks, and once the
-    /// window has closed only one dated no later than its end does (no grace at all).
+    /// window has closed only one dated no later than its end does (no grace at all). A channel
+    /// that cannot be read is `None` even after the window has closed, so an Allow tapped in time
+    /// is not lost to a failed read: the next call reads again (review round 4e, L2).
     pub fn check(&mut self, req: &Request, now_ms: u64) -> Option<Outcome> {
         if self.resolved_set.contains(&req.id) {
             return Some(Outcome::Expired);
         }
         let closed = now_ms >= req.expires_ms;
-        let events = match self.channel.poll(req) {
-            Ok(e) => e,
-            Err(_) if !closed => return None,
-            Err(_) => vec![],
+        let Ok(events) = self.channel.poll(req) else {
+            return None;
         };
         for ev in &events {
             if closed && ev.time_ms > req.expires_ms {
@@ -1688,12 +1688,29 @@ mod tests {
             }),
             "tapped in time, looked at late"
         );
-        // a channel that cannot be read once the window has closed: expired
+        // review round 4e, L2: a channel that cannot be read is no answer, open or closed, so an
+        // Allow dated in time is found once a read works; then a closed ask with none is expired
         let r5 = req(&mut a, t0);
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(a.check(&r5, r5.expires_ms - 1), None, "open: try again");
-        assert_eq!(a.check(&r5, r5.expires_ms), Some(Outcome::Expired));
+        assert_eq!(a.check(&r5, r5.expires_ms), None, "closed: still try again");
+        assert_eq!(a.check(&r5, r5.expires_ms + 60_000), None);
         fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        ch.lock()
+            .unwrap()
+            .push(ev("e7b", r5.expires_ms - 2, format!("allow {}", r5.id)));
+        assert_eq!(
+            a.check(&r5, r5.expires_ms + 90_000),
+            Some(Outcome::Approved {
+                event_id: "e7b".into()
+            }),
+            "the Allow tapped in time is not lost to the failed reads"
+        );
+        let r5b = req(&mut a, t0);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.check(&r5b, r5b.expires_ms), None);
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.check(&r5b, r5b.expires_ms), Some(Outcome::Expired));
         // several asks in one read: the first Deny on any of them, and only that event is used
         let (p1, p2) = (req(&mut a, t0 + 100), req(&mut a, t0 + 200));
         ch.lock()

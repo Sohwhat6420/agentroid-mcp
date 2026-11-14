@@ -107,7 +107,8 @@ const CODE_SUFFIXES: [&str; 12] = [
 /// A path as the phone resolves it, for the code-push rule: lower case, `\` as `/`, empty and `.`
 /// segments dropped, `..` taken off the segment before it, and a leading `/proc/<any>/root` or
 /// `/proc/<any>/cwd` (a process's view of `/`, as in `/proc/self/root/data/local/tmp`) taken off,
-/// however often it repeats (review round 4, item 8).
+/// however often it repeats (review round 4, item 8), and so is a thread's, `/proc/<any>/task/
+/// <any>/root` or `cwd` (review round 4e, L7).
 fn normalise_phone_path(p: &str) -> String {
     let p = p.trim().to_lowercase().replace('\\', "/");
     let lead = if p.starts_with('/') { "/" } else { "" };
@@ -120,7 +121,12 @@ fn normalise_phone_path(p: &str) -> String {
             }
             s => out.push(s),
         }
-        if !lead.is_empty() && matches!(out.as_slice(), ["proc", _, "root" | "cwd"]) {
+        if !lead.is_empty()
+            && matches!(
+                out.as_slice(),
+                ["proc", _, "root" | "cwd"] | ["proc", _, "task", _, "root" | "cwd"]
+            )
+        {
             out.clear();
         }
     }
@@ -2631,6 +2637,16 @@ mod tests {
                 "C:/outbox/note.txt",
                 "/sdcard/../proc/self/root/data/local/tmp/x",
             ),
+            // review round 4e, L7: and through a thread's
+            (
+                "C:/outbox/note.txt",
+                "/proc/self/task/1234/root/data/local/tmp/x",
+            ),
+            ("C:/outbox/note.txt", "/proc/1/task/1/cwd/data/local/tmp"),
+            (
+                "C:/outbox/note.txt",
+                "/proc/self/task/9/root/proc/1/task/2/cwd/data/local/tmp/x",
+            ),
             ("C:/outbox/note.txt", DUMP_HELPER_REMOTE),
             ("C:\\outbox\\a.DeX", "/sdcard/a"),
         ] {
@@ -2648,6 +2664,8 @@ mod tests {
             ("C:/outbox/a", "/sdcard/tmp/x"),
             ("C:/outbox/a", "/sdcard/proc/self/root/data/local/tmp/x"),
             ("C:/outbox/a", "/proc/self/rootx/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/task/1/rootx/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/tasks/1/root/data/local/tmp/x"),
         ] {
             assert!(
                 code_push_refusal(local, remote).is_none(),

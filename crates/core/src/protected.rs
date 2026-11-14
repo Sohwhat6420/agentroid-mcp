@@ -476,8 +476,10 @@ pub const NOTICES_KEPT: usize = 64;
 enum Until {
     /// A daytime Deny, or an ask nobody answered: until this wall-clock time (the ask window).
     Window(u64),
-    /// Denied while the owner was asleep: until a trusted presence file says otherwise.
-    Awake,
+    /// Denied while the owner was asleep: until a trusted presence file says otherwise, and not
+    /// before this wall-clock time nor before the ask window after the Deny has ended (review
+    /// round 4e, M1: an Awake hold lasts at least the ask window).
+    Awake(u64),
     /// The holds file could not be read at start-up, so what it held is unknown: until a trusted
     /// presence file's state changes from the first one seen (`None`: none seen yet).
     Unknown(Option<String>),
@@ -530,10 +532,11 @@ pub struct Protected {
     notices: Vec<Kept>,
     /// When `notices` were last read for a Deny without an error (`None`: not since start-up).
     notices_polled_ms: Option<u64>,
-    /// The next ask goes at low priority: an overnight lease ended because the presence file
-    /// could not be trusted, and it has not been trusted since (review round 4, item 5; the
-    /// owner may reverse this default). Not kept across a restart.
-    quiet_ask: bool,
+    /// The next ask goes at low priority: an overnight lease ended at this time because the
+    /// presence file could not be trusted, and it has not been trusted since (review round 4,
+    /// item 5; the owner may reverse this default). It lapses outside the quiet hours and
+    /// [`QUIET_ASK_MAX_MS`] after it was set ([`quiet_lapsed`]). Not kept across a restart.
+    quiet_since: Option<u64>,
 }
 
 impl std::fmt::Debug for Protected {
@@ -570,10 +573,30 @@ fn clean(s: &str, n: usize) -> String {
 /// Singapore's offset from UTC (no daylight saving).
 const SGT_OFFSET_MIN: u64 = 8 * 60;
 
+/// The minute of the day in Singapore for Unix ms.
+fn sgt_minute(ms: u64) -> u64 {
+    (ms / 60_000 + SGT_OFFSET_MIN) % (24 * 60)
+}
+
 /// `HH:MM SGT` for Unix ms (the push says when the lease ends, in the owner's own time zone).
 pub fn sgt_hhmm(ms: u64) -> String {
-    let m = (ms / 60_000 + SGT_OFFSET_MIN) % (24 * 60);
+    let m = sgt_minute(ms);
     format!("{:02}:{:02} SGT", m / 60, m % 60)
+}
+
+/// The quiet ask's hours, Singapore time: from 22:00 to 08:00 (review round 4e, L9).
+pub const QUIET_HOURS_SGT: (u64, u64) = (22, 8);
+/// A quiet ask lapses this long after it was set, quiet hours or not: past a night's sleep, a
+/// presence file that cannot be trusted is an outage, not a hiccup (review round 4e, L9).
+pub const QUIET_ASK_MAX_MS: u64 = 8 * 60 * 60 * 1000;
+
+/// Has a quiet ask set at `since` lapsed at `now`: outside the quiet hours, or
+/// [`QUIET_ASK_MAX_MS`] on?
+fn quiet_lapsed(since: u64, now: u64) -> bool {
+    let m = sgt_minute(now);
+    let (from, to) = QUIET_HOURS_SGT;
+    let night = m >= from * 60 || m < to * 60;
+    !night || now.saturating_sub(since) >= QUIET_ASK_MAX_MS
 }
 
 /// A request read back from the holds file: only its id and times are kept.
@@ -612,7 +635,7 @@ fn holds_json(h: &Holds) -> String {
     let hold = h.held.as_ref().map(|h| {
         let (until, until_ms, state) = match &h.until {
             Until::Window(t) => ("window", Some(*t), None),
-            Until::Awake => ("awake", None, None),
+            Until::Awake(t) => ("awake", Some(*t), None),
             Until::Unknown(s) => ("presence_change", None, s.clone()),
         };
         serde_json::json!({
@@ -750,7 +773,11 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
     };
     let until = match h.get("until").and_then(|x| x.as_str()) {
         Some("window") => Until::Window(num("until_ms")?),
-        Some("awake") => Until::Awake,
+        // before round 4e an awake hold kept no time: the ask window after the Deny still holds
+        Some("awake") => Until::Awake(match h.get("until_ms") {
+            Some(serde_json::Value::Null) | None => 0,
+            Some(x) => x.as_u64().ok_or_else(bad)?,
+        }),
         Some("presence_change") => Until::Unknown(
             h.get("presence_state")
                 .and_then(|x| x.as_str())
@@ -772,6 +799,35 @@ fn parse_holds(text: &str) -> Result<Holds, String> {
         reallow,
     });
     Ok(out)
+}
+
+/// The hold a Deny leaves, given the hold standing (`None`: keep the standing hold as it is).
+/// `window_end` is when the ask window after the Deny ends. Awake (`!asleep`): until
+/// `window_end`. Asleep: until a trusted presence file says awake, and never before `window_end`.
+/// A standing hold that ends later is never cut short by a weaker one: its end carries over
+/// (review round 4e, M1). A hold from an unreadable holds file stands against a daytime Deny.
+fn after_deny(standing: Option<&Until>, asleep: bool, window_end: u64) -> Option<Until> {
+    match (standing, asleep) {
+        (Some(Until::Unknown(_)), false) => None,
+        (Some(Until::Window(t)), false) if *t > window_end => None,
+        (Some(Until::Awake(t)), false) => Some(Until::Awake((*t).max(window_end))),
+        (Some(Until::Window(t) | Until::Awake(t)), true) => {
+            Some(Until::Awake((*t).max(window_end)))
+        }
+        (_, true) => Some(Until::Awake(window_end)),
+        (_, false) => Some(Until::Window(window_end)),
+    }
+}
+
+/// When the hold after an ask nobody answered ends: the ask window after the ask's own end, and
+/// never more than the ask window from `now` (an ask read back with a time ahead); `None` once it
+/// has passed, so an ask looked at hours late leaves no hold (review round 4e, L1).
+fn unanswered_hold_end(req: &Request, now: u64, window_ms: u64) -> Option<u64> {
+    let end = req
+        .expires_ms
+        .saturating_add(window_ms)
+        .min(now.saturating_add(window_ms));
+    (now < end).then_some(end)
 }
 
 /// Write `text` to `path` atomically: a temporary file beside it, then a rename over it.
@@ -805,7 +861,7 @@ impl Protected {
             seen_fed: false,
             notices: vec![],
             notices_polled_ms: None,
-            quiet_ask: false,
+            quiet_since: None,
         };
         let h = p.load_holds();
         p.held = h.held;
@@ -959,29 +1015,43 @@ impl Protected {
             Some(_) => self.close_lease("denied", audit, tool),
             None => Ok(()),
         };
-        let asleep = k.overnight
-            || lease.is_some_and(|l| l.granted == Granted::Overnight)
-            || self.presence(now).asleep();
-        let until = if asleep {
-            Until::Awake
-        } else {
-            Until::Window(now.saturating_add(self.cfg.ask_window_ms))
-        };
-        let saved = match (&self.held, &until) {
-            // an overnight hold (or one from an unreadable holds file) is never cut short
-            (Some(h), Until::Window(_)) if !matches!(h.until, Until::Window(_)) => self.save(),
-            (Some(h), Until::Window(t)) if matches!(h.until, Until::Window(old) if old > *t) => {
-                self.save()
-            }
-            _ => self.set_held(Some(Held {
-                req: k.req.clone(),
-                holder: lease.map(|l| l.holder.clone()),
+        // a trusted presence file that says the owner is up at the Deny: the hold lasts the ask
+        // window, even on an overnight notice (review round 4e, M1)
+        let presence = self.presence(now);
+        let asleep = !matches!(presence, Presence::Other(_))
+            && (k.overnight
+                || lease.is_some_and(|l| l.granted == Granted::Overnight)
+                || presence.asleep());
+        let saved = self.hold_after_deny(
+            &k.req,
+            lease.map(|l| l.holder.clone()),
+            lease.is_some(),
+            asleep,
+            now,
+        );
+        closed.map(|()| saved)
+    }
+
+    /// Hold after a Deny at `now` (see [`after_deny`]): a standing hold that ends later is kept.
+    fn hold_after_deny(
+        &mut self,
+        req: &Request,
+        holder: Option<Holder>,
+        reallow: bool,
+        asleep: bool,
+        now: u64,
+    ) -> Result<(), String> {
+        let window_end = now.saturating_add(self.cfg.ask_window_ms);
+        match after_deny(self.held.as_ref().map(|h| &h.until), asleep, window_end) {
+            None => self.save(),
+            Some(until) => self.set_held(Some(Held {
+                req: req.clone(),
+                holder,
                 at_ms: now,
                 until,
-                reallow: lease.is_some(),
+                reallow,
             })),
-        };
-        closed.map(|()| saved)
+        }
     }
 
     /// How core learns who holds the protected phone (the daemon's registry, for the caller's own
@@ -1022,7 +1092,9 @@ impl Protected {
     /// Write every lease the book closed without core (it ran out, its holder released the phone
     /// or went) to the audit log, oldest first. `Err`: a write failed; that close and every later
     /// one go back in the queue (review round 3, item 10), and the caller refuses until they are
-    /// written.
+    /// written. A close whose record is in the log but whose head or anchor is not
+    /// ([`crate::audit::record_written`]) is not queued again, so it is never written twice
+    /// (review round 4e, L4); the call is still refused.
     pub fn audit_closes(
         &mut self,
         audit: Option<&mut AuditLog>,
@@ -1042,6 +1114,7 @@ impl Protected {
             return Ok(());
         };
         let mut rest = ended.into_iter();
+        let mut anchor_not: Option<String> = None;
         while let Some((l, why)) = rest.next() {
             let written = a.append(&Entry {
                 device: String::new(),
@@ -1057,19 +1130,33 @@ impl Protected {
                 target: String::new(),
                 screen: String::new(),
             });
-            if let Err(e) = written {
-                let mut unwritten = vec![(l, why)];
-                unwritten.extend(rest);
-                self.book.requeue_ended(unwritten);
-                return Err(Refusal::Audit {
-                    tool,
-                    why: format!(
-                        "a lease close could not be written to the audit log ({e}); it is kept, and the protected phone is refused until it is written"
-                    ),
-                });
+            match written {
+                Ok(_) => {}
+                Err(e) if crate::audit::record_written(&e) => {
+                    anchor_not.get_or_insert(e.to_string());
+                }
+                Err(e) => {
+                    let mut unwritten = vec![(l, why)];
+                    unwritten.extend(rest);
+                    self.book.requeue_ended(unwritten);
+                    return Err(Refusal::Audit {
+                        tool,
+                        why: format!(
+                            "a lease close could not be written to the audit log ({e}); it is kept, and the protected phone is refused until it is written"
+                        ),
+                    });
+                }
             }
         }
-        Ok(())
+        match anchor_not {
+            Some(e) => Err(Refusal::Audit {
+                tool,
+                why: format!(
+                    "a lease close is in the audit log, but not everywhere it is kept ({e}); it is not written again, and this call is refused"
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// What the presence file says now (no file configured: untrusted, so the overnight rule is off).
@@ -1274,7 +1361,7 @@ impl Protected {
                 }
                 // it was asleep at the last trusted reading: an unreadable presence file is a
                 // hiccup at night, so the ask that follows goes quietly (review round 4, item 5)
-                self.quiet_ask = matches!(p, Presence::Untrusted(_));
+                self.quiet_since = matches!(p, Presence::Untrusted(_)).then_some(now);
                 self.close_lease("presence ended", audit.as_deref_mut(), tool)?;
                 log(
                     audit.as_deref_mut(),
@@ -1376,8 +1463,9 @@ impl Protected {
                     now >= *t,
                     format!("for {} min", self.cfg.ask_window_ms / 60_000),
                 ),
-                Until::Awake => (
-                    matches!(presence, Presence::Other(_)),
+                Until::Awake(t) => (
+                    matches!(presence, Presence::Other(_))
+                        && now >= (*t).max(h.at_ms.saturating_add(self.cfg.ask_window_ms)),
                     "until the presence file says the owner is awake".to_string(),
                 ),
                 Until::Unknown(seen) => {
@@ -1504,17 +1592,8 @@ impl Protected {
                 Some(Answer::Denied { event_id }) => {
                     self.note_deny(&event_id);
                     let asleep = self.presence(now).asleep();
-                    let saved = self.set_held(Some(Held {
-                        req: p.req.clone(),
-                        holder: Some(p.holder.clone()),
-                        at_ms: now,
-                        until: if asleep {
-                            Until::Awake
-                        } else {
-                            Until::Window(now.saturating_add(self.cfg.ask_window_ms))
-                        },
-                        reallow: true,
-                    }));
+                    let saved =
+                        self.hold_after_deny(&p.req, Some(p.holder.clone()), true, asleep, now);
                     log(
                         audit.as_deref_mut(),
                         "blocked",
@@ -1528,13 +1607,18 @@ impl Protected {
                     return Err(refused("the owner tapped Deny".into()));
                 }
                 Some(other) => {
-                    let saved = self.set_held(Some(Held {
-                        req: p.req.clone(),
-                        holder: Some(p.holder.clone()),
-                        at_ms: now,
-                        until: Until::Window(now.saturating_add(self.cfg.ask_window_ms)),
-                        reallow: false,
-                    }));
+                    // the cool-down runs from the end of the ask, not from when it was looked at:
+                    // one looked at hours later leaves no fresh hold (review round 4e, L1)
+                    let saved = match unanswered_hold_end(&p.req, now, self.cfg.ask_window_ms) {
+                        Some(t) => self.set_held(Some(Held {
+                            req: p.req.clone(),
+                            holder: Some(p.holder.clone()),
+                            at_ms: now,
+                            until: Until::Window(t),
+                            reallow: false,
+                        })),
+                        None => self.save(),
+                    };
                     log(
                         audit.as_deref_mut(),
                         "blocked",
@@ -1555,8 +1639,10 @@ impl Protected {
             return Err(refused("no approval channel is configured".into()));
         };
         let presence = self.presence(now);
-        if !matches!(presence, Presence::Untrusted(_)) {
-            self.quiet_ask = false;
+        if !matches!(presence, Presence::Untrusted(_))
+            || self.quiet_since.is_some_and(|t| quiet_lapsed(t, now))
+        {
+            self.quiet_since = None;
         }
         let minutes = self.cfg.lease_ms / 60_000;
         let who = push_holder(&holder.name);
@@ -1654,7 +1740,7 @@ impl Protected {
         req.expires_ms = now.saturating_add(self.cfg.ask_window_ms);
         // at night, after an overnight lease ended on an unreadable presence file, the ask waits
         // quietly in the shade, answerable in the morning (review round 4, item 5)
-        req.quiet = self.quiet_ask && matches!(presence, Presence::Untrusted(_));
+        req.quiet = self.quiet_since.is_some() && matches!(presence, Presence::Untrusted(_));
         if let Err(e) = a.send(&req) {
             return Err(refused(format!("the ask could not be sent ({e})")));
         }
@@ -2051,6 +2137,90 @@ mod tests {
             until: Until::Window(9),
             reallow,
         }
+    }
+
+    /// Review round 4e, L9: a quiet ask lapses outside 22:00-08:00 SGT and eight hours after it
+    /// was set.
+    #[test]
+    fn a_quiet_ask_lapses_in_the_day_and_after_eight_hours() {
+        // 16:00 UTC is 00:00 SGT
+        const H: u64 = 3_600_000;
+        let midnight = 16 * H;
+        assert!(
+            !quiet_lapsed(midnight, midnight + 7 * H + 59 * 60_000),
+            "07:59"
+        );
+        assert!(quiet_lapsed(midnight, midnight + 8 * H), "08:00");
+        assert!(quiet_lapsed(midnight - 2 * H, midnight + 12 * H), "midday");
+        assert!(!quiet_lapsed(midnight - 2 * H, midnight - 2 * H), "22:00");
+        assert!(
+            quiet_lapsed(midnight - 2 * H - 60_000, midnight - 2 * H - 60_000),
+            "21:59"
+        );
+        // in the quiet hours, eight hours on: lapsed
+        let at_2230 = midnight - 90 * 60_000;
+        assert!(!quiet_lapsed(at_2230, at_2230 + 8 * H - 1), "06:29");
+        assert!(quiet_lapsed(at_2230, at_2230 + 8 * H), "06:30");
+    }
+
+    /// Review round 4e, M1: a Deny never cuts a standing hold short; an asleep Deny holds at least
+    /// to the end of its ask window; an awake one ends at it.
+    #[test]
+    fn a_deny_never_cuts_a_standing_hold_short() {
+        use Until::{Awake, Unknown, Window};
+        assert_eq!(after_deny(None, false, 100), Some(Window(100)));
+        assert_eq!(after_deny(None, true, 100), Some(Awake(100)));
+        // a later Window stands against an awake Deny; an earlier one gives way
+        assert_eq!(after_deny(Some(&Window(150)), false, 100), None);
+        assert_eq!(after_deny(Some(&Window(50)), false, 100), Some(Window(100)));
+        // an asleep Deny keeps the later of the two ends
+        assert_eq!(after_deny(Some(&Window(150)), true, 100), Some(Awake(150)));
+        assert_eq!(after_deny(Some(&Window(50)), true, 100), Some(Awake(100)));
+        // a standing Awake hold is not turned into a Window: it carries the later end
+        assert_eq!(after_deny(Some(&Awake(50)), false, 100), Some(Awake(100)));
+        assert_eq!(after_deny(Some(&Awake(150)), false, 100), Some(Awake(150)));
+        assert_eq!(after_deny(Some(&Awake(150)), true, 100), Some(Awake(150)));
+        // an unreadable holds file's hold stands against an awake Deny
+        assert_eq!(after_deny(Some(&Unknown(None)), false, 100), None);
+        assert_eq!(
+            after_deny(Some(&Unknown(None)), true, 100),
+            Some(Awake(100))
+        );
+    }
+
+    /// Review round 4e, L1: the hold after an unanswered ask runs from the ask's end.
+    #[test]
+    fn an_unanswered_asks_hold_runs_from_the_asks_end() {
+        let r = bare_request("abc", 0, 1_000, Style::Lease);
+        assert_eq!(unanswered_hold_end(&r, 1_000, 600), Some(1_600));
+        assert_eq!(unanswered_hold_end(&r, 1_300, 600), Some(1_600));
+        assert_eq!(unanswered_hold_end(&r, 1_600, 600), None);
+        assert_eq!(unanswered_hold_end(&r, 1_000 + 3 * 3_600_000, 600), None);
+        // an ask read back with its end ahead: never more than the window from now
+        let ahead = bare_request("abc", 0, 10_000_000, Style::Lease);
+        assert_eq!(unanswered_hold_end(&ahead, 1_000, 600), Some(1_600));
+    }
+
+    /// Review round 4e, M1: an Awake hold keeps its earliest end in the holds file; one written
+    /// before it kept none reads as 0 (the ask window after the Deny still holds).
+    #[test]
+    fn an_awake_hold_keeps_its_earliest_end_in_the_holds_file() {
+        let mut h = held(false);
+        h.until = Until::Awake(77);
+        let text = holds_json(&Holds {
+            held: Some(h),
+            ..Holds::default()
+        });
+        assert_eq!(
+            parse_holds(&text).unwrap().held.unwrap().until,
+            Until::Awake(77)
+        );
+        let old = r#"{"version":3,"hold":{"request_id":"abc","created_ms":1,"expires_ms":2,"holder":null,"denied_at_ms":3,"until":"awake","until_ms":null,"reallow":false},"seen_denies":[],"notices":[],"pending":null,"last_ask_ms":null}"#;
+        assert_eq!(
+            parse_holds(old).unwrap().held.unwrap().until,
+            Until::Awake(0)
+        );
+        assert!(parse_holds(&old.replace("null,\"reallow", "\"x\",\"reallow")).is_err());
     }
 
     /// Review round 3, items 8 and 9, and round 4, items 1 and 4: the holds file keeps whether

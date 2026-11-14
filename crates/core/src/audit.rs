@@ -186,6 +186,26 @@ impl fmt::Display for Broken {
     }
 }
 
+/// The error of an append whose record IS in the log, the chain moved on from it, but whose head
+/// file or anchor could not be written ("record written, anchor not"). A caller that queues
+/// records to write again (the protected lease's closes) must not write this one again: tell it
+/// from every other append error with [`record_written`] (review round 4e, L4).
+#[derive(Debug)]
+pub struct RecordWritten(pub String);
+
+impl fmt::Display for RecordWritten {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "record written, {}", self.0)
+    }
+}
+
+impl std::error::Error for RecordWritten {}
+
+/// Is `e` an append error whose record is in the log ([`RecordWritten`])?
+pub fn record_written(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.is::<RecordWritten>())
+}
+
 /// A log (or a chain of rotated logs) that verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
@@ -384,16 +404,6 @@ pub struct Chain {
 /// Verify every rotated part of `log` in order, then `log` itself, each chained from the previous
 /// one's end; then the end against the head file (when one exists) and `anchor` (when given).
 pub fn verify_chain(log: &Path, anchor: Option<&Path>) -> Result<Chain, Broken> {
-    let parts = rotated_parts(log);
-    for (expect_part, (n, p)) in (1u32..).zip(parts.iter()) {
-        if *n != expect_part {
-            return Err(Broken::at(
-                0,
-                format!("rotated part {expect_part:06} is missing (found part {n:06} next)"),
-            )
-            .in_file(p));
-        }
-    }
     let head = read_head(&head_path(log))
         .map_err(|e| Broken::at(0, format!("head file: {e}")).in_file(log))?;
     let anchor_head = match anchor {
@@ -404,6 +414,25 @@ pub fn verify_chain(log: &Path, anchor: Option<&Path>) -> Result<Chain, Broken> 
         ),
         None => None,
     };
+    verify_chain_against(log, head, anchor_head)
+}
+
+/// [`verify_chain`] against the given head and anchor heads (`None`: not checked).
+fn verify_chain_against(
+    log: &Path,
+    head: Option<(u64, String)>,
+    anchor_head: Option<(u64, String)>,
+) -> Result<Chain, Broken> {
+    let parts = rotated_parts(log);
+    for (expect_part, (n, p)) in (1u32..).zip(parts.iter()) {
+        if *n != expect_part {
+            return Err(Broken::at(
+                0,
+                format!("rotated part {expect_part:06} is missing (found part {n:06} next)"),
+            )
+            .in_file(p));
+        }
+    }
     let mut seq = 0u64;
     let mut prev = GENESIS.to_string();
     let mut all = Verified::empty(0, GENESIS);
@@ -469,6 +498,61 @@ pub fn verify_file(path: &Path) -> Result<Verified, Broken> {
     verify_chain(path, None).map(|c| c.all)
 }
 
+/// A crash between the log's sync and the head file's rename leaves exactly one whole, chained
+/// record past the head file (and past the anchor, written after it). Verified without them, a log
+/// whose last record is the one after the head's, chained from it, in the active file, is that
+/// crash, and its chain is returned so the caller writes the head (and the anchor) up to it. Any
+/// other mismatch is `None`: refused as before (review round 4e, L5).
+fn one_past_head(log: &Path, anchor: Option<&Path>) -> Option<Chain> {
+    let (hseq, hhash) = read_head(&head_path(log)).ok()??;
+    let c = verify_chain_against(log, None, None).ok()?;
+    let text = std::fs::read_to_string(log).ok()?;
+    let last = Record::from_json(text.lines().rev().find(|l| !l.is_empty())?).ok()?;
+    if last.seq != c.all.head_seq || last.seq != hseq.checked_add(1)? || last.prev != hhash {
+        return None;
+    }
+    if let Some(a) = anchor {
+        let (aseq, ahash) = read_head(a).ok()??;
+        let behind = aseq == hseq && ahash == hhash;
+        let level = aseq == last.seq && ahash == last.hash;
+        if !behind && !level {
+            return None;
+        }
+    }
+    Some(c)
+}
+
+/// A head rename can fail for a moment on Windows while another process (a scanner, the indexer,
+/// a verifier reading it) has the file open: access denied (os error 5) or a sharing violation
+/// (os error 32). It is tried again after each of these waits, then the write fails closed
+/// (review round 4e, L6).
+const RENAME_BACKOFF_MS: [u64; 3] = [20, 50, 100];
+
+fn transient_rename_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied
+        || (cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32)))
+}
+
+/// `rename(from, to)`, tried again after each of [`RENAME_BACKOFF_MS`] while it fails with a
+/// transient error.
+fn rename_retrying(
+    from: &Path,
+    to: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    sleep: &mut dyn FnMut(u64),
+) -> io::Result<()> {
+    let mut r = rename(from, to);
+    for ms in RENAME_BACKOFF_MS {
+        let transient = matches!(&r, Err(e) if transient_rename_error(e));
+        if !transient {
+            return r;
+        }
+        sleep(ms);
+        r = rename(from, to);
+    }
+    r
+}
+
 /// When the active file is closed and a new one started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rotation {
@@ -517,6 +601,21 @@ pub struct AuditLog {
     /// How many rotations this log has performed (tests).
     rotations: u32,
     anchor_failures: u32,
+    /// A part of a record may be in the log and could not be taken out: every later append is
+    /// refused, with why (review round 4e, L3).
+    poisoned: Option<String>,
+    #[cfg(test)]
+    faults: Faults,
+}
+
+/// Failures a unit test injects.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct Faults {
+    /// The line is written and flushed, then the sync fails.
+    sync: bool,
+    /// Taking a failed append's line out again fails.
+    undo: bool,
 }
 
 impl fmt::Debug for AuditLog {
@@ -541,8 +640,11 @@ fn write_head(path: &Path, seq: u64, hash: &str) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let r =
-        std::fs::write(&tmp, format!("{seq} {hash}\n")).and_then(|()| std::fs::rename(&tmp, path));
+    let r = std::fs::write(&tmp, format!("{seq} {hash}\n")).and_then(|()| {
+        rename_retrying(&tmp, path, &mut |a, b| std::fs::rename(a, b), &mut |ms| {
+            std::thread::sleep(std::time::Duration::from_millis(ms))
+        })
+    });
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -567,15 +669,27 @@ impl AuditLog {
             .map(|a| a.path.as_path())
             .filter(|p| p.exists());
         let (seq, last, part_records, part_first_ts) = if path.exists() {
-            let c = verify_chain(path, anchor).map_err(|b| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "audit log {} is broken at {b}; move it aside before starting a new one",
-                        path.display()
-                    ),
-                )
-            })?;
+            let c = match verify_chain(path, anchor) {
+                Ok(c) => c,
+                Err(b) => {
+                    let Some(c) = one_past_head(path, anchor) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "audit log {} is broken at {b}; move it aside before starting a new one",
+                                path.display()
+                            ),
+                        ));
+                    };
+                    // one whole record past the head: a crash before the head's rename; the head
+                    // (and the anchor) are brought up to it
+                    write_head(&head_path(path), c.all.head_seq, &c.all.head_hash)?;
+                    if let (Some(a), Some(_)) = (&options.anchor, anchor) {
+                        write_head(&a.path, c.all.head_seq, &c.all.head_hash)?;
+                    }
+                    c
+                }
+            };
             (
                 c.all.head_seq,
                 c.all.head_hash,
@@ -611,7 +725,33 @@ impl AuditLog {
             part_first_ts,
             rotations: 0,
             anchor_failures: 0,
+            poisoned: None,
+            #[cfg(test)]
+            faults: Faults::default(),
         })
+    }
+
+    /// Write `line` to the log, flushed and synced.
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        self.file.write_all(line.as_bytes())?;
+        self.file.flush()?;
+        #[cfg(test)]
+        if self.faults.sync {
+            return Err(io::Error::other("injected: the log could not be synced"));
+        }
+        self.file.sync_data()
+    }
+
+    /// Cut the log back to `len` bytes, synced (a failed append's line taken out again).
+    fn cut_back(&self, len: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if self.faults.undo {
+            return Err(io::Error::other("injected: the log could not be cut back"));
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .and_then(|f| f.set_len(len).and_then(|()| f.sync_data()))
     }
 
     /// Use another clock for `ts_ms` (tests).
@@ -688,6 +828,12 @@ impl AuditLog {
     /// Append one record, flushed and synced, then rewrite the head file and the anchor. Rotates
     /// first when the policy says the active file is full or old.
     pub fn append(&mut self, e: &Entry) -> io::Result<Record> {
+        if let Some(why) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "audit log {} refuses every append: {why}; move it aside before starting a new one",
+                self.path.display()
+            )));
+        }
         let mut e = e.clone();
         e.target = trunc(&e.target, 120);
         e.reason = trunc(&e.reason, 400);
@@ -712,28 +858,39 @@ impl AuditLog {
         // writes the record twice, and the chain never holds two records with one `seq`. Before
         // this, the line stayed while `seq` did not move, so a retry forked the chain.
         let before = std::fs::metadata(&self.path)?.len();
-        let written = self
-            .file
-            .write_all(line.as_bytes())
-            .and_then(|()| self.file.flush())
-            .and_then(|()| self.file.sync_data())
-            .and_then(|()| write_head(&head_path(&self.path), r.seq, &r.hash));
-        if let Err(err) = written {
-            let undo = OpenOptions::new()
-                .write(true)
-                .open(&self.path)
-                .and_then(|f| f.set_len(before).and_then(|()| f.sync_data()));
-            if let Err(undo) = undo {
-                // the line could not be taken out: it stands, so the chain moves on from it
+        // (the error, and whether the whole line was written, flushed and synced)
+        let failed = match self.write_line(&line) {
+            Err(err) => Some((err, false)),
+            Ok(()) => write_head(&head_path(&self.path), r.seq, &r.hash)
+                .err()
+                .map(|err| (err, true)),
+        };
+        if let Some((err, whole)) = failed {
+            if let Err(undo) = self.cut_back(before) {
+                if !whole {
+                    // a part of the line may be in the log, and it could not be taken out: no
+                    // later record may follow it (review round 4e, L3)
+                    let why = format!(
+                        "an append failed ({err}) and what it wrote could not be taken out ({undo})"
+                    );
+                    self.poisoned = Some(why.clone());
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!("{why}; the log refuses every later append"),
+                    ));
+                }
+                // the whole line is in the log, synced, and could not be taken out: it stands,
+                // so the chain moves on from it (the head file is behind it by one record, which
+                // the next open brings up to it)
                 self.seq = seq;
                 self.last = r.hash.clone();
                 self.part_records += 1;
                 self.part_first_ts.get_or_insert(ts_ms);
                 return Err(io::Error::new(
                     err.kind(),
-                    format!(
-                        "{err} (the record stays in the log: it could not be taken out: {undo})"
-                    ),
+                    RecordWritten(format!(
+                        "head not: {err} (the record stays in the log: it could not be taken out: {undo})"
+                    )),
                 ));
             }
             return Err(err);
@@ -748,7 +905,10 @@ impl AuditLog {
                 if a.required {
                     return Err(io::Error::new(
                         err.kind(),
-                        format!("anchor {} could not be written: {err}", a.path.display()),
+                        RecordWritten(format!(
+                            "anchor not: anchor {} could not be written: {err}",
+                            a.path.display()
+                        )),
                     ));
                 }
             }
@@ -1115,7 +1275,8 @@ mod tests {
         std::fs::remove_file(&head).unwrap();
         std::fs::create_dir_all(&head).unwrap();
         for _ in 0..3 {
-            log.append(&entry(1, "blocked")).unwrap_err();
+            let err = log.append(&entry(1, "blocked")).unwrap_err();
+            assert!(!record_written(&err), "taken out again: {err}");
         }
         let text = std::fs::read_to_string(&p).unwrap();
         assert_eq!(
@@ -1214,6 +1375,12 @@ mod tests {
         );
         let err = log.append(&entry(0, "allowed")).unwrap_err();
         assert!(err.to_string().contains("anchor"), "{err}");
+        // review round 4e, L4: a kind of its own, so a caller does not write the record again
+        assert!(record_written(&err), "{err}");
+        assert!(
+            err.to_string().contains("record written, anchor not"),
+            "{err}"
+        );
         // the record itself was written and the head updated: the log stays consistent
         assert_eq!(verify_chain(&p, None).unwrap().all.records, 1);
         drop(log);
@@ -1231,5 +1398,174 @@ mod tests {
         log.append(&entry(1, "allowed")).unwrap();
         assert_eq!(log.anchor_failures(), 1);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review round 4e, L3: a line whose write, flush or sync failed and that cannot be taken out
+    /// poisons the log (every later append is refused); a whole, synced line whose head write
+    /// failed stays, and the chain moves on from it.
+    #[test]
+    fn a_part_record_that_cannot_be_taken_out_poisons_the_log() {
+        let d = tmp("poison");
+        let p = d.join("audit.jsonl");
+        let mut log = AuditLog::open(&p).unwrap();
+        log.append(&entry(0, "allowed")).unwrap();
+        log.faults = Faults {
+            sync: true,
+            undo: true,
+        };
+        let err = log.append(&entry(1, "blocked")).unwrap_err();
+        assert!(!record_written(&err), "{err}");
+        assert!(
+            err.to_string().contains("refuses every later append"),
+            "{err}"
+        );
+        log.faults = Faults::default();
+        for _ in 0..2 {
+            let err = log.append(&entry(2, "blocked")).unwrap_err();
+            assert!(err.to_string().contains("refuses every append"), "{err}");
+        }
+        assert_eq!(log.head().0, 1, "the chain did not move");
+        // the sync fails but the line is taken out: not poisoned, and a retry writes it once
+        let d2 = tmp("poison-undone");
+        let p2 = d2.join("audit.jsonl");
+        let mut log = AuditLog::open(&p2).unwrap();
+        log.faults.sync = true;
+        log.append(&entry(0, "allowed")).unwrap_err();
+        log.faults.sync = false;
+        log.append(&entry(0, "allowed")).unwrap();
+        assert_eq!(verify_chain(&p2, None).unwrap().all.records, 1);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn a_whole_record_whose_head_failed_and_cannot_be_taken_out_stays() {
+        let d = tmp("stays");
+        let p = d.join("audit.jsonl");
+        let mut log = AuditLog::open(&p).unwrap();
+        log.append(&entry(0, "allowed")).unwrap();
+        let head = head_path(&p);
+        std::fs::remove_file(&head).unwrap();
+        std::fs::create_dir_all(&head).unwrap();
+        log.faults.undo = true;
+        let err = log.append(&entry(1, "blocked")).unwrap_err();
+        assert!(record_written(&err), "{err}");
+        assert!(
+            err.to_string().contains("record written, head not"),
+            "{err}"
+        );
+        assert_eq!(
+            log.head().0,
+            2,
+            "the chain moves on from the record that stays"
+        );
+        log.faults.undo = false;
+        std::fs::remove_dir_all(&head).unwrap();
+        assert_eq!(log.append(&entry(2, "blocked")).unwrap().seq, 3);
+        assert_eq!(verify_chain(&p, None).unwrap().all.records, 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review round 4e, L5: one whole record past the head (a crash between the log's sync and the
+    /// head's rename) is accepted on open and the head is brought up to it; two are refused, as
+    /// is a head ahead of the log.
+    #[test]
+    fn one_record_past_the_head_is_repaired_on_open_and_nothing_else_is() {
+        let d = tmp("one-past");
+        let p = d.join("audit.jsonl");
+        let head = head_path(&p);
+        let mut log = AuditLog::open(&p).unwrap();
+        for i in 0..3 {
+            log.append(&entry(i, "allowed")).unwrap();
+        }
+        let at3 = std::fs::read_to_string(&head).unwrap();
+        log.append(&entry(3, "blocked")).unwrap();
+        drop(log);
+        std::fs::write(&head, &at3).unwrap();
+        let mut log = AuditLog::open(&p).expect("one record past the head opens");
+        assert_eq!(log.head().0, 4);
+        assert_eq!(
+            read_head(&head).unwrap().unwrap().0,
+            4,
+            "the head is repaired"
+        );
+        assert_eq!(log.append(&entry(4, "allowed")).unwrap().seq, 5);
+        assert_eq!(verify_chain(&p, None).unwrap().all.records, 5);
+        let at5 = std::fs::read_to_string(&head).unwrap();
+        log.append(&entry(5, "allowed")).unwrap();
+        log.append(&entry(6, "allowed")).unwrap();
+        drop(log);
+        // two records past the head: refused, and the head is left as it was
+        std::fs::write(&head, &at5).unwrap();
+        assert!(AuditLog::open(&p).is_err(), "two past the head");
+        assert_eq!(std::fs::read_to_string(&head).unwrap(), at5);
+        // a head ahead of the log (records cut off the end): refused
+        std::fs::write(&head, "9 ".to_string() + &"a".repeat(64) + "\n").unwrap();
+        assert!(AuditLog::open(&p).is_err(), "a head ahead of the log");
+        // one past a head whose hash is not the previous record's: refused
+        std::fs::write(&head, "6 ".to_string() + &"b".repeat(64) + "\n").unwrap();
+        assert!(
+            AuditLog::open(&p).is_err(),
+            "a head that is not the previous record"
+        );
+        // with an anchor one behind too, both are brought up
+        let d2 = tmp("one-past-anchor");
+        let p2 = d2.join("audit.jsonl");
+        let anchor = d2.join("anchor.head");
+        let opts = || Options {
+            rotation: None,
+            anchor: Some(Anchor {
+                path: anchor.clone(),
+                required: true,
+            }),
+        };
+        let mut log = AuditLog::open_with(&p2, opts()).unwrap();
+        log.append(&entry(0, "allowed")).unwrap();
+        let at1 = std::fs::read_to_string(&anchor).unwrap();
+        log.append(&entry(1, "allowed")).unwrap();
+        drop(log);
+        std::fs::write(head_path(&p2), &at1).unwrap();
+        std::fs::write(&anchor, &at1).unwrap();
+        AuditLog::open_with(&p2, opts()).expect("head and anchor one behind");
+        assert_eq!(read_head(&anchor).unwrap().unwrap().0, 2);
+        assert!(verify_chain(&p2, Some(&anchor)).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// Review round 4e, L6: a head rename refused for a moment (access denied, a sharing
+    /// violation) is tried again after 20, 50 and 100 ms, then fails closed; any other error is
+    /// not retried.
+    #[test]
+    fn a_head_rename_refused_for_a_moment_is_retried_then_fails_closed() {
+        let (a, b) = (Path::new("from"), Path::new("to"));
+        let run = |fails: usize, kind: fn() -> io::Error| {
+            let mut calls = 0usize;
+            let mut slept = vec![];
+            let r = rename_retrying(
+                a,
+                b,
+                &mut |_, _| {
+                    calls += 1;
+                    if calls <= fails {
+                        Err(kind())
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |ms| slept.push(ms),
+            );
+            (r.is_ok(), calls, slept)
+        };
+        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(run(0, denied), (true, 1, vec![]));
+        assert_eq!(run(2, denied), (true, 3, vec![20, 50]));
+        assert_eq!(run(9, denied), (false, 4, vec![20, 50, 100]));
+        let missing = || io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert_eq!(run(9, missing), (false, 1, vec![]));
+        if cfg!(windows) {
+            let sharing = || io::Error::from_raw_os_error(32);
+            assert_eq!(run(1, sharing), (true, 2, vec![20]));
+        }
     }
 }
