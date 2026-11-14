@@ -314,7 +314,9 @@ impl Approver {
     /// an answer DATED inside the window counts however late the caller looks, and once the
     /// window has closed only one dated no later than its end does (no grace at all). A channel
     /// that cannot be read is `None` even after the window has closed, so an Allow tapped in time
-    /// is not lost to a failed read: the next call reads again (review round 4e, L2).
+    /// is not lost to a failed read: the next call reads again (review round 4e, L2). So `None`
+    /// at or after `req.expires_ms` means only that the channel could not be read: a caller must
+    /// not call that ask "still open" (review round 4f, item 5).
     pub fn check(&mut self, req: &Request, now_ms: u64) -> Option<Outcome> {
         if self.resolved_set.contains(&req.id) {
             return Some(Outcome::Expired);

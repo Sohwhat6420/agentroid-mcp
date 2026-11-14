@@ -537,6 +537,10 @@ pub struct Protected {
     /// item 5; the owner may reverse this default). It lapses outside the quiet hours and
     /// [`QUIET_ASK_MAX_MS`] after it was set ([`quiet_lapsed`]). Not kept across a restart.
     quiet_since: Option<u64>,
+    /// A close written to the log without its head or anchor, outside [`Protected::admit`] (the
+    /// call path and the daemon write the queue first): why. The next admit refuses with it, so a
+    /// required anchor never fails silently (review round 4f, item 1).
+    unanchored: Option<String>,
 }
 
 impl std::fmt::Debug for Protected {
@@ -862,6 +866,7 @@ impl Protected {
             notices: vec![],
             notices_polled_ms: None,
             quiet_since: None,
+            unanchored: None,
         };
         let h = p.load_holds();
         p.held = h.held;
@@ -1094,8 +1099,30 @@ impl Protected {
     /// one go back in the queue (review round 3, item 10), and the caller refuses until they are
     /// written. A close whose record is in the log but whose head or anchor is not
     /// ([`crate::audit::record_written`]) is not queued again, so it is never written twice
-    /// (review round 4e, L4); the call is still refused.
+    /// (review round 4e, L4); the call is still refused, and so is the first call after one
+    /// written ahead of it ([`Protected::audit_closes_ahead`]).
     pub fn audit_closes(
+        &mut self,
+        audit: Option<&mut AuditLog>,
+        tool: &'static str,
+    ) -> Result<(), Refusal> {
+        self.write_closes(audit, tool)?;
+        match self.unanchored.take() {
+            Some(why) => Err(Refusal::Audit { tool, why }),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Protected::audit_closes`] ahead of a call (core's call path, the daemon at a release):
+    /// nothing is refused here. A close that could not be written stays queued; one written
+    /// without its head or anchor is refused on the next admit (review round 4f, item 1).
+    pub fn audit_closes_ahead(&mut self, audit: Option<&mut AuditLog>, tool: &'static str) {
+        let _ = self.write_closes(audit, tool);
+    }
+
+    /// Write the close queue. `Err`: a close could not be written (it and every later one are
+    /// queued again). A close written without its head or anchor is kept in `unanchored`.
+    fn write_closes(
         &mut self,
         audit: Option<&mut AuditLog>,
         tool: &'static str,
@@ -1148,15 +1175,12 @@ impl Protected {
                 }
             }
         }
-        match anchor_not {
-            Some(e) => Err(Refusal::Audit {
-                tool,
-                why: format!(
-                    "a lease close is in the audit log, but not everywhere it is kept ({e}); it is not written again, and this call is refused"
-                ),
-            }),
-            None => Ok(()),
+        if let Some(e) = anchor_not {
+            self.unanchored.get_or_insert(format!(
+                "a lease close is in the audit log, but not everywhere it is kept ({e}); it is not written again, and this call is refused"
+            ));
         }
+        Ok(())
     }
 
     /// What the presence file says now (no file configured: untrusted, so the overnight rule is off).
@@ -1529,9 +1553,16 @@ impl Protected {
                     let r = reference(&p.req.id);
                     let who = clean(&p.holder.name, 40);
                     let epoch = p.holder.epoch;
+                    // past its window, no outcome means the channel could not be read: the ask
+                    // is not "still open" (review round 4f, item 5)
+                    let state = if now >= p.req.expires_ms {
+                        ": its window has closed; the channel cannot be read"
+                    } else {
+                        " is still open"
+                    };
                     self.pending = Some(p);
                     return Err(refused(format!(
-                        "ask {r} for {who} (epoch {epoch}) is still open; one ask at a time goes to the owner, so try again once it has ended"
+                        "ask {r} for {who} (epoch {epoch}){state}; one ask at a time goes to the owner, so try again once it has ended"
                     )));
                 }
                 Some(Answer::Approved { event_id }) if mine => {

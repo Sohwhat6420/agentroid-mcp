@@ -643,8 +643,10 @@ fn settle_on_the_protected_phone_is_an_ordinary_settle() {
 #[test]
 fn files_go_under_the_lease_but_code_shell_and_link_segments_never_do() {
     let mut r = rig("paths");
-    // code, or anything into /data/local/tmp, is refused before any ask, in any spelling
+    // code, or anything into /data/local/tmp or under /proc, is refused before any ask, in any
+    // spelling
     for p in [
+        "/proc/self/fd/3",
         "/data/local/tmp/agentroid-dump.dex",
         "/data/local/tmp",
         "/data/local/tmp/notes.txt",
@@ -2515,6 +2517,28 @@ fn an_allow_in_time_survives_a_channel_that_fails_after_the_window() {
     ));
 }
 
+/// Round 4f, item 5: past an ask's window, with the channel unreadable, another holder is told
+/// the window has closed and the channel cannot be read, not that the ask "is still open".
+#[test]
+fn another_holder_is_not_told_a_closed_ask_is_open_when_the_channel_cannot_be_read() {
+    let mut r = rig("r4f-closed-unreadable");
+    r.call(&at(100.0, 300.0)).unwrap_err();
+    *r.holder.lock().unwrap() = Some(Holder {
+        name: "lane-b".into(),
+        epoch: 2,
+    });
+    let e = refused(r.call(&at(100.0, 300.0))).to_string();
+    assert!(e.contains("is still open"), "{e}");
+    r.inbox.lock().unwrap().poll_fails = true;
+    r.wall.advance(11 * MIN);
+    let e = refused(r.call(&at(100.0, 300.0))).to_string();
+    assert!(
+        e.contains("its window has closed; the channel cannot be read"),
+        "{e}"
+    );
+    assert!(!e.contains("is still open"), "{e}");
+}
+
 /// Round 4e, L4: a close whose record is written but whose required anchor is not is not queued
 /// again: it is in the log once, however many calls follow.
 #[test]
@@ -2559,6 +2583,33 @@ fn a_close_written_without_its_anchor_is_not_written_again() {
     assert!(!matches!(e, Refusal::Audit { .. }), "{e:?}");
     assert_eq!(released(&path), 1);
     assert!(agentroid_core::audit::verify_chain(&path, Some(&anchor)).is_ok());
+}
+
+/// Round 4f, item 1: a close written at a release, ahead of any call, without its required
+/// anchor refuses the protected phone's next call; a second write ahead does not lose it. (Before,
+/// the write ahead dropped the refusal, and the call was judged as if the anchor were written.)
+#[test]
+fn a_close_written_ahead_without_its_anchor_refuses_the_next_call() {
+    let mut r = rig("r4f-ahead");
+    r.open_lease();
+    let path = r.dir.join("audit.log");
+    let blocker = r.dir.join("anchor-dir");
+    std::fs::write(&blocker, "a file where the anchor's folder should be").unwrap();
+    let opts = agentroid_core::audit::Options {
+        rotation: None,
+        anchor: Some(agentroid_core::audit::Anchor {
+            path: blocker.join("agentroid.head"),
+            required: true,
+        }),
+    };
+    r.core
+        .set_audit(agentroid_core::audit::AuditLog::open_with(&path, opts).unwrap());
+    assert!(r.core.protected_mut().unwrap().close_epoch(1).is_some());
+    r.core.protected_audit_closes("lease.release");
+    r.core.protected_audit_closes("lease.release");
+    let e = refused(r.call(&at(100.0, 300.0)));
+    assert!(matches!(e, Refusal::Audit { .. }), "{e:?}");
+    assert!(e.to_string().contains("is in the audit log"), "{e}");
 }
 
 /// An overnight lease from `start` that ends on a stale presence file 16 min on: the ask after

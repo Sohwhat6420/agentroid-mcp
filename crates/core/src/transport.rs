@@ -1090,11 +1090,12 @@ impl<T: Transport, C: Clock> Core<T, C> {
     }
 
     /// Write the protected-device leases that closed without core (run out, released, connection
-    /// gone) to the audit log. A write that fails here is not retried: the lease's own check
-    /// refuses on a failed write.
+    /// gone) to the audit log. Nothing is refused here: a close that could not be written stays
+    /// queued, and one written without its head or anchor is kept, so the protected phone's next
+    /// call is refused either way (review round 4f, item 1).
     pub fn protected_audit_closes(&mut self, tool: &'static str) {
         if let Some(p) = self.protected.as_mut() {
-            let _ = p.audit_closes(self.audit.as_mut(), tool);
+            p.audit_closes_ahead(self.audit.as_mut(), tool);
         }
     }
 

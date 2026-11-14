@@ -221,7 +221,15 @@ pub struct Verified {
     pub last_ts_ms: Option<u64>,
     /// How many files the chain spanned (1 for a single log).
     pub files: usize,
+    /// The head repairs made at open ([`REPAIRED_HEAD`] records): `seq N: reason`, oldest first.
+    pub repairs: Vec<String>,
 }
+
+/// The rule of the record an open appends when it brings the head file or the anchor up to the
+/// log's last record ([`AuditLog::open_with`]). An unkeyed chain cannot tell a crash's leftover
+/// record from one forged, correctly chained append; this record is the evidence that a record
+/// was adopted, and `audit verify` lists every one (review round 4f, item 2).
+pub const REPAIRED_HEAD: &str = "audit:repaired_head";
 
 impl Verified {
     fn empty(start_seq: u64, start_prev: &str) -> Verified {
@@ -235,6 +243,7 @@ impl Verified {
             first_ts_ms: None,
             last_ts_ms: None,
             files: 1,
+            repairs: Vec::new(),
         }
     }
 }
@@ -306,6 +315,10 @@ pub fn verify_str_from(
             "blocked" => out.blocked += 1,
             "asked" => out.asked += 1,
             d => return Err(Broken::at(line, format!("unknown decision {d:?}"))),
+        }
+        if r.entry.rule == REPAIRED_HEAD {
+            out.repairs
+                .push(format!("seq {}: {}", r.seq, r.entry.reason));
         }
         prev = r.hash.clone();
         out.records += 1;
@@ -460,6 +473,7 @@ fn verify_chain_against(
         all.blocked += v.blocked;
         all.asked += v.asked;
         all.files += 1;
+        all.repairs.extend(v.repairs.iter().cloned());
         if all.first_ts_ms.is_none() {
             all.first_ts_ms = v.first_ts_ms;
         }
@@ -498,28 +512,43 @@ pub fn verify_file(path: &Path) -> Result<Verified, Broken> {
     verify_chain(path, None).map(|c| c.all)
 }
 
-/// A crash between the log's sync and the head file's rename leaves exactly one whole, chained
-/// record past the head file (and past the anchor, written after it). Verified without them, a log
-/// whose last record is the one after the head's, chained from it, in the active file, is that
-/// crash, and its chain is returned so the caller writes the head (and the anchor) up to it. Any
-/// other mismatch is `None`: refused as before (review round 4e, L5).
-fn one_past_head(log: &Path, anchor: Option<&Path>) -> Option<Chain> {
+/// An append writes the line (synced), renames the head file, then writes the anchor. A crash
+/// between the sync and the head's rename leaves exactly one whole, chained record past the head
+/// file and the anchor; a crash between the head's rename and the anchor's write leaves the
+/// anchor alone one record behind (review round 4f, item 3). Verified without them, a log whose
+/// last record, in the active file, is one of these is that crash: its chain is returned, with
+/// what was behind, so the caller brings both up to it and records the repair. Any other mismatch
+/// is `None`: refused as before (review round 4e, L5). The anchor is never accepted ahead of the
+/// head: this write order cannot leave it there (review round 4f, item 4).
+fn one_past_head(log: &Path, anchor: Option<&Path>) -> Option<(Chain, &'static str)> {
     let (hseq, hhash) = read_head(&head_path(log)).ok()??;
     let c = verify_chain_against(log, None, None).ok()?;
     let text = std::fs::read_to_string(log).ok()?;
     let last = Record::from_json(text.lines().rev().find(|l| !l.is_empty())?).ok()?;
-    if last.seq != c.all.head_seq || last.seq != hseq.checked_add(1)? || last.prev != hhash {
+    if last.seq != c.all.head_seq {
         return None;
     }
-    if let Some(a) = anchor {
-        let (aseq, ahash) = read_head(a).ok()??;
-        let behind = aseq == hseq && ahash == hhash;
-        let level = aseq == last.seq && ahash == last.hash;
-        if !behind && !level {
-            return None;
+    // (seq, hash) is the record just before the last one
+    let behind = |seq: u64, hash: &str| seq.checked_add(1) == Some(last.seq) && hash == last.prev;
+    let head_behind = behind(hseq, &hhash);
+    let what = match anchor {
+        None if head_behind => "the head file",
+        None => return None,
+        Some(a) => {
+            let (aseq, ahash) = read_head(a).ok()??;
+            let head_level = hseq == last.seq && hhash == last.hash;
+            let repairable = behind(aseq, &ahash) && (head_behind || head_level);
+            if !repairable {
+                return None;
+            }
+            if head_behind {
+                "the head file and the anchor"
+            } else {
+                "the anchor"
+            }
         }
-    }
-    Some(c)
+    };
+    Some((c, what))
 }
 
 /// A head rename can fail for a moment on Windows while another process (a scanner, the indexer,
@@ -668,11 +697,12 @@ impl AuditLog {
             .as_ref()
             .map(|a| a.path.as_path())
             .filter(|p| p.exists());
+        let mut repaired: Option<(u64, String, &'static str)> = None;
         let (seq, last, part_records, part_first_ts) = if path.exists() {
             let c = match verify_chain(path, anchor) {
                 Ok(c) => c,
                 Err(b) => {
-                    let Some(c) = one_past_head(path, anchor) else {
+                    let Some((c, what)) = one_past_head(path, anchor) else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -681,12 +711,9 @@ impl AuditLog {
                             ),
                         ));
                     };
-                    // one whole record past the head: a crash before the head's rename; the head
-                    // (and the anchor) are brought up to it
-                    write_head(&head_path(path), c.all.head_seq, &c.all.head_hash)?;
-                    if let (Some(a), Some(_)) = (&options.anchor, anchor) {
-                        write_head(&a.path, c.all.head_seq, &c.all.head_hash)?;
-                    }
+                    // a crash part-way through an append: the record is adopted, and the repair
+                    // record appended below brings the head file and the anchor up past it
+                    repaired = Some((c.all.head_seq, c.all.head_hash.clone(), what));
                     c
                 }
             };
@@ -714,7 +741,7 @@ impl AuditLog {
             (0, GENESIS.to_string(), 0, None)
         };
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(AuditLog {
+        let mut log = AuditLog {
             path: path.to_path_buf(),
             file,
             seq,
@@ -728,7 +755,23 @@ impl AuditLog {
             poisoned: None,
             #[cfg(test)]
             faults: Faults::default(),
-        })
+        };
+        if let Some((seq, hash, what)) = repaired {
+            // chained like every record, so the adoption is in the log for good; a log whose
+            // repair cannot be written is not opened (review round 4f, item 2)
+            log.append(&Entry {
+                device: String::new(),
+                tool: "audit".into(),
+                decision: "blocked".into(),
+                rule: REPAIRED_HEAD.into(),
+                reason: format!(
+                    "{what}: one record behind the log at open; record seq {seq} ({hash}) was adopted (an unkeyed chain cannot tell a crash's leftover record from one forged append)"
+                ),
+                target: String::new(),
+                screen: String::new(),
+            })?;
+        }
+        Ok(log)
     }
 
     /// Write `line` to the log, flushed and synced.
@@ -917,6 +960,23 @@ impl AuditLog {
     }
 }
 
+/// The head repairs a verified chain holds, one per line after the OK line (none: nothing).
+fn repairs_text(repairs: &[String]) -> String {
+    if repairs.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n{} head repair{} at open (each adopted one record the head file or the anchor had not reached):",
+        repairs.len(),
+        if repairs.len() == 1 { "" } else { "s" }
+    );
+    for r in repairs {
+        out.push_str("\n  ");
+        out.push_str(r);
+    }
+    out
+}
+
 /// `agentroid audit verify <log> [--head SEQ:HASH] [--anchor PATH]`: the command's logic, so tests
 /// run it in-process too. Spans the log's rotated parts. Returns the text to print and the exit code
 /// (0 verified, 1 broken, 2 usage).
@@ -986,7 +1046,7 @@ pub fn verify_command(args: &[String]) -> (String, i32) {
                 } else {
                     ""
                 }
-            ),
+            ) + &repairs_text(&c.all.repairs),
             0,
         ),
         Err(b) => (format!("BROKEN {}: {b}", p.display()), 1),
@@ -1466,9 +1526,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Review round 4e, L5: one whole record past the head (a crash between the log's sync and the
-    /// head's rename) is accepted on open and the head is brought up to it; two are refused, as
-    /// is a head ahead of the log.
+    /// Review round 4e, L5, and round 4f, item 2: one whole record past the head (a crash between
+    /// the log's sync and the head's rename) is adopted on open, and a chained repair record
+    /// brings the head up past it and names it; `audit verify` lists the repair. Two records past
+    /// the head are refused, as is a head ahead of the log.
     #[test]
     fn one_record_past_the_head_is_repaired_on_open_and_nothing_else_is() {
         let d = tmp("one-past");
@@ -1479,36 +1540,49 @@ mod tests {
             log.append(&entry(i, "allowed")).unwrap();
         }
         let at3 = std::fs::read_to_string(&head).unwrap();
-        log.append(&entry(3, "blocked")).unwrap();
+        let adopted = log.append(&entry(3, "blocked")).unwrap();
         drop(log);
         std::fs::write(&head, &at3).unwrap();
         let mut log = AuditLog::open(&p).expect("one record past the head opens");
-        assert_eq!(log.head().0, 4);
+        assert_eq!(log.head().0, 5, "record 4 adopted, then the repair record");
         assert_eq!(
             read_head(&head).unwrap().unwrap().0,
-            4,
+            5,
             "the head is repaired"
         );
-        assert_eq!(log.append(&entry(4, "allowed")).unwrap().seq, 5);
-        assert_eq!(verify_chain(&p, None).unwrap().all.records, 5);
-        let at5 = std::fs::read_to_string(&head).unwrap();
+        let c = verify_chain(&p, None).unwrap();
+        assert_eq!(c.all.repairs.len(), 1, "{:?}", c.all.repairs);
+        let repair = &c.all.repairs[0];
+        assert!(repair.starts_with("seq 5: the head file: "), "{repair}");
+        assert!(
+            repair.contains(&format!("record seq 4 ({})", adopted.hash)),
+            "{repair}"
+        );
+        let (out, code) = verify_command(&[p.display().to_string()]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("1 head repair at open"), "{out}");
+        assert!(out.contains(&adopted.hash), "{out}");
+        assert_eq!(log.append(&entry(4, "allowed")).unwrap().seq, 6);
+        let at6 = std::fs::read_to_string(&head).unwrap();
         log.append(&entry(5, "allowed")).unwrap();
         log.append(&entry(6, "allowed")).unwrap();
         drop(log);
         // two records past the head: refused, and the head is left as it was
-        std::fs::write(&head, &at5).unwrap();
+        std::fs::write(&head, &at6).unwrap();
         assert!(AuditLog::open(&p).is_err(), "two past the head");
-        assert_eq!(std::fs::read_to_string(&head).unwrap(), at5);
+        assert_eq!(std::fs::read_to_string(&head).unwrap(), at6);
         // a head ahead of the log (records cut off the end): refused
         std::fs::write(&head, "9 ".to_string() + &"a".repeat(64) + "\n").unwrap();
         assert!(AuditLog::open(&p).is_err(), "a head ahead of the log");
         // one past a head whose hash is not the previous record's: refused
-        std::fs::write(&head, "6 ".to_string() + &"b".repeat(64) + "\n").unwrap();
+        std::fs::write(&head, "7 ".to_string() + &"b".repeat(64) + "\n").unwrap();
         assert!(
             AuditLog::open(&p).is_err(),
             "a head that is not the previous record"
         );
-        // with an anchor one behind too, both are brought up
+        // a refused open appends nothing
+        assert_eq!(verify_chain_against(&p, None, None).unwrap().all.records, 8);
+        // with an anchor one behind too, both are brought up by the repair record
         let d2 = tmp("one-past-anchor");
         let p2 = d2.join("audit.jsonl");
         let anchor = d2.join("anchor.head");
@@ -1527,10 +1601,77 @@ mod tests {
         std::fs::write(head_path(&p2), &at1).unwrap();
         std::fs::write(&anchor, &at1).unwrap();
         AuditLog::open_with(&p2, opts()).expect("head and anchor one behind");
-        assert_eq!(read_head(&anchor).unwrap().unwrap().0, 2);
-        assert!(verify_chain(&p2, Some(&anchor)).is_ok());
+        assert_eq!(read_head(&anchor).unwrap().unwrap().0, 3);
+        let c = verify_chain(&p2, Some(&anchor)).unwrap();
+        assert!(
+            c.all.repairs.len() == 1
+                && c.all.repairs[0].starts_with("seq 3: the head file and the anchor: "),
+            "{:?}",
+            c.all.repairs
+        );
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// Review round 4f, items 3 and 4: a crash between the head's rename and the anchor's write
+    /// (the head at the last record, the anchor one behind) is repaired like a crash before the
+    /// head's rename, with a repair record. An anchor ahead of the head (this write order cannot
+    /// leave one) is refused, as is an anchor two behind.
+    #[test]
+    fn a_crash_before_the_anchor_write_is_repaired_and_an_anchor_ahead_is_not() {
+        let d = tmp("anchor-behind");
+        let p = d.join("audit.jsonl");
+        let head = head_path(&p);
+        let anchor = d.join("anchor.head");
+        let opts = || Options {
+            rotation: None,
+            anchor: Some(Anchor {
+                path: anchor.clone(),
+                required: true,
+            }),
+        };
+        let mut log = AuditLog::open_with(&p, opts()).unwrap();
+        log.append(&entry(0, "allowed")).unwrap();
+        let at1 = std::fs::read_to_string(&anchor).unwrap();
+        let adopted = log.append(&entry(1, "allowed")).unwrap();
+        drop(log);
+        // the head at record 2, the anchor still at record 1
+        std::fs::write(&anchor, &at1).unwrap();
+        let log = AuditLog::open_with(&p, opts()).expect("the anchor one behind the head");
+        assert_eq!(log.head().0, 3, "record 2 adopted, then the repair record");
+        drop(log);
+        assert_eq!(read_head(&anchor).unwrap().unwrap().0, 3);
+        let c = verify_chain(&p, Some(&anchor)).unwrap();
+        assert_eq!(c.all.repairs.len(), 1, "{:?}", c.all.repairs);
+        let repair = &c.all.repairs[0];
+        assert!(repair.starts_with("seq 3: the anchor: "), "{repair}");
+        assert!(
+            repair.contains(&format!("record seq 2 ({})", adopted.hash)),
+            "{repair}"
+        );
+        // the anchor at the last record and the head one behind it: refused, nothing written
+        let mut log = AuditLog::open_with(&p, opts()).unwrap();
+        let at3 = std::fs::read_to_string(&head).unwrap();
+        log.append(&entry(2, "allowed")).unwrap();
+        drop(log);
+        std::fs::write(&head, &at3).unwrap();
+        assert!(
+            AuditLog::open_with(&p, opts()).is_err(),
+            "an anchor ahead of the head"
+        );
+        assert_eq!(std::fs::read_to_string(&head).unwrap(), at3);
+        // the anchor two behind the head and the log: refused
+        let at4 = std::fs::read_to_string(&anchor).unwrap();
+        std::fs::write(&head, &at4).unwrap();
+        let mut log = AuditLog::open_with(&p, opts()).unwrap();
+        assert_eq!(log.append(&entry(3, "allowed")).unwrap().seq, 5);
+        drop(log);
+        std::fs::write(&anchor, &at3).unwrap();
+        assert!(
+            AuditLog::open_with(&p, opts()).is_err(),
+            "an anchor two behind"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Review round 4e, L6: a head rename refused for a moment (access denied, a sharing

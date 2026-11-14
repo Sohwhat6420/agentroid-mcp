@@ -105,10 +105,8 @@ const CODE_SUFFIXES: [&str; 12] = [
 ];
 
 /// A path as the phone resolves it, for the code-push rule: lower case, `\` as `/`, empty and `.`
-/// segments dropped, `..` taken off the segment before it, and a leading `/proc/<any>/root` or
-/// `/proc/<any>/cwd` (a process's view of `/`, as in `/proc/self/root/data/local/tmp`) taken off,
-/// however often it repeats (review round 4, item 8), and so is a thread's, `/proc/<any>/task/
-/// <any>/root` or `cwd` (review round 4e, L7).
+/// segments dropped, `..` taken off the segment before it. (`/proc` paths are not resolved here:
+/// [`code_push_refusal`] refuses every one, review round 4f, item 6.)
 fn normalise_phone_path(p: &str) -> String {
     let p = p.trim().to_lowercase().replace('\\', "/");
     let lead = if p.starts_with('/') { "/" } else { "" };
@@ -121,22 +119,16 @@ fn normalise_phone_path(p: &str) -> String {
             }
             s => out.push(s),
         }
-        if !lead.is_empty()
-            && matches!(
-                out.as_slice(),
-                ["proc", _, "root" | "cwd"] | ["proc", _, "task", _, "root" | "cwd"]
-            )
-        {
-            out.clear();
-        }
     }
     format!("{lead}{}", out.join("/"))
 }
 
 /// Why a push to the protected phone is refused as code, or `None`. `local` is the file sent and
 /// `remote` the path it lands at: a code file by name (either side, any case), anything into
-/// `/data/local/tmp` (where `app_process` and the shell run code from) or onto the dump helper's
-/// path. A fixed refusal: no lease or approval lifts it.
+/// `/data/local/tmp` (where `app_process` and the shell run code from), anything under `/proc`
+/// (a process's or a thread's view of `/`, its open files: `/proc/<any>/root`, `cwd`, `fd/<n>`,
+/// `task/<any>/root`... are other spellings of real paths, so none is let through; review round
+/// 4f, item 6) or onto the dump helper's path. A fixed refusal: no lease or approval lifts it.
 pub fn code_push_refusal(local: &str, remote: &str) -> Option<String> {
     let r = normalise_phone_path(remote);
     let named_code = [local, remote].iter().any(|p| {
@@ -145,8 +137,9 @@ pub fn code_push_refusal(local: &str, remote: &str) -> Option<String> {
         CODE_SUFFIXES.iter().any(|s| base.ends_with(s))
     });
     let tmp = r == "/data/local/tmp" || r.starts_with("/data/local/tmp/");
-    (named_code || tmp || r == DUMP_HELPER_REMOTE).then(|| {
-        "code is never pushed to the protected phone (a .dex, .apk, .jar, .so or similar, or anything into /data/local/tmp), lease or not".to_string()
+    let proc = r == "/proc" || r.starts_with("/proc/");
+    (named_code || tmp || proc || r == DUMP_HELPER_REMOTE).then(|| {
+        "code is never pushed to the protected phone (a .dex, .apk, .jar, .so or similar, or anything into /data/local/tmp or under /proc), lease or not".to_string()
     })
 }
 
@@ -2647,6 +2640,15 @@ mod tests {
                 "C:/outbox/note.txt",
                 "/proc/self/task/9/root/proc/1/task/2/cwd/data/local/tmp/x",
             ),
+            // review round 4f, item 6: anything under /proc, a process's open files included,
+            // and the spellings that once read as other paths
+            ("C:/outbox/note.txt", "/proc/self/fd/3"),
+            ("C:/outbox/note.txt", "/proc/1234/fd/7"),
+            ("C:/outbox/note.txt", "/sdcard/../PROC/1/fd/0"),
+            ("C:/outbox/note.txt", "/proc"),
+            ("C:/outbox/a", "/proc/self/rootx/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/task/1/rootx/data/local/tmp/x"),
+            ("C:/outbox/a", "/proc/self/tasks/1/root/data/local/tmp/x"),
             ("C:/outbox/note.txt", DUMP_HELPER_REMOTE),
             ("C:\\outbox\\a.DeX", "/sdcard/a"),
         ] {
@@ -2663,9 +2665,8 @@ mod tests {
             ("C:/outbox/a", "/data/local/tm"),
             ("C:/outbox/a", "/sdcard/tmp/x"),
             ("C:/outbox/a", "/sdcard/proc/self/root/data/local/tmp/x"),
-            ("C:/outbox/a", "/proc/self/rootx/data/local/tmp/x"),
-            ("C:/outbox/a", "/proc/self/task/1/rootx/data/local/tmp/x"),
-            ("C:/outbox/a", "/proc/self/tasks/1/root/data/local/tmp/x"),
+            ("C:/outbox/a", "/sdcard/proc/self/fd/3"),
+            ("C:/outbox/a", "/procx/self/fd/3"),
         ] {
             assert!(
                 code_push_refusal(local, remote).is_none(),

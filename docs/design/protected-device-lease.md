@@ -91,11 +91,12 @@ The checks run in this order, and the first one that refuses ends the call:
    - **code pushed to the phone** (rule `code`): a push whose phone path, or whose laptop file,
      ends in `.dex`, `.apk`, `.apks`, `.apex`, `.jar`, `.so`, `.odex`, `.vdex`, `.oat`, `.art`,
      `.xapk` or `.aab` (any case), and any push into `/data/local/tmp` (where `app_process` and the
-     shell run code from) or onto the dump helper's path. The path is normalised first (`\`
-     becomes `/`; empty, `.` and `..` segments are resolved; a leading `/proc/<any>/root` or
-     `/proc/<any>/cwd`, a process's view of `/`, is taken off, however often it repeats, and so is
-     a thread's, `/proc/<any>/task/<any>/root` or `cwd` (round 4e)), so
-     `/sdcard/../data/local/tmp/x` and `/proc/self/root/data/local/tmp/x` are caught. Core checks the phone path; the adb guard checks both sides again. Pulls are reads and
+     shell run code from), anything under `/proc` (round 4f: a process's or a thread's view of
+     `/`, `/proc/<any>/root`, `cwd` and `task/<any>/root`, and its open files, `/proc/<any>/fd/<n>`,
+     are other spellings of real paths, so none is let through instead of each being resolved),
+     or onto the dump helper's path. The path is normalised first (`\` becomes `/`; empty, `.` and
+     `..` segments are resolved), so `/sdcard/../data/local/tmp/x` and
+     `/proc/self/root/data/local/tmp/x` are caught. Core checks the phone path; the adb guard checks both sides again. Pulls are reads and
      are not refused.
 3. **The daemon lease.** The caller must hold the daemon's device lease on the protected phone
    (`lease.acquire`). The protected lease's holder is **the caller's own** daemon lease (its
@@ -342,7 +343,9 @@ lease's answer comes over the approval channel's separate inbound topic.
   phone, even when it arrives while the ask still looks open on the laptop's clock (a phone clock
   that runs ahead). Other approval asks keep their 60-second grace. A channel that cannot be read
   is no answer either way: the ask stays pending, even after its window, and the next call reads
-  again, so an Allow tapped in time is not lost to a failed read (round 4e).
+  again, so an Allow tapped in time is not lost to a failed read (round 4e). Another holder is
+  then told the ask's window has closed and the channel cannot be read, not that it is still open
+  (round 4f).
 - **A Deny counts once, across restarts too.** Each Deny event is applied once, so an old Deny
   cannot close a lease that the owner re-allowed later. The Deny event ids seen are kept in the
   holds file (the newest 64) and handed back to the approver at the first call after a restart.
@@ -458,6 +461,12 @@ These are not fixed by this design, and are recorded so nobody relies on them:
   touch itself wakes it) and show a PIN prompt. At most that one touch lands unchecked; the next
   call reads the screen, and overnight the screen lock's in-use check refuses once the owner is
   using the phone.
+- **One forged record at the end of the log.** The chain is not keyed: a same-user process can
+  append one correctly chained record without touching the head file or the anchor, and on the
+  next open it looks exactly like a crash's leftover record, so it is adopted. Every adoption
+  appends an `audit:repaired_head` record naming the adopted record's seq and hash, and
+  `agentroid audit verify` lists them: that record is the evidence to check. (Refusing to open
+  instead is the other choice; the owner may take it.)
 
 ## Holder and job
 
@@ -493,7 +502,10 @@ Every lease event is an audit entry (`allowed`, `blocked` or `asked`), with thes
   dropped**: one that cannot be written goes back to the front of the queue, and calls on the
   protected phone are refused until it is written. A close whose record is written but whose head
   file or required anchor is not ("record written, anchor not", `audit::record_written`) is not
-  queued again, so it is never in the log twice; that call is still refused (round 4e).
+  queued again, so it is never in the log twice; that call is still refused (round 4e). The
+  queue is also written ahead of every call and at a release, where nothing can be refused; a
+  close written there without its anchor is kept, and the protected phone's next call is refused
+  with it, so a required anchor never fails silently (round 4f).
 
 The log itself (`crates/core/src/audit.rs`), round 4e:
 
@@ -502,8 +514,13 @@ The log itself (`crates/core/src/audit.rs`), round 4e:
   with a clear error, so nothing is chained after a part of a record. A whole, synced line whose
   head write failed and that could not be taken out stays, and the chain moves on from it.
 - On open, **exactly one whole, chained record past the head file** (a crash between the log's
-  sync and the head's rename) is accepted, and the head (and an anchor one behind with it) is
-  written up to it. Anything else that disagrees with the head is refused, as before.
+  sync and the head's rename, so the anchor is one behind with it), or **past the anchor alone**
+  (a crash between the head's rename and the anchor's write, round 4f), is adopted. A chained
+  `audit:repaired_head` record is appended at once, naming what was behind and the seq and hash
+  of the adopted record, and it brings the head file and the anchor up past it; a log whose repair
+  record cannot be written is not opened. `agentroid audit verify` lists every repair. An anchor
+  ahead of the head is refused (this write order cannot leave one), and so is anything else that
+  disagrees with the head, as before.
 - The head file is written beside itself and renamed over the old one. On Windows that rename can
   be refused for a moment while another process has the file open (access denied, or a sharing
   violation, os errors 5 and 32), so it is tried again after 20, 50 and 100 ms, then fails closed.
