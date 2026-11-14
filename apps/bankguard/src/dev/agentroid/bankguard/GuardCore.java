@@ -26,6 +26,8 @@ final class GuardCore {
     static final String ADB_WIFI = "adb_wifi_enabled"; // not a public constant; the same key the keeper writes
     static final String KEY_BANKS = "banks";
     static final String KEY_PAUSE_UNTIL = "pause_until_wall"; // wall clock: a pause is the owner's, and may span a boot
+    /** Home Wi-Fi mode: the home network's name, and its access points (GuardLogic.parseBssids). Empty: mode off. */
+    static final String KEY_HOME_SSID = "home_ssid", KEY_HOME_BSSIDS = "home_bssids";
     /** Singapore banking and Singpass apps (DBS digibank, PayLah!, POSB, OCBC, UOB TMRW, Singpass). The owner's list
      *  replaces it (MainActivity, ConfigReceiver); setup-bankguard.sh prints the bank apps it finds on the phone. */
     static final String DEFAULT_BANKS = "com.dbs.sg.dbsmbanking,com.dbs.dbspaylah,com.dbs.sg.posbmbanking,"
@@ -45,8 +47,9 @@ final class GuardCore {
     private boolean holdFromEarlierBoot; // the saved hold was made before this boot
     private long refreshedAt;            // elapsedRealtime of the last tick that saw the hold
     private long lastSaved;
+    private boolean onTrusted; // the phone is on the home network now (GuardService's network callback)
     // measurements, shown by `adb shell dumpsys activity service dev.agentroid.bankguard/.GuardService`
-    long holds, releases, reasserts, writeFailures, lastHoldLatencyMs = -1, maxHoldLatencyMs = -1;
+    long holds, releases, reasserts, homeWrites, writeFailures, lastHoldLatencyMs = -1, maxHoldLatencyMs = -1;
     private final ArrayDeque<String> events = new ArrayDeque<String>();
 
     private GuardCore(Context app) {
@@ -101,7 +104,47 @@ final class GuardCore {
 
     /** For the HoldProvider: should the keeper leave Wireless debugging off right now? */
     synchronized boolean keeperShouldWait() {
+        if (homeMode()) return GuardLogic.keeperShouldWaitHome(st, onTrusted);
         return GuardLogic.keeperShouldWait(st, refreshedAt, now(), !holdFromEarlierBoot);
+    }
+
+    // ------------------------------------------------------------------------------------------- home Wi-Fi mode
+
+    synchronized String homeSsid() { return p.getString(KEY_HOME_SSID, ""); }
+
+    synchronized Set<String> homeBssids() { return GuardLogic.parseBssids(p.getString(KEY_HOME_BSSIDS, "")); }
+
+    /** On only with both a name and at least one access point. */
+    synchronized boolean homeMode() { return !homeSsid().isEmpty() && !homeBssids().isEmpty(); }
+
+    synchronized boolean trusted(String ssid, String bssid) {
+        return GuardLogic.trusted(ssid, bssid, homeSsid(), homeBssids());
+    }
+
+    /** Set (or, with an empty name, clear) the home network. Nothing is written to the settings here: the service's
+     *  callback re-checks the current network when the preference changes. */
+    synchronized void setHome(String ssid, Set<String> bssids) {
+        StringBuilder b = new StringBuilder();
+        for (String s : bssids) { if (b.length() > 0) b.append(','); b.append(s); }
+        p.edit().putString(KEY_HOME_SSID, ssid == null ? "" : ssid).putString(KEY_HOME_BSSIDS, b.toString()).commit();
+        log(ssid == null || ssid.isEmpty() ? "home wifi mode off" : "home wifi set: " + bssids.size() + " access point(s)");
+    }
+
+    /** The network callback: the phone joined or left the home network (or the home network was changed). */
+    synchronized GuardLogic.Action setOnTrusted(boolean t) {
+        boolean changed = t != onTrusted;
+        onTrusted = t;
+        if (!homeMode()) return GuardLogic.Action.NONE;
+        if (changed) log(t ? "home wifi: joined" : "home wifi: left");
+        GuardLogic.Seen s = new GuardLogic.Seen(null, null, now(), read(ADB_USB), read(ADB_WIFI), false, 0, true, false);
+        GuardLogic.Action a = GuardLogic.withHome(GuardLogic.Action.NONE, st, s, t);
+        commitThenApply(a, 0);
+        return a;
+    }
+
+    /** Home mode over an action GuardLogic has just decided for the state in s. */
+    private GuardLogic.Action home(GuardLogic.Action a, GuardLogic.Seen s) {
+        return homeMode() ? GuardLogic.withHome(a, st, s, onTrusted) : a;
     }
 
     // ------------------------------------------------------------------------------------------------ the poll
@@ -111,7 +154,7 @@ final class GuardCore {
                                         boolean screenOn, long fgSinceWall) {
         long now = now();
         GuardLogic.Seen s = new GuardLogic.Seen(fg, bank, now, read(ADB_USB), read(ADB_WIFI), onWifi, network, screenOn, fgIsHome);
-        GuardLogic.Action a = GuardLogic.tick(st, s);
+        GuardLogic.Action a = home(GuardLogic.tick(st, s), s);
         if (st.held) refreshedAt = now;
         commitThenApply(a, fgSinceWall);
         if (a.event == null && st.held && now - lastSaved > 5_000) save(false);
@@ -124,7 +167,7 @@ final class GuardCore {
         if (paused()) pauseFor(0);
         long now = now();
         GuardLogic.Seen s = new GuardLogic.Seen(pkg, pkg, now, read(ADB_USB), read(ADB_WIFI), onWifi, network, true, false);
-        GuardLogic.Action a = GuardLogic.holdForLaunch(st, s);
+        GuardLogic.Action a = home(GuardLogic.holdForLaunch(st, s), s);
         refreshedAt = now;
         commitThenApply(a, 0);
         save(true);
@@ -134,7 +177,7 @@ final class GuardCore {
     /** The owner's button or a pause. */
     synchronized GuardLogic.Action releaseNow(String event, boolean onWifi, long network) {
         GuardLogic.Seen s = new GuardLogic.Seen(null, null, now(), read(ADB_USB), read(ADB_WIFI), onWifi, network, true, false);
-        GuardLogic.Action a = GuardLogic.release(st, s, event);
+        GuardLogic.Action a = home(GuardLogic.release(st, s, event), s);
         commitThenApply(a, 0);
         return a;
     }
@@ -145,7 +188,7 @@ final class GuardCore {
         GuardLogic.Action a = GuardLogic.Action.NONE;
         if (GuardLogic.bootShouldRelease(st, holdFromEarlierBoot)) {
             GuardLogic.Seen s = new GuardLogic.Seen(null, null, now(), read(ADB_USB), read(ADB_WIFI), false, 0, true, false);
-            a = GuardLogic.release(st, s, "release_boot");
+            a = home(GuardLogic.release(st, s, "release_boot"), s);
             commitThenApply(a, 0);
         } else if (st.held) {
             log("boot: a hold from this boot stays");
@@ -188,6 +231,8 @@ final class GuardCore {
             reasserts++;
         } else if (a.event.startsWith("release")) {
             releases++;
+        } else if (a.event.startsWith("home_")) {
+            homeWrites++;
         }
         log(a.event + " pkg=" + st.heldPkg + " usb=" + a.usb + " wifi=" + a.wifi + extra);
     }
@@ -236,7 +281,10 @@ final class GuardCore {
         b.append("adb_enabled=").append(read(ADB_USB) ? 1 : 0).append(" adb_wifi_enabled=").append(read(ADB_WIFI) ? 1 : 0)
                 .append(" paused=").append(paused()).append(" keeper_should_wait=").append(keeperShouldWait())
                 .append(" boot=").append(boot).append(" hold_from_earlier_boot=").append(holdFromEarlierBoot).append('\n');
+        b.append("home_mode=").append(homeMode()).append(" home_access_points=").append(homeBssids().size())
+                .append(" on_home_wifi=").append(onTrusted).append('\n');
         b.append("holds=").append(holds).append(" releases=").append(releases).append(" reasserts=").append(reasserts)
+                .append(" home_writes=").append(homeWrites)
                 .append(" write_failures=").append(writeFailures).append(" last_hold_latency_ms=").append(lastHoldLatencyMs)
                 .append(" max_hold_latency_ms=").append(maxHoldLatencyMs).append('\n');
         b.append("banks=").append(banks()).append('\n');

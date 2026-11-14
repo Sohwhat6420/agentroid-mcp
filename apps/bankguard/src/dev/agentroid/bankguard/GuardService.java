@@ -22,6 +22,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -33,7 +34,9 @@ import android.os.UserManager;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -102,20 +105,60 @@ public final class GuardService extends Service {
         ClockWidget.renderAll(this);
     }
 
-    private final ConnectivityManager.NetworkCallback net = new ConnectivityManager.NetworkCallback() {
+    // Home Wi-Fi mode: the name and access point each Wi-Fi network up now was last seen with (poll thread only).
+    private final Map<Long, String[]> wifiIds = new HashMap<Long, String[]>();
+    private Boolean lastTrusted; // null until the first check
+
+    /**
+     * Wi-Fi networks, from the system's own callbacks: no polling, and nothing is woken for it. On Android 12+ the
+     * callback asks for location info, so the network's name and access point arrive with its capabilities (when the
+     * app holds location access and location is on; otherwise they arrive redacted, and the network is not trusted).
+     */
+    private final class Net extends ConnectivityManager.NetworkCallback {
+        Net() { super(); }
+        Net(int flags) { super(flags); }
+
         @Override public void onAvailable(Network n) {
             wifiUp.add(n.getNetworkHandle());
             if (network == 0) network = n.getNetworkHandle();
         }
+        @Override public void onCapabilitiesChanged(Network n, NetworkCapabilities nc) {
+            Object ti = nc.getTransportInfo();
+            if (!(ti instanceof WifiInfo)) return;
+            WifiInfo w = (WifiInfo) ti;
+            String[] id = {w.getSSID(), w.getBSSID()};
+            String[] was = wifiIds.put(n.getNetworkHandle(), id);
+            // Signal-strength updates arrive here too: re-decide only when the network or access point changed.
+            if (was == null || !eq(was[0], id[0]) || !eq(was[1], id[1])) checkHome();
+        }
         @Override public void onLost(Network n) {
             long gone = n.getNetworkHandle();
             wifiUp.remove(gone);
+            wifiIds.remove(gone);
             if (gone == network) {
                 network = wifiUp.isEmpty() ? 0 : wifiUp.iterator().next();
                 core.wifiGone();
             }
+            checkHome();
         }
-    };
+    }
+
+    private static boolean eq(String a, String b) { return a == null ? b == null : a.equals(b); }
+
+    private final ConnectivityManager.NetworkCallback net =
+            Build.VERSION.SDK_INT >= 31 ? new Net(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) : new Net();
+
+    /** On the home network now? Decided from the last-seen identity of every Wi-Fi network up (poll thread). */
+    private void checkHome() {
+        boolean t = false;
+        for (String[] id : wifiIds.values()) if (core.trusted(id[0], id[1])) { t = true; break; }
+        if (lastTrusted != null && lastTrusted == t && !homeDirty) return;
+        lastTrusted = t;
+        homeDirty = false;
+        core.setOnTrusted(t);
+    }
+
+    private boolean homeDirty; // the home network setting changed: decide again even if "trusted" did not
 
     @Override public IBinder onBind(Intent i) { return null; }
 
@@ -137,6 +180,10 @@ public final class GuardService extends Service {
                     .build();
             cm.registerNetworkCallback(wifi, net, h);
         } catch (Throwable t) { core.log("network callback: " + t); }
+        // No Wi-Fi at all calls no callback: decide once (home mode then switches Wireless debugging off).
+        // Wait a moment first: the callback reports the networks already up within milliseconds, and deciding before it
+        // would switch Wireless debugging off and on again under a working connection.
+        h.postDelayed(new Runnable() { public void run() { if (lastTrusted == null) checkHome(); } }, 3_000);
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_SCREEN_ON);
         f.addAction(Intent.ACTION_SCREEN_OFF);
@@ -157,6 +204,10 @@ public final class GuardService extends Service {
     private final SharedPreferences.OnSharedPreferenceChangeListener prefsChanged =
             new SharedPreferences.OnSharedPreferenceChangeListener() {
                 public void onSharedPreferenceChanged(SharedPreferences sp, String key) {
+                    if (GuardCore.KEY_HOME_SSID.equals(key) || GuardCore.KEY_HOME_BSSIDS.equals(key)) {
+                        h.post(new Runnable() { public void run() { homeDirty = true; checkHome(); } });
+                        return;
+                    }
                     if (!GuardCore.KEY_BANKS.equals(key) && !GuardCore.KEY_PAUSE_UNTIL.equals(key)) return;
                     h.post(new Runnable() { public void run() {
                         if (!polling) return;

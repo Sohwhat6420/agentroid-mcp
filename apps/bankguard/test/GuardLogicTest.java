@@ -221,6 +221,59 @@ public final class GuardLogicTest {
         v.event(GuardLogic.EV_DESTROYED, "dev.agentroid.bankguard", "dev.agentroid.bankguard.TestBank");
         check("visible: destroyed is gone, top cleared", v.bank(BANKS) == null && v.top == null);
 
+        // 18. home Wi-Fi mode: which network is trusted
+        Set<String> aps = GuardLogic.parseBssids("AA:BB:CC:DD:EE:01, aa:bb:cc:11:*, nonsense, aa:bb:*, 02:00:00:00:00:00");
+        check("bssids: full and 4-octet prefix kept, lower-cased; junk and a 2-octet prefix dropped",
+                aps.contains("aa:bb:cc:dd:ee:01") && aps.contains("aa:bb:cc:11:*") && !aps.contains("aa:bb:*") && aps.size() == 3);
+        check("trusted: home name, listed access point", GuardLogic.trusted("\"home\"", "aa:bb:cc:dd:ee:01", "home", aps));
+        check("trusted: home name, an access point under the prefix", GuardLogic.trusted("\"home\"", "AA:BB:CC:11:22:33", "home", aps));
+        check("not trusted: home name, a stranger's access point (a copied name)", !GuardLogic.trusted("\"home\"", "aa:bb:cc:dd:ee:02", "home", aps));
+        check("not trusted: another name on a home access point", !GuardLogic.trusted("\"cafe\"", "aa:bb:cc:dd:ee:01", "home", aps));
+        check("not trusted: name unreadable (no location access)", !GuardLogic.trusted("<unknown ssid>", "aa:bb:cc:dd:ee:01", "home", aps));
+        check("not trusted: access point redacted", !GuardLogic.trusted("\"home\"", "02:00:00:00:00:00", "home", GuardLogic.parseBssids("02:00:00:*")));
+        check("not trusted: access point null", !GuardLogic.trusted("\"home\"", null, "home", aps));
+        check("not trusted: home mode off (no name)", !GuardLogic.trusted("\"home\"", "aa:bb:cc:dd:ee:01", "", aps));
+        check("not trusted: a name with no access points", !GuardLogic.trusted("\"home\"", "aa:bb:cc:dd:ee:01", "home", GuardLogic.parseBssids("")));
+        check("not trusted: case matters in the name", !GuardLogic.trusted("\"Home\"", "aa:bb:cc:dd:ee:01", "home", aps));
+
+        // 19. home Wi-Fi mode: what it writes
+        st = new State();
+        Seen off = new Seen(null, null, 0, false, false, false, 0, true, false);
+        Seen on = new Seen(null, null, 0, false, true, true, NET, true, false);
+        x = GuardLogic.withHome(Action.NONE, st, off, true);
+        check("home: joined the home network, nothing open: wireless on", "home_wifi_on".equals(x.event) && is(x.wifi, 1) && x.usb == null);
+        x = GuardLogic.withHome(Action.NONE, st, on, true);
+        check("home: already on at home: nothing", x.event == null && !x.writes());
+        x = GuardLogic.withHome(Action.NONE, st, on, false);
+        check("home: left the home network: wireless off", "home_wifi_off_away".equals(x.event) && is(x.wifi, 0));
+        x = GuardLogic.withHome(Action.NONE, st, off, false);
+        check("home: away and off: nothing", x.event == null && !x.writes());
+        // a bank opened at home: the hold switches both off; home mode agrees for Wireless
+        st = new State();
+        x = GuardLogic.withHome(GuardLogic.tick(st, bank(1_000, true, true)), st, bank(1_000, true, true), true);
+        check("home: bank opened at home: usb=0 and wifi=0", "hold".equals(x.event) && is(x.usb, 0) && is(x.wifi, 0));
+        x = GuardLogic.withHome(GuardLogic.tick(st, bank(1_400, false, true)), st, bank(1_400, false, true), true);
+        check("home: switched on during the bank: off again", "reassert".equals(x.event) && is(x.wifi, 0));
+        x = GuardLogic.withHome(Action.NONE, st, bank(1_500, false, false), true);
+        check("home: the network callback during a hold does not switch wireless on", x.event == null && !x.writes());
+        x = GuardLogic.withHome(GuardLogic.tick(st, home(1_400 + HG, false, false)), st, home(1_400 + HG, false, false), true);
+        check("home: bank closed at home: both back on", "release".equals(x.event) && is(x.usb, 1) && is(x.wifi, 1) && !st.held);
+        check("home: keeper goes ahead at home with no bank", !GuardLogic.keeperShouldWaitHome(st, true));
+        // a bank held, then the phone leaves home: Wireless stays off at the release, USB comes back
+        st = new State();
+        GuardLogic.withHome(GuardLogic.tick(st, bank(0, true, true)), st, bank(0, true, true), true);
+        check("home: keeper waits while a bank is open at home", GuardLogic.keeperShouldWaitHome(st, true));
+        Seen awayHome = new Seen(HOME, null, 10_000, false, false, false, 0, true, true);
+        x = GuardLogic.withHome(GuardLogic.tick(st, awayHome), st, awayHome, false);
+        check("home: bank closed away from home: usb back, wireless stays off, nothing left-off",
+                "release".equals(x.event) && is(x.usb, 1) && x.wifi == null && !st.wifiLeftOff);
+        check("home: keeper waits away from home", GuardLogic.keeperShouldWaitHome(st, false));
+        // the owner's release button away from home does not switch wireless on
+        st = new State();
+        GuardLogic.tick(st, bank(0, false, true));
+        x = GuardLogic.withHome(GuardLogic.release(st, off, "release_owner"), st, off, false);
+        check("home: owner's release away from home: wireless stays off", "release_owner".equals(x.event) && x.wifi == null);
+
         System.out.println(run + " checks, " + failed + " failed");
         System.exit(failed == 0 ? 0 : 1);
     }

@@ -68,6 +68,21 @@ Only the adb shell can send that broadcast, because the receiver needs `android.
 
 adb drops while the test bank is open. The test bank closes itself, and adb comes back.
 
+**Home Wi-Fi mode (optional).** With it on, Wireless debugging is on only while the phone is on your home network,
+switches off the moment the phone leaves it, and also switches off while a bank app is open at home. USB debugging
+keeps the bank rule.
+
+1. At home, list the access points of your network: `adb shell cmd wifi list-scan-results`. A mesh has several, and
+   a 3 to 5 octet prefix ending in `:*` covers nodes and bands you didn't see.
+2. Run the setup with `BANKGUARD_HOME_SSID="<name>" BANKGUARD_HOME_BSSIDS="<bssid>,<prefix>:*"`. It grants location
+   access (Android shows a network's name to a background app only with it) and sets the network.
+3. Check: `on_home_wifi=true` in the service's dump.
+
+- The name alone is never enough: a copied network name on another access point is not trusted.
+- If the name can't be read (location off, or no location access), the network counts as not home, so Wireless
+  debugging stays off.
+- It runs on the system's network callback, with no polling and no alarm. Clear it with `--es home_ssid "''"`.
+
 ## Tests
 
 ```bash

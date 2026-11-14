@@ -85,10 +85,21 @@ public final class MainActivity extends Activity {
         AppOpsManager ao = getSystemService(AppOpsManager.class);
         boolean usage = ao.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), getPackageName())
                 == AppOpsManager.MODE_ALLOWED;
-        GuardLogic.State st = GuardCore.get(this).state();
+        GuardCore core = GuardCore.get(this);
+        GuardLogic.State st = core.state();
+        String home;
+        if (!core.homeMode()) {
+            home = "Home Wi-Fi mode: off (set it over adb: see the README)";
+        } else {
+            boolean loc = checkSelfPermission("android.permission.ACCESS_BACKGROUND_LOCATION") == PackageManager.PERMISSION_GRANTED;
+            home = "Home Wi-Fi mode: on for " + core.homeSsid() + " (" + core.homeBssids().size() + " access point"
+                    + (core.homeBssids().size() == 1 ? "" : "s") + "). Wireless debugging is on only there."
+                    + (loc ? "" : "\n✗ Location access (grant it over adb, or the home network is never recognised)");
+        }
         status.setText("Agentroid Companion: bank guard\n"
                 + (wss ? "✓" : "✗") + " WRITE_SECURE_SETTINGS" + (wss ? "" : " (grant it once over adb: see the README)") + "\n"
                 + (usage ? "✓" : "✗") + " Usage access" + (usage ? "" : " (tap the button below, or grant it over adb)") + "\n"
+                + home + "\n"
                 + (st.held ? "Holding: debugging is off while " + st.heldPkg + " is open" : "Watching; debugging is left as it is"));
     }
 

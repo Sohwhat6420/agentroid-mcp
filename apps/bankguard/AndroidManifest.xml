@@ -18,6 +18,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Home Wi-Fi mode only: Android shows a Wi-Fi network's name and access point only to an app with location
+         access, and to a background service only with background location. Granted over adb at setup; nothing here
+         reads a location. Without them the home network is never recognised, and Wireless debugging stays off. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- To list the apps the owner can tick or put in the dock, to open them, and to open the clock app. -->

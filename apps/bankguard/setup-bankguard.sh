@@ -10,10 +10,15 @@
 #   BANKGUARD_REFUSE_SERIALS  space-separated hardware serials (ro.serialno) this script must never touch
 #   BANKGUARD_APK             path to the APK (default: out/bankguard.apk next to this script)
 #   ADB                       the adb to use (default: adb on PATH)
+#   BANKGUARD_HOME_SSID       optional: turn on home Wi-Fi mode for this network name. Wireless debugging is then on
+#                             only on that network, and off while a bank is open there
+#   BANKGUARD_HOME_BSSIDS     with it, the home access points: full BSSIDs, or a 3-5 octet prefix ending in ":*"
+#                             (read them on the phone at home: adb shell cmd wifi list-scan-results)
 #
 # Every adb line takes -s "$SERIAL"; there is never a bare `adb`, so it cannot touch another device.
 # What it changes on the phone: installs the app; grants WRITE_SECURE_SETTINGS, Usage access and notifications to
-# it; exempts it from battery optimisation (so the poll is not frozen); starts it. Nothing else.
+# it; exempts it from battery optimisation (so the poll is not frozen); starts it. With home Wi-Fi mode it also grants
+# location access (Android shows a network's name only to apps with it) and sets the home network. Nothing else.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 
@@ -54,6 +59,17 @@ echo "== bank-like apps on this phone (check the list covers yours) =="
 a shell pm list packages | tr -d '\r' | sed 's/^package://' \
   | grep -iE 'dbs|posb|paylah|ocbc|uob|sg\.ndi|singpass|trustbank|gxs|maribank|citi|hsbc|standardchartered|maybank|cimb|bank' \
   | sed 's/^/  /' || echo "  (none found)"
+
+if [ -n "${BANKGUARD_HOME_SSID:-}" ]; then
+  [ -n "${BANKGUARD_HOME_BSSIDS:-}" ] || { echo "BANKGUARD_HOME_BSSIDS is needed with BANKGUARD_HOME_SSID" >&2; exit 2; }
+  echo "== home Wi-Fi mode =="
+  a shell pm grant "$PKG" android.permission.ACCESS_FINE_LOCATION
+  a shell pm grant "$PKG" android.permission.ACCESS_COARSE_LOCATION
+  a shell pm grant "$PKG" android.permission.ACCESS_BACKGROUND_LOCATION
+  echo "  location on: $(a shell settings get secure location_mode | tr -d '\r') (0 = off: the home network is then never recognised)"
+  a shell am broadcast -n "$PKG/.ConfigReceiver" -a dev.agentroid.bankguard.SET \
+    --es home_ssid "'$BANKGUARD_HOME_SSID'" --es home_bssids "'$BANKGUARD_HOME_BSSIDS'" | tr -d '\r' | tail -1
+fi
 
 if [ -n "$BANKS" ]; then
   echo "== set the list =="

@@ -19,7 +19,9 @@ import java.util.regex.Pattern;
  * <p>All times here are the phone's elapsedRealtime (milliseconds since boot): a wall clock that moves back cannot
  * stretch a hold. A hold from an earlier boot is released at boot; its times mean nothing in this boot.
  *
- * <p>The guard never switches debugging ON unless it switched it off; it only ever writes those two keys.
+ * <p>The guard never switches debugging ON unless it switched it off; it only ever writes those two keys. The one
+ * exception is home Wi-Fi mode (below), which the owner turns on: then Wireless debugging is on only on the home
+ * network, and only while no bank is open.
  */
 public final class GuardLogic {
     /** Left the bank for the home screen or Recents: debugging comes back after this. */
@@ -238,4 +240,75 @@ public final class GuardLogic {
         boolean live = st.held && sameBoot && now - refreshedAt >= 0 && now - refreshedAt < HOLD_STALE_MS;
         return (live && st.restoreWifi) || st.wifiLeftOff;
     }
+
+    // ------------------------------------------------------------------------------------------- home Wi-Fi mode
+
+    /*
+     * Home Wi-Fi mode is off until the owner names a home network (ConfigReceiver, over adb). Once it is on, the
+     * guard owns Wireless debugging outright:
+     *   - on while the phone is on a trusted network (the home SSID, from one of the home access points) and no bank
+     *     hold is on;
+     *   - off the moment the phone leaves that network, and off while a bank is open at home.
+     * USB debugging keeps the bank-hold rule above (off while a bank is open, back as it was).
+     * A network whose name or access point cannot be read (no location access, location off) is not trusted: the
+     * unknown case fails closed, with Wireless debugging off.
+     */
+
+    private static final Pattern MAC = Pattern.compile("[0-9a-f]{2}(:[0-9a-f]{2}){5}");
+    private static final Pattern MAC_PREFIX = Pattern.compile("[0-9a-f]{2}(:[0-9a-f]{2}){2,4}:\\*");
+
+    /** The home access points: full BSSIDs ("aa:bb:cc:dd:ee:01") or a prefix of 3 to 5 octets ending in ":*" (a mesh
+     *  whose nodes and bands are not all known). Lower-cased; anything else is dropped. */
+    public static Set<String> parseBssids(String s) {
+        Set<String> out = new LinkedHashSet<String>();
+        if (s == null) return out;
+        for (String part : s.toLowerCase(java.util.Locale.ROOT).split("[,\\s]+")) {
+            if (MAC.matcher(part).matches() || MAC_PREFIX.matcher(part).matches()) out.add(part);
+        }
+        return out;
+    }
+
+    /** Android quotes a UTF-8 SSID ("\"home\""); a hidden or unreadable one is "<unknown ssid>". */
+    public static String unquote(String ssid) {
+        if (ssid == null) return null;
+        if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) return ssid.substring(1, ssid.length() - 1);
+        return ssid;
+    }
+
+    /** Is this the home network? The SSID must match exactly, and the access point must be one of the home ones. An
+     *  empty home SSID means home mode is off: nothing is trusted. An empty access-point list never trusts either,
+     *  because a network name alone is easy to copy. */
+    public static boolean trusted(String ssid, String bssid, String homeSsid, Set<String> homeBssids) {
+        if (homeSsid == null || homeSsid.isEmpty() || homeBssids == null || homeBssids.isEmpty()) return false;
+        String name = unquote(ssid);
+        if (name == null || !name.equals(homeSsid) || bssid == null) return false;
+        String ap = bssid.toLowerCase(java.util.Locale.ROOT);
+        if (!MAC.matcher(ap).matches() || ap.equals("02:00:00:00:00:00")) return false; // Android's redacted value
+        for (String h : homeBssids) {
+            if (h.endsWith("*") ? ap.startsWith(h.substring(0, h.length() - 1)) : ap.equals(h)) return true;
+        }
+        return false;
+    }
+
+    /** What home mode wants for Wireless debugging now: on exactly when trusted and no bank hold is on. */
+    public static boolean homeWantsWifi(State st, boolean onTrusted) { return onTrusted && !st.held; }
+
+    /**
+     * Home mode over a tick's action (after tick, release or holdForLaunch has updated st). The USB part is kept; the
+     * Wireless part is replaced by what home mode wants. "Left off" never applies: home mode puts it back itself when
+     * the phone is home again.
+     */
+    public static Action withHome(Action a, State st, Seen s, boolean onTrusted) {
+        st.wifiLeftOff = false;
+        boolean want = homeWantsWifi(st, onTrusted);
+        Integer wifi = want == s.wifiOn ? null : (want ? 1 : 0);
+        String event = a.event;
+        if (event != null && event.endsWith("_wifi_left_off")) event = event.substring(0, event.length() - "_wifi_left_off".length());
+        if (event == null && wifi != null) event = want ? "home_wifi_on" : (onTrusted ? "home_wifi_off_bank" : "home_wifi_off_away");
+        if (event == null && a.usb == null) return Action.NONE;
+        return new Action(a.usb, wifi, event);
+    }
+
+    /** The keeper's answer in home mode: wait (leave Wireless debugging off) whenever home mode wants it off. */
+    public static boolean keeperShouldWaitHome(State st, boolean onTrusted) { return !homeWantsWifi(st, onTrusted); }
 }
