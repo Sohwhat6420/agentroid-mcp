@@ -5,9 +5,9 @@
 
 # Agentroid
 
-**An AI agent drives your real Android phone, and each look at the screen costs it [9 to 50 times fewer tokens](#what-one-look-costs) than Android's raw screen text.**
+**Your AI agent drives a real Android phone, for [9 to 50 times fewer tokens](#what-one-look-costs) per look at the screen.**
 
-Agentroid is an MCP server (MCP is the plug-in standard AI agents use for tools). It lets an agent such as Claude Code see the screen, tap, type, swipe and open apps on a phone you own. It hands the agent a short text list in place of a screenshot or Android's raw screen description, so a long task fits before the AI runs out of room.
+Agentroid is an MCP server (MCP is the plug-in standard AI agents use for tools). It lets an agent such as Claude Code see the screen, tap, type, swipe and open apps on a phone you own. It hands the agent a short text list in place of Android's raw screen description (the comparison behind "9 to 50 times") or a screenshot, so a long task fits before the AI runs out of room.
 
 [![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-167C4A?labelColor=0A1410)](LICENSE)
 [![Status: preview 0.1.0](https://img.shields.io/badge/status-preview%200.1.0-167C4A?labelColor=0A1410)](#status-and-limits)
