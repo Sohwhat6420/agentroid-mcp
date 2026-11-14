@@ -145,8 +145,27 @@ public final class GuardService extends Service {
 
     private static boolean eq(String a, String b) { return a == null ? b == null : a.equals(b); }
 
-    private final ConnectivityManager.NetworkCallback net =
-            Build.VERSION.SDK_INT >= 31 ? new Net(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) : new Net();
+    private ConnectivityManager.NetworkCallback net;
+    private NetworkRequest wifiRequest;
+
+    /**
+     * (Re-)register the Wi-Fi callback. Registering makes the system report every Wi-Fi network up now, with its
+     * name and access point as this app may see them NOW. So it is re-armed whenever the home setting changes: a
+     * callback registered before location access was granted holds redacted names, and deciding from those would
+     * switch Wireless debugging off under a working connection.
+     */
+    private void armNet() {
+        try { if (net != null) cm.unregisterNetworkCallback(net); } catch (Throwable ignored) { }
+        wifiIds.clear();
+        net = Build.VERSION.SDK_INT >= 31 ? new Net(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) : new Net();
+        try { cm.registerNetworkCallback(wifiRequest, net, h); } catch (Throwable t) { core.log("network callback: " + t); }
+    }
+
+    /** Decide once after a moment if no callback has decided yet (no Wi-Fi at all calls no callback). The moment lets
+     *  the networks already up arrive first, so a working connection is never switched off and on again. */
+    private void decideSoon() {
+        h.postDelayed(new Runnable() { public void run() { if (lastTrusted == null || homeDirty) checkHome(); } }, 3_000);
+    }
 
     /** On the home network now? Decided from the last-seen identity of every Wi-Fi network up (poll thread). */
     private void checkHome() {
@@ -173,17 +192,12 @@ public final class GuardService extends Service {
         h = new Handler(thread.getLooper());
         cm = getSystemService(ConnectivityManager.class);
         km = getSystemService(KeyguardManager.class);
-        try {
-            NetworkRequest wifi = new NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                    .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build();
-            cm.registerNetworkCallback(wifi, net, h);
-        } catch (Throwable t) { core.log("network callback: " + t); }
-        // No Wi-Fi at all calls no callback: decide once (home mode then switches Wireless debugging off).
-        // Wait a moment first: the callback reports the networks already up within milliseconds, and deciding before it
-        // would switch Wireless debugging off and on again under a working connection.
-        h.postDelayed(new Runnable() { public void run() { if (lastTrusted == null) checkHome(); } }, 3_000);
+        wifiRequest = new NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build();
+        armNet();
+        decideSoon();
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_SCREEN_ON);
         f.addAction(Intent.ACTION_SCREEN_OFF);
@@ -205,7 +219,7 @@ public final class GuardService extends Service {
             new SharedPreferences.OnSharedPreferenceChangeListener() {
                 public void onSharedPreferenceChanged(SharedPreferences sp, String key) {
                     if (GuardCore.KEY_HOME_SSID.equals(key) || GuardCore.KEY_HOME_BSSIDS.equals(key)) {
-                        h.post(new Runnable() { public void run() { homeDirty = true; checkHome(); } });
+                        h.post(new Runnable() { public void run() { homeDirty = true; armNet(); decideSoon(); } });
                         return;
                     }
                     if (!GuardCore.KEY_BANKS.equals(key) && !GuardCore.KEY_PAUSE_UNTIL.equals(key)) return;
