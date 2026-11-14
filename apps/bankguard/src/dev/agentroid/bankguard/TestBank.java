@@ -17,7 +17,7 @@ public final class TestBank extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         TextView t = new TextView(this);
-        t.setText("Agentroid Bank Guard: test bank (closes by itself)");
+        t.setText("Agentroid Companion: test bank (closes by itself)");
         t.setPadding(48, 96, 48, 48);
         setContentView(t);
         long ms = Math.max(1_000, Math.min(60_000, getIntent().getLongExtra("close_after_ms", 15_000)));

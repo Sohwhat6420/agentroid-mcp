@@ -51,6 +51,10 @@ public final class MainActivity extends Activity {
             startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS));
         } });
         root.addView(usage);
+        Button dock = new Button(this);
+        dock.setText("Edit the app dock");
+        dock.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { editDock(); } });
+        root.addView(dock);
         TextView hint = new TextView(this);
         hint.setText("Ticked apps switch USB and Wireless debugging off while they are open. Long-press one for a "
                 + "home-screen shortcut that switches debugging off before it opens.");
@@ -82,7 +86,7 @@ public final class MainActivity extends Activity {
         boolean usage = ao.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), getPackageName())
                 == AppOpsManager.MODE_ALLOWED;
         GuardLogic.State st = GuardCore.get(this).state();
-        status.setText("Agentroid Bank Guard\n"
+        status.setText("Agentroid Companion: bank guard\n"
                 + (wss ? "✓" : "✗") + " WRITE_SECURE_SETTINGS" + (wss ? "" : " (grant it once over adb: see the README)") + "\n"
                 + (usage ? "✓" : "✗") + " Usage access" + (usage ? "" : " (tap the button below, or grant it over adb)") + "\n"
                 + (st.held ? "Holding: debugging is off while " + st.heldPkg + " is open" : "Watching; debugging is left as it is"));
@@ -120,6 +124,19 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < apps.size(); i++) if (list.isItemChecked(i)) keep.add(apps.get(i)[1]);
         core.setBanks(keep);
         refresh();
+    }
+
+    /** The first placed dock (most phones have one). None placed: say how to add one. */
+    private void editDock() {
+        int[] ids = android.appwidget.AppWidgetManager.getInstance(this)
+                .getAppWidgetIds(new android.content.ComponentName(this, DockWidget.class));
+        if (ids.length == 0) {
+            Toast.makeText(this, "Add it first: long-press the home screen, Widgets, Agentroid Companion, App dock",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        startActivity(new Intent(this, DockConfigActivity.class)
+                .putExtra(android.appwidget.AppWidgetManager.EXTRA_APPWIDGET_ID, ids[0]));
     }
 
     private void pin(String[] app) {

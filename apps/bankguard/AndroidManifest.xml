@@ -20,16 +20,21 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- To list the apps the owner can tick, and to open a ticked bank from its shortcut. -->
+    <!-- To list the apps the owner can tick or put in the dock, to open them, and to open the clock app. -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <intent>
+            <action android:name="android.intent.action.SHOW_ALARMS" />
+        </intent>
     </queries>
 
+    <!-- "Agentroid Companion": the bank guard and the home-screen widgets (dot clocks, app dock) in one small app.
+         The widget picker lists them under this name. -->
     <application
-        android:label="Agentroid Bank Guard"
+        android:label="Agentroid Companion"
         android:icon="@android:drawable/ic_lock_lock"
         android:allowBackup="false">
 
@@ -93,6 +98,48 @@
                 <action android:name="dev.agentroid.bankguard.SET" />
             </intent-filter>
         </receiver>
+
+        <!-- Home-screen widgets. Exported: the launcher's AppWidget service sends them APPWIDGET_UPDATE. None has a
+             timer (updatePeriodMillis 0) and none sets an alarm: the clocks are TextClocks, ticking in the launcher. -->
+        <receiver
+            android:name=".ClockWidget$Row"
+            android:label="@string/clock_row_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/clock_row_info" />
+        </receiver>
+        <receiver
+            android:name=".ClockWidget$Large"
+            android:label="@string/clock_large_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/clock_large_info" />
+        </receiver>
+        <receiver
+            android:name=".DockWidget"
+            android:label="@string/dock_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/dock_info" />
+        </receiver>
+        <!-- EXPORTED for the launcher (APPWIDGET_CONFIGURE). It only edits a dock widget of THIS app: it checks that
+             the widget id belongs to DockWidget and closes otherwise. -->
+        <activity
+            android:name=".DockConfigActivity"
+            android:exported="true"
+            android:label="@string/dock_label"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
 
         <!-- EXPORTED and read-only: the keeper asks it before switching Wireless debugging back on. It answers
              held=1/0 and nothing else (see HoldProvider). -->

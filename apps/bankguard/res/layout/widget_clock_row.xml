@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dot clock (row): [ 06:27 ] ( 14 ) ( SAT ). Three TextClocks tick inside the home screen's process, so this app
+     sets no alarm and never wakes the phone. Weights 2:1:1 match the reference widget's proportions. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/w_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:gravity="center_vertical">
+
+    <TextClock
+        android:id="@+id/w_time"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="2"
+        android:layout_marginEnd="3dp"
+        android:background="@drawable/w_pill"
+        android:gravity="center"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:paddingTop="16dp"
+        android:paddingBottom="16dp"
+        android:maxLines="1"
+        android:format12Hour="hh:mm"
+        android:format24Hour="HH:mm"
+        android:fontFamily="@font/doto_clock"
+        android:textColor="@color/w_ink"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="14sp"
+        android:autoSizeMaxTextSize="64sp"
+        android:importantForAccessibility="yes" />
+
+    <TextClock
+        android:id="@+id/w_date"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:layout_marginEnd="3dp"
+        android:background="@drawable/w_pill_red"
+        android:gravity="center"
+        android:padding="16dp"
+        android:maxLines="1"
+        android:format12Hour="d"
+        android:format24Hour="d"
+        android:fontFamily="@font/doto_clock"
+        android:textColor="@color/w_ink"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="12sp"
+        android:autoSizeMaxTextSize="48sp" />
+
+    <TextClock
+        android:id="@+id/w_day"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:background="@drawable/w_pill"
+        android:gravity="center"
+        android:padding="16dp"
+        android:maxLines="1"
+        android:format12Hour="EEE"
+        android:format24Hour="EEE"
+        android:textAllCaps="true"
+        android:fontFamily="@font/doto_clock"
+        android:textColor="@color/w_ink"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="12sp"
+        android:autoSizeMaxTextSize="40sp" />
+</LinearLayout>

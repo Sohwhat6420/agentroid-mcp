@@ -9,15 +9,16 @@ SDK="${ANDROID_HOME:-${LOCALAPPDATA:-$HOME/AppData/Local}/Android/Sdk}"
 BT="$SDK/build-tools/36.0.0"
 ANDROID_JAR="$SDK/platforms/android-36/android.jar"
 OUT="$HERE/out"
-rm -rf "$OUT/classes" "$OUT/dex" "$OUT"/*.apk
-mkdir -p "$OUT/classes" "$OUT/dex"
+rm -rf "$OUT/classes" "$OUT/dex" "$OUT/gen" "$OUT/res.zip" "$OUT"/*.apk
+mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/gen"
 
-# No resources of its own: the label is in the manifest and the icons are Android's.
+# Resources: the widgets' layouts, shapes and the DotoClock font (res/). aapt2 writes R.java for javac.
+"$BT/aapt2" compile --dir "$HERE/res" -o "$OUT/res.zip"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$ANDROID_JAR" --manifest "$HERE/AndroidManifest.xml" \
-    --min-sdk-version 29 --target-sdk-version 36 --debug-mode
+    --min-sdk-version 29 --target-sdk-version 36 --debug-mode --java "$OUT/gen" "$OUT/res.zip"
 
 javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -bootclasspath "$ANDROID_JAR" \
-    -classpath "$BT/core-lambda-stubs.jar" -d "$OUT/classes" $(find "$HERE/src" -name '*.java')
+    -classpath "$BT/core-lambda-stubs.jar" -d "$OUT/classes" $(find "$HERE/src" "$OUT/gen" -name '*.java')
 
 java -cp "$BT/lib/d8.jar" com.android.tools.r8.D8 --release --min-api 29 --lib "$ANDROID_JAR" --output "$OUT/dex" \
     $(find "$OUT/classes" -name '*.class')
