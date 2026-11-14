@@ -7,12 +7,15 @@ import android.database.MatrixCursor;
 import android.net.Uri;
 
 /**
- * content://dev.agentroid.bankguard.hold answers one row, one column: held (1 or 0). The Agentroid keeper asks it
- * before it switches Wireless debugging back on, so the two apps never fight over the setting.
+ * content://dev.agentroid.bankguard.hold answers one row, one column: held (1 or 0), meaning "keeper, leave Wireless
+ * debugging off now". The Agentroid keeper asks it before it switches Wireless debugging back on, so the two apps
+ * never fight over the setting.
  *
- * <p>Readable by any app on purpose, and read-only. It tells nothing a reader cannot already see: any app can read
- * Settings.Global adb_enabled and adb_wifi_enabled, and so see that debugging was switched off. It never says which
- * app is open. A hold the guard stopped refreshing (a dead guard) reads as 0 after {@link GuardLogic#HOLD_STALE_MS}.
+ * <p>Readable by any app on purpose, and read-only. It answers 1 only when the guard itself switched Wireless
+ * debugging off (a live hold that will put it back, or a release that had to leave it off), so it tells a reader no
+ * more than Settings.Global adb_wifi_enabled already does: that Wireless debugging is off. It never says which app is
+ * open, and a bank opened with Wireless debugging already off reads 0. A hold the guard stopped refreshing (a dead
+ * guard) reads 0 after {@link GuardLogic#HOLD_STALE_MS}.
  */
 public final class HoldProvider extends ContentProvider {
     @Override public boolean onCreate() { return true; }
@@ -20,7 +23,7 @@ public final class HoldProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] args, String sort) {
         MatrixCursor c = new MatrixCursor(new String[] {"held"}, 1);
-        c.addRow(new Object[] {GuardCore.get(getContext()).holdLive() ? 1 : 0});
+        c.addRow(new Object[] {GuardCore.get(getContext()).keeperShouldWait() ? 1 : 0});
         return c;
     }
 

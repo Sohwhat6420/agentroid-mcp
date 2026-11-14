@@ -50,11 +50,13 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.NoDisplay" />
 
-        <!-- EXPORTED so `adb shell am start` can open it in tests. It is a screen that closes itself; it is a bank
-             only on a list that names it. -->
+        <!-- EXPORTED so `adb shell am start` can open it in tests, behind DUMP: only the adb shell (and this app)
+             can start it, so no other app can use a listed test bank to cut debugging. It is a screen that closes
+             itself; it is a bank only on a list that names it. -->
         <activity
             android:name=".TestBank"
             android:exported="true"
+            android:permission="android.permission.DUMP"
             android:excludeFromRecents="true" />
 
         <!-- EXPORTED only so `adb shell am start-foreground-service` can start it at setup: only a caller holding

@@ -2,6 +2,7 @@ package dev.agentroid.bankguard;
 
 import android.app.AlarmManager;
 import android.app.AppOpsManager;
+import android.app.KeyguardManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -14,10 +15,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -29,12 +33,15 @@ import android.os.UserManager;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 /**
- * Polls the foreground app (UsageStatsManager, Usage Access; never an AccessibilityService) about every 400 ms while the
- * screen is on, and hands each reading to {@link GuardCore#tick}. Stops polling with the screen off; a held guard is
- * then woken once after {@link GuardLogic#SCREEN_OFF_RELEASE_MS} by an alarm, so a bank left open under a locked screen
- * does not keep debugging off all night.
+ * Polls UsageEvents (Usage Access; never an AccessibilityService) about every 400 ms while the screen is on, keeps the
+ * set of VISIBLE activities (so a bank in split screen, or under a dialog, still counts), and hands each reading to
+ * {@link GuardCore#tick}. A locked screen counts as off. Stops polling with the screen off; a held guard is then woken
+ * once after {@link GuardLogic#SCREEN_OFF_RELEASE_MS} by an alarm, so a bank left open under a locked screen does not
+ * keep debugging off all night.
  */
 public final class GuardService extends Service {
     static final String ACTION_RELEASE = "dev.agentroid.bankguard.RELEASE";   // notification: debugging back on now
@@ -43,6 +50,7 @@ public final class GuardService extends Service {
     static final String ACTION_TICK = "dev.agentroid.bankguard.TICK";         // alarm after screen-off
     static final String EXTRA_BOOT = "boot";
     static final long POLL_MS = 400;
+    private static final long OVERLAP_MS = 5_000; // re-read this much of the last query: late events still count
     private static final int NOTE_ID = 1, NOTE_WIFI = 2, NOTE_REOPEN = 3;
     private static final String CH_STATUS = "status", CH_WIFI = "wifi"; // CH_WIFI: things the owner may act on
 
@@ -51,11 +59,15 @@ public final class GuardService extends Service {
     private Handler h;
     private UsageStatsManager usm;
     private ConnectivityManager cm;
-    private volatile boolean screenOn = true;
-    private volatile boolean onWifi;
-    private volatile long network;
-    private String fg;
-    private long fgSince, lastResumeTs, queriedTo;
+    private KeyguardManager km;
+    private boolean interactive = true;
+    // Wi-Fi networks up now (handles in this boot), from a TRANSPORT_WIFI request that does not ask for internet:
+    // an adb LAN with no internet still counts. All on the poll thread.
+    private final Set<Long> wifiUp = new LinkedHashSet<Long>();
+    private long network;
+    private final GuardLogic.Visible visible = new GuardLogic.Visible();
+    private long queriedTo, bankSinceWall;
+    private String home;
     private boolean polling;
     private String shownText;
     private long ticks, tickNanos;
@@ -63,18 +75,27 @@ public final class GuardService extends Service {
     private final Runnable poll = new Runnable() { public void run() { pollOnce(); } };
 
     private final BroadcastReceiver screen = new BroadcastReceiver() {
-        @Override public void onReceive(Context c, Intent i) {
-            screenOn = Intent.ACTION_SCREEN_ON.equals(i.getAction()) || Intent.ACTION_USER_PRESENT.equals(i.getAction());
-            h.post(new Runnable() { public void run() { onScreen(); } });
+        @Override public void onReceive(Context c, final Intent i) {
+            h.post(new Runnable() { public void run() {
+                interactive = !Intent.ACTION_SCREEN_OFF.equals(i.getAction());
+                onScreen();
+            } });
         }
     };
 
     private final ConnectivityManager.NetworkCallback net = new ConnectivityManager.NetworkCallback() {
-        @Override public void onCapabilitiesChanged(Network n, NetworkCapabilities caps) {
-            onWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
-            network = onWifi ? n.getNetworkHandle() : 0;
+        @Override public void onAvailable(Network n) {
+            wifiUp.add(n.getNetworkHandle());
+            if (network == 0) network = n.getNetworkHandle();
         }
-        @Override public void onLost(Network n) { onWifi = false; network = 0; }
+        @Override public void onLost(Network n) {
+            long gone = n.getNetworkHandle();
+            wifiUp.remove(gone);
+            if (gone == network) {
+                network = wifiUp.isEmpty() ? 0 : wifiUp.iterator().next();
+                core.wifiGone();
+            }
+        }
     };
 
     @Override public IBinder onBind(Intent i) { return null; }
@@ -89,21 +110,33 @@ public final class GuardService extends Service {
         thread.start();
         h = new Handler(thread.getLooper());
         cm = getSystemService(ConnectivityManager.class);
-        try { cm.registerDefaultNetworkCallback(net, h); } catch (Throwable t) { core.log("network callback: " + t); }
+        km = getSystemService(KeyguardManager.class);
+        try {
+            NetworkRequest wifi = new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build();
+            cm.registerNetworkCallback(wifi, net, h);
+        } catch (Throwable t) { core.log("network callback: " + t); }
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_SCREEN_ON);
         f.addAction(Intent.ACTION_SCREEN_OFF);
         f.addAction(Intent.ACTION_USER_PRESENT);
         registerReceiver(screen, f);
         PowerManager pm = getSystemService(PowerManager.class);
-        screenOn = pm == null || pm.isInteractive();
+        interactive = pm == null || pm.isInteractive();
         core.prefs().registerOnSharedPreferenceChangeListener(prefsChanged);
     }
 
     private final SharedPreferences.OnSharedPreferenceChangeListener prefsChanged =
             new SharedPreferences.OnSharedPreferenceChangeListener() {
                 public void onSharedPreferenceChanged(SharedPreferences sp, String key) {
-                    if (GuardCore.KEY_BANKS.equals(key) || GuardCore.KEY_PAUSE_UNTIL.equals(key)) h.post(poll);
+                    if (!GuardCore.KEY_BANKS.equals(key) && !GuardCore.KEY_PAUSE_UNTIL.equals(key)) return;
+                    h.post(new Runnable() { public void run() {
+                        if (!polling) return;
+                        h.removeCallbacks(poll); // one poll chain, never two
+                        pollOnce();
+                    } });
                 }
             };
 
@@ -111,18 +144,21 @@ public final class GuardService extends Service {
     public int onStartCommand(Intent i, int flags, int startId) {
         final String action = i == null ? null : i.getAction();
         final boolean boot = i != null && i.getBooleanExtra(EXTRA_BOOT, false);
+        // Every start may come from startForegroundService (boot, the alarm, the shortcut): be in the foreground again.
+        startInForeground(shownText == null ? "Watching" : shownText);
         h.post(new Runnable() { public void run() {
-            if (boot) core.releaseNow("release_boot", onWifi, network); // after a reboot no bank is in front
+            if (boot) leftOffNote(core.bootRelease());
             if (ACTION_RELEASE.equals(action)) {
                 core.pauseFor(2 * 60_000L); // or the bank still in front would hold again at once
-                core.releaseNow("release_owner", onWifi, network);
+                leftOffNote(core.releaseNow("release_owner", network != 0, network));
+                shownText = null;
             } else if (ACTION_PAUSE.equals(action)) {
-                boolean paused = core.paused(System.currentTimeMillis());
+                boolean paused = core.paused();
                 core.pauseFor(paused ? 0 : 60 * 60_000L);
-                if (!paused) core.releaseNow("release_paused", onWifi, network);
+                if (!paused) leftOffNote(core.releaseNow("release_paused", network != 0, network));
+                shownText = null;
             } else if (ACTION_WIFI_ON.equals(action)) {
-                core.wifiOnByOwner();
-                cancelWifiNote();
+                if (core.wifiOnByOwner()) cancelWifiNote();
             }
             onScreen();
         } });
@@ -130,9 +166,10 @@ public final class GuardService extends Service {
     }
 
     private void onScreen() {
-        if (screenOn) {
+        if (interactive) {
             cancelAlarm();
-            if (!polling) { polling = true; queriedTo = 0; h.post(poll); }
+            home = homePackage();
+            if (!polling) { polling = true; h.removeCallbacks(poll); h.post(poll); }
         } else {
             polling = false;
             h.removeCallbacks(poll);
@@ -143,21 +180,25 @@ public final class GuardService extends Service {
 
     private void pollOnce() {
         long t0 = System.nanoTime();
-        long now = System.currentTimeMillis();
         boolean unlocked = getSystemService(UserManager.class).isUserUnlocked();
         if (!unlocked || !usageAccess()) {
-            show(!unlocked ? "Waiting for the first unlock" : "Needs Usage access: open Agentroid Bank Guard");
+            show(!unlocked ? "Waiting for the first unlock" : "Needs Usage access: open Agentroid Companion");
             again();
             return;
         }
-        if (core.paused(now)) {
+        if (core.paused()) {
             show("Paused: debugging is left as it is");
             again();
             return;
         }
-        readForeground(now);
-        GuardLogic.Action a = core.tick(fg, fgSince, onWifi, network, screenOn);
-        if (a.event != null && a.event.endsWith("_wifi_left_off")) wifiNote();
+        readVisible();
+        String bank = visible.bank(core.banks());
+        String fg = visible.top;
+        boolean locked = km != null && km.isKeyguardLocked();
+        boolean screenOn = interactive && !locked; // a bank behind the keyguard is not in front
+        boolean fgIsHome = fg != null && home != null && home.equals(GuardLogic.pkgOf(fg));
+        GuardLogic.Action a = core.tick(fg, bank, fgIsHome, network != 0, network, screenOn, bankSinceWall);
+        leftOffNote(a);
         // The poll caught a bank opened directly while debugging was on: its start-up check may already have seen it.
         if ("hold".equals(a.event) && a.writes()) reopenNote(core.state().heldPkg);
         GuardLogic.State st = core.state();
@@ -167,23 +208,40 @@ public final class GuardService extends Service {
         again();
     }
 
-    private void again() { if (polling && screenOn) h.postDelayed(poll, POLL_MS); }
+    private void again() { if (polling && interactive) h.postDelayed(poll, POLL_MS); }
 
-    /** The latest app to come in front. queryEvents from where the last query stopped; on the first query, the last 6 h. */
-    private void readForeground(long now) {
-        long from = queriedTo == 0 ? now - 6 * 3_600_000L : queriedTo - 1_000;
+    /**
+     * Applies new UsageEvents to the visible set, in order. Each query re-reads the last OVERLAP_MS (replaying events
+     * is harmless), so events reported late still count. The first query, and any query after the wall clock moved
+     * back, rebuilds the set from the last 6 h. UsageEvents carry wall-clock times; nothing here compares them with
+     * each other, so a clock change cannot freeze the set.
+     */
+    private void readVisible() {
+        long now = System.currentTimeMillis();
+        long from;
+        if (queriedTo == 0 || now < queriedTo - OVERLAP_MS) { visible.clear(); from = now - 6 * 3_600_000L; }
+        else from = queriedTo - OVERLAP_MS;
         UsageEvents ev = usm().queryEvents(from, now);
         UsageEvents.Event e = new UsageEvents.Event();
+        Set<String> banks = core.banks();
         while (ev != null && ev.hasNextEvent()) {
             ev.getNextEvent(e);
-            if (e.getEventType() != UsageEvents.Event.ACTIVITY_RESUMED || e.getTimeStamp() < lastResumeTs) continue;
-            lastResumeTs = e.getTimeStamp();
-            // fgSince is when this app came in front: a second activity of the same app does not move it
-            String now2 = e.getPackageName() + "/" + e.getClassName();
-            if (!GuardLogic.pkgOf(now2).equals(GuardLogic.pkgOf(fg))) fgSince = e.getTimeStamp();
-            fg = now2;
+            int type = e.getEventType();
+            if (type != GuardLogic.EV_RESUMED && type != GuardLogic.EV_STOPPED && type != GuardLogic.EV_DESTROYED) continue;
+            visible.event(type, e.getPackageName(), e.getClassName());
+            if (type == GuardLogic.EV_RESUMED && GuardLogic.isBank(banks, e.getPackageName() + "/" + e.getClassName())) {
+                bankSinceWall = e.getTimeStamp();
+            }
         }
         queriedTo = now;
+    }
+
+    private String homePackage() {
+        try {
+            ResolveInfo r = getPackageManager().resolveActivity(
+                    new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), PackageManager.MATCH_DEFAULT_ONLY);
+            return r == null || r.activityInfo == null ? null : r.activityInfo.packageName;
+        } catch (Throwable t) { return null; }
     }
 
     private UsageStatsManager usm() {
@@ -206,7 +264,7 @@ public final class GuardService extends Service {
     // ------------------------------------------------------------------------------------------- the alarm
 
     private PendingIntent tickIntent() {
-        return PendingIntent.getService(this, 3, new Intent(this, GuardService.class).setAction(ACTION_TICK),
+        return PendingIntent.getForegroundService(this, 3, new Intent(this, GuardService.class).setAction(ACTION_TICK),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
@@ -227,21 +285,23 @@ public final class GuardService extends Service {
         nm.createNotificationChannel(new NotificationChannel(CH_WIFI, "Bank guard notices", NotificationManager.IMPORTANCE_DEFAULT));
     }
 
+    /** One-shot: a button works once, and the next status note carries a fresh one. Anything that can read
+     *  notifications (a listener, a watch bridge) cannot replay it later. */
     private PendingIntent self(String action, int code) {
         return PendingIntent.getService(this, code, new Intent(this, GuardService.class).setAction(action),
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_ONE_SHOT);
     }
 
     private Notification status(String text) {
         Notification.Builder b = new Notification.Builder(this, CH_STATUS)
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
-                .setContentTitle("Agentroid Bank Guard")
+                .setContentTitle("Bank guard")
                 .setContentText(text)
                 .setOngoing(true)
                 .setContentIntent(PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE))
                 .addAction(new Notification.Action.Builder(null, "Debugging back on", self(ACTION_RELEASE, 1)).build())
                 .addAction(new Notification.Action.Builder(null,
-                        core.paused(System.currentTimeMillis()) ? "Resume" : "Pause 1 h", self(ACTION_PAUSE, 2)).build());
+                        core.paused() ? "Resume" : "Pause 1 h", self(ACTION_PAUSE, 2)).build());
         return b.build();
     }
 
@@ -257,11 +317,13 @@ public final class GuardService extends Service {
         getSystemService(NotificationManager.class).notify(NOTE_ID, status(text));
     }
 
-    private void wifiNote() {
+    /** Every path that releases can leave Wireless debugging off; each one tells the owner. */
+    private void leftOffNote(GuardLogic.Action a) {
+        if (a == null || a.event == null || !a.event.endsWith("_wifi_left_off")) return;
         Notification n = new Notification.Builder(this, CH_WIFI)
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .setContentTitle("Wireless debugging stayed off")
-                .setContentText("The Wi-Fi network changed while a bank app was open. Tap to turn it back on.")
+                .setContentText("The Wi-Fi network changed (or the phone restarted) while a bank app was open. Tap to turn it back on.")
                 .setAutoCancel(true)
                 .setContentIntent(self(ACTION_WIFI_ON, 4))
                 .build();
@@ -287,7 +349,8 @@ public final class GuardService extends Service {
     @Override
     protected void dump(FileDescriptor fd, PrintWriter w, String[] args) {
         w.print(core.dump());
-        w.println("screen_on=" + screenOn + " on_wifi=" + onWifi + " polling=" + polling + " fg=" + fg
+        w.println("interactive=" + interactive + " wifi_networks=" + wifiUp.size() + " polling=" + polling
+                + " top=" + visible.top + " visible=" + visible.size() + " home=" + home
                 + " ticks=" + ticks + " mean_tick_us=" + (ticks == 0 ? 0 : tickNanos / ticks / 1000));
     }
 

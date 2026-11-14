@@ -8,10 +8,10 @@ import android.net.NetworkCapabilities;
 import android.os.Bundle;
 
 /**
- * The home-screen shortcut "Open UOB TMRW safely": debugging goes off FIRST, then the bank opens. A bank that checks
- * in its first screen's onCreate never sees debugging on, which the poll alone cannot promise.
- * Not exported: only this app's own pinned shortcuts (started by the launcher on this app's behalf) reach it, and
- * the package must be on the bank list.
+ * The home-screen shortcut "Open UOB TMRW safely": debugging goes off FIRST, then the bank opens, and the guard holds
+ * for {@link GuardLogic#LAUNCH_MS} while the bank starts (a bank's start-up checks can take seconds before its first
+ * screen shows). Not exported: only this app's own pinned shortcuts and widgets (started on this app's behalf) reach
+ * it, and the package must be on the bank list.
  */
 public final class OpenSafely extends Activity {
     static final String EXTRA_PKG = "pkg";
@@ -23,14 +23,26 @@ public final class OpenSafely extends Activity {
         GuardCore core = GuardCore.get(this);
         Intent launch = pkg == null ? null : getPackageManager().getLaunchIntentForPackage(pkg);
         if (pkg != null && GuardLogic.isBank(core.banks(), pkg) && launch != null) {
-            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
-            Network n = cm.getActiveNetwork();
-            NetworkCapabilities caps = n == null ? null : cm.getNetworkCapabilities(n);
-            boolean wifi = caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
-            core.holdNow(pkg, wifi, wifi ? n.getNetworkHandle() : 0);
+            long wifi = wifiHandle();
+            core.holdNow(pkg, wifi != 0, wifi);
             startForegroundService(new Intent(this, GuardService.class));
             startActivity(launch);
+        } else if (launch != null) {
+            startActivity(launch); // not a bank (any more): just open it
         }
         finish();
+    }
+
+    /** The Wi-Fi network's handle, internet or not (an adb LAN may have none), or 0. */
+    @SuppressWarnings("deprecation")
+    private long wifiHandle() {
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            for (Network n : cm.getAllNetworks()) {
+                NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return n.getNetworkHandle();
+            }
+        } catch (Throwable ignored) { }
+        return 0;
     }
 }
