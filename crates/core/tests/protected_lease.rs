@@ -811,6 +811,12 @@ fn an_explicit_re_allow_lifts_a_hold() {
         r.book.active().unwrap().granted,
         Granted::Approved { .. }
     ));
+    // the Deny already applied counts once: the Deny polls of the re-allowed lease do not close it
+    for _ in 0..3 {
+        r.wall.advance(11_000);
+        r.call(&at(100.0, 300.0))
+            .expect("the old Deny does not close the re-allowed lease");
+    }
 }
 
 #[test]
