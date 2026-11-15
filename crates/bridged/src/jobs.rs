@@ -276,6 +276,13 @@ pub struct Jobs {
 }
 
 impl Jobs {
+    /// Does `device` have a job that is running or paused? Such a job keeps its lease from lapsing.
+    pub(crate) fn device_live(&self, device: &str) -> bool {
+        self.map().values().any(|j| {
+            j.meta.device == device && (j.st().status == "running" || is_paused(j.st().status))
+        })
+    }
+
     fn map(&self) -> MutexGuard<'_, HashMap<String, Arc<Job>>> {
         self.map
             .lock()

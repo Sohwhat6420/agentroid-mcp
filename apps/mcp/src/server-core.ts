@@ -138,7 +138,17 @@ export interface ServerOptions {
   watch?: boolean;
   /** Poll interval for `watch`. */
   pollMs?: number;
+  /**
+   * Give a lease back after this long with no device call from this server (default 10 minutes; 0: never).
+   * A server lives as long as its client's session, so without this a session that drove a phone once keeps
+   * it locked for every other agent until the session ends. A device with a job this server started and has
+   * not seen end is never released here (the daemon keeps a live job's lease too).
+   */
+  leaseIdleMs?: number;
 }
+
+/** The default of `leaseIdleMs`, and the daemon's own `--lease-idle-secs` default. */
+export const LEASE_IDLE_MS = 10 * 60 * 1000;
 
 export interface Server {
   instructions: string;
@@ -205,6 +215,35 @@ export function createServer(opts: ServerOptions): Server {
   const deadline = Math.max(1, Math.min(opts.callDeadlineMs ?? CALL_DEADLINE_MS, CALL_DEADLINE_MS));
   const supervisor = opts.supervisor ?? new Supervisor();
   const runDevice = new Map<string, string>(); // run id -> device key, for jobs this server saw start
+  const ended = new Set<string>(); // run ids this server has seen reach a terminal status
+  const lastUse = new Map<string, number>(); // device key -> wall ms of this server's last call on it
+  const leaseIdle = Math.max(0, opts.leaseIdleMs ?? LEASE_IDLE_MS);
+  let idleTimer: unknown;
+  /** A job this server started or saw on `key` and has not seen end. */
+  const jobLive = (key: string): boolean => [...runDevice.entries()].some(([run, dev]) => dev === key && !ended.has(run));
+  function touch(key: string): void {
+    lastUse.set(key, now());
+    if (leaseIdle > 0 && idleTimer === undefined) idleTimer = timers.setInterval(() => void releaseIdle(), Math.min(leaseIdle, 60_000));
+  }
+  /** Give back every lease idle for `leaseIdle` (or every lease, when `all`), except under a live job. */
+  async function releaseIdle(all = false): Promise<void> {
+    const t = now();
+    for (const key of [...held.keys()]) {
+      if (jobLive(key)) continue;
+      if (!all && t - (lastUse.get(key) ?? 0) < leaseIdle) continue;
+      held.delete(key);
+      lastUse.delete(key);
+      try {
+        await daemon.request("lease.release", { device: key }, { timeoutMs: 5_000 });
+      } catch {
+        // already gone (the daemon lapsed it, or the device vanished): nothing to give back
+      }
+    }
+    if (held.size === 0 && idleTimer !== undefined) {
+      timers.clearInterval(idleTimer);
+      idleTimer = undefined;
+    }
+  }
 
   // ---- the job watcher (opts.watch): polls job.status for jobs not yet ended ----
   const watched = new Map<string, number>(); // run id -> consecutive poll failures
@@ -212,6 +251,7 @@ export function createServer(opts: ServerOptions): Server {
   let polling = false;
   function watchJob(runId: string, status: string): void {
     if (TERMINAL.has(status)) {
+      ended.add(runId);
       watched.delete(runId);
     } else if (opts.watch === true) {
       if (!watched.has(runId)) watched.set(runId, 0);
@@ -279,11 +319,15 @@ export function createServer(opts: ServerOptions): Server {
   }
 
   async function ensureLease(key: string): Promise<void> {
-    if (held.get(key) === daemon.connectionEpoch) return;
+    if (held.get(key) === daemon.connectionEpoch) {
+      touch(key);
+      return;
+    }
     const res = await rpc("lease.acquire", { device: key });
     const issues = validate(res, LEASE_SCHEMA);
     if (issues.length > 0) throw fail("bad_reply", `bridged sent a malformed lease.acquire reply: ${describeIssues(issues)}`);
     held.set(key, daemon.connectionEpoch);
+    touch(key);
   }
 
   function shapeText(text: string, level: Level): { text: string; truncated?: boolean } {
@@ -326,6 +370,7 @@ export function createServer(opts: ServerOptions): Server {
         const issues = validate(res, LEASE_SCHEMA);
         if (issues.length > 0) throw fail("bad_reply", `bridged sent a malformed lease.acquire reply: ${describeIssues(issues)}`);
         held.set(row.device, daemon.connectionEpoch);
+        touch(row.device);
         const l = res as { holder: string; epoch: number };
         return { data: { lease: res as Record<string, unknown> }, observation: ctx.observation, body: `lease on ${row.device} taken by ${l.holder} (epoch ${l.epoch})` };
       }
@@ -334,6 +379,7 @@ export function createServer(opts: ServerOptions): Server {
         const issues = validate(res, RELEASED_SCHEMA);
         if (issues.length > 0) throw fail("bad_reply", `bridged sent a malformed lease.release reply: ${describeIssues(issues)}`);
         held.delete(row.device);
+        lastUse.delete(row.device);
         const released = (res as { released: boolean }).released;
         return { data: { released }, observation: ctx.observation, body: released ? `lease on ${row.device} released` : `${row.device} was not leased` };
       }
@@ -348,12 +394,25 @@ export function createServer(opts: ServerOptions): Server {
     const row = pickDevice(await readDevices(), args.device);
     ctx.device = row.device;
     ctx.observation = identity(row);
-    await ensureLease(row.device);
+    // A read takes no lease, so a session that only looks never locks the phone for anyone else (15 Nov 2026:
+    // a session that had driven the phone once held it about 18 h, and other agents could not even look).
+    if (!def.read) await ensureLease(row.device);
+    else if (held.has(row.device)) touch(row.device);
     const { device: _device, level: _level, ...rest } = args;
     // require, retry and verify ride along inside the call, for the daemon to enforce
     const retry = typeof args.retry === "number" ? args.retry : 0;
     const base = def.name === "wait" && typeof args.seconds === "number" ? CALL_TIMEOUT_MS + args.seconds * 1000 : CALL_TIMEOUT_MS;
-    const res = await rpc("device.call", { device: row.device, call: { tool: def.name, ...rest } }, clampTimeout(base * (1 + retry)));
+    const call = (): Promise<unknown> => rpc("device.call", { device: row.device, call: { tool: def.name, ...rest } }, clampTimeout(base * (1 + retry)));
+    let res: unknown;
+    try {
+      res = await call();
+    } catch (e) {
+      // an older daemon still wants a lease for reads: take it and ask once more
+      const f = e instanceof ToolFailure ? e : mapDaemonError(e);
+      if (!def.read || f.err.kind !== "not_holder" || !/do not hold a lease/.test(f.err.message)) throw f;
+      await ensureLease(row.device);
+      res = await call();
+    }
     const issues = validate(res, CALL_RESULT_SCHEMA);
     if (issues.length > 0) throw fail("bad_reply", `bridged sent a malformed device.call reply: ${describeIssues(issues)}`);
     const { health, ...payload } = res as Record<string, unknown>;
@@ -692,6 +751,8 @@ export function createServer(opts: ServerOptions): Server {
       watched.clear();
       if (poll !== undefined) timers.clearInterval(poll);
       poll = undefined;
+      // give every lease back (a live job's excepted); the daemon also frees them when the connection closes
+      void releaseIdle(true);
     },
     callTool: async (name, args, extra) => {
       try {

@@ -390,8 +390,15 @@ impl Daemon {
         let p: DeviceCallParams = parse_params(params)?;
         let dev = self.resolve(&p.device)?;
         let key = device_key(&dev);
-        self.require_holder(&key, conn_id)?;
-        self.keep_awake(conn_id, &key, &dev);
+        // A read needs no lease: a session that only looks never locks the phone, and a look still works
+        // while another session holds it. It still passes the allowlist and the gate (the device mode and
+        // the protected-phone rule) in run_tool, and it does not count as working the phone (no stay-awake).
+        if p.call.tool.is_read() && self.registry.check_holder(&key, conn_id).is_err() {
+            self.require_allowed(&dev)?;
+        } else {
+            self.require_holder(&key, conn_id)?;
+            self.keep_awake(conn_id, &key, &dev);
+        }
         match self.run_tool(&dev, &key, &p.call) {
             Ok((d, attempts)) => {
                 let health = self.health_member(&dev);

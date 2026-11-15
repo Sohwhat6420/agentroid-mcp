@@ -411,6 +411,37 @@ pub enum Tool {
     },
 }
 
+impl Tool {
+    /// A read: nothing on the phone changes, so it needs no lease (another session may hold one).
+    /// The match is exhaustive on purpose: a new tool cannot be added without deciding this.
+    /// `doctor`, `push` and `pull_new` count as not reads (they move data or run commands).
+    pub fn is_read(&self) -> bool {
+        match self {
+            Tool::Look { .. }
+            | Tool::Screenshot { .. }
+            | Tool::UiTree { .. }
+            | Tool::ListApps { .. }
+            | Tool::Wait { .. }
+            | Tool::Getprop { .. }
+            | Tool::PixelProbe { .. } => true,
+            Tool::Tap { .. }
+            | Tool::LongPress { .. }
+            | Tool::Swipe { .. }
+            | Tool::Scroll { .. }
+            | Tool::TypeText { .. }
+            | Tool::Key { .. }
+            | Tool::Unlock { .. }
+            | Tool::OpenApp { .. }
+            | Tool::OpenUrl { .. }
+            | Tool::StartActivity { .. }
+            | Tool::SetValue { .. }
+            | Tool::Doctor { .. }
+            | Tool::PullNew { .. }
+            | Tool::Push { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeviceCallParams {
     pub device: String,

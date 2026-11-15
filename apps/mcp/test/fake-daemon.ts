@@ -50,6 +50,8 @@ export const STRANGER: FakeDevice = { device: "STRANGER0001", serial: "192.0.2.9
 // the tools the daemon serves since 2.4 (crates/bridged/src/devcall.rs, and devtools.rs for doctor, push and pull_new)
 const SERVED = ["look", "screenshot", "ui_tree", "getprop", "tap", "long_press", "swipe", "scroll", "type_text", "key", "unlock", "open_app", "open_url", "start_activity", "list_apps", "wait", "set_value", "pixel_probe", "doctor", "push", "pull_new"];
 const ACTING = ["tap", "long_press", "swipe", "scroll", "type_text", "key", "unlock", "open_app", "open_url", "start_activity"];
+// the reads bridged serves without a lease (proto.rs Tool::is_read)
+const READS = ["look", "screenshot", "ui_tree", "list_apps", "wait", "getprop", "pixel_probe"];
 // The getprop keys among the protected phone's approved probes, read from the one list (probes/readonly-s24.txt,
 // the approved set of 10), the same file guard.rs builds S24_READS from. The other approved
 // lines (wm, pm, dumpsys) are probe-internal and have no MCP tool.
@@ -79,6 +81,8 @@ export class FakeDaemon {
   serveAll = false;
   /** Delay before every reply, ms. */
   delayMs = 0;
+  /** A daemon from before 15 Nov 2026 that wants a lease for reads too (the client falls back to taking one). */
+  leaseForReads = false;
   /**
    * The statuses successive job.status calls report for each job (the last one repeats). A step
    * is "done" per status seen, so routine progress shows as `running` with a rising count.
@@ -292,10 +296,14 @@ export class FakeDaemon {
     const d = this.devices.find((x) => x.serial === p.device || x.hw_serial === p.device);
     if (!d) return err(CODE.UNKNOWN_DEVICE, `no connected device matches ${JSON.stringify(p.device)}`);
     const held = this.leases.get(d.device);
-    if (!held) return err(CODE.NOT_HOLDER, `you do not hold a lease on ${d.device}; call lease.acquire first`);
-    if (held.conn !== conn.id) return err(CODE.NOT_HOLDER, `device ${d.device} is held by ${held.holder}, not by you`, { device: d.device, holder: held.holder, epoch: held.epoch });
     const call = (p.call ?? {}) as Record<string, unknown>;
     const tool = String(call.tool);
+    // as bridged: a read needs no lease (unless this fake plays an older daemon); anything else does
+    const isRead = READS.includes(tool) && !this.leaseForReads;
+    if (!isRead || held?.conn === conn.id) {
+      if (!held) return err(CODE.NOT_HOLDER, `you do not hold a lease on ${d.device}; call lease.acquire first`);
+      if (held.conn !== conn.id) return err(CODE.NOT_HOLDER, `device ${d.device} is held by ${held.holder}, not by you`, { device: d.device, holder: held.holder, epoch: held.epoch });
+    }
     if (!this.serveAll && !SERVED.includes(tool)) return err(CODE.METHOD_NOT_FOUND, `tool ${tool} is planned: not implemented in this bridged yet`);
 
     // the gate: S24, allowlist, then the mode (gate.rs `check`)
