@@ -1354,6 +1354,67 @@ fn type_text_by_ref_and_the_modes_still_gate_a_ref_tap() {
     });
 }
 
+/// Regression guard for the forgotten-lease bug: a session that only reads must never end up
+/// holding the phone. Every read, on a phone nobody holds, leaves `lease.status` empty, and the
+/// next session can take the lease at once.
+#[test]
+fn a_read_never_takes_a_lease() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        let mut reader = Client::new(&h);
+        for call in [
+            json!({ "tool": "look" }),
+            json!({ "tool": "ui_tree" }),
+            json!({ "tool": "screenshot" }),
+            json!({ "tool": "list_apps" }),
+            json!({ "tool": "getprop", "key": "ro.product.model" }),
+            json!({ "tool": "wait", "seconds": 0 }),
+        ] {
+            let r = reader.tool(POCO, call.clone()).await;
+            assert!(r.get("error").is_none(), "{call}: {r}");
+            let s = reader.call("lease.status", json!({})).await;
+            assert_eq!(
+                s["result"]["leases"],
+                json!([]),
+                "{call} left a lease behind: {s}"
+            );
+            assert_eq!(s["result"]["idle"], json!([]), "{s}");
+        }
+        let mut next = Client::new(&h);
+        let r = next.call("lease.acquire", json!({ "device": POCO })).await;
+        assert!(
+            r["result"]["epoch"].is_u64(),
+            "after any number of reads the phone is free for the next session: {r}"
+        );
+    });
+}
+
+/// `lease.status` says how long each holder has gone without a call, so a watcher can raise an
+/// alarm on a lease nobody is using (15 Nov 2026).
+#[test]
+fn lease_status_reports_how_long_each_holder_has_been_idle() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        let mut holder = Client::leased(&h, POCO).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let s = holder.call("lease.status", json!({})).await;
+        let row = &s["result"]["idle"][0];
+        assert_eq!(row["device"], s["result"]["leases"][0]["device"], "{s}");
+        assert!(row["idle_s"].as_u64().unwrap() >= 1, "idle at least 1 s: {s}");
+        assert_eq!(row["job_live"], false, "{s}");
+        // a lease-checked call by the holder resets it
+        let r = holder
+            .tool(
+                POCO,
+                json!({ "tool": "tap", "x": 1, "y": 1, "space": "device" }),
+            )
+            .await;
+        assert!(r.get("error").is_none(), "{r}");
+        let s = holder.call("lease.status", json!({})).await;
+        assert_eq!(s["result"]["idle"][0]["idle_s"], 0, "{s}");
+    });
+}
+
 #[test]
 fn reads_need_no_lease_and_still_work_while_another_session_holds_it() {
     run(async {

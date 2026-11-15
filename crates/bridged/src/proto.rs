@@ -235,6 +235,21 @@ pub struct LeaseStatusParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LeaseStatusResult {
     pub leases: Vec<Lease>,
+    /// How long each lease's holder has gone without a call, one row per lease. A watcher uses it to
+    /// raise an alarm on a lease left held by a session that has stopped using the phone. Absent from
+    /// older daemons.
+    #[serde(default)]
+    pub idle: Vec<LeaseIdle>,
+}
+
+/// One row of [`LeaseStatusResult::idle`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LeaseIdle {
+    pub device: String,
+    /// Seconds since the holder's last lease-checked call (or the grant).
+    pub idle_s: u64,
+    /// A job is running on the device; its lease does not lapse and is not idle in any useful sense.
+    pub job_live: bool,
 }
 
 // ---- device.call: pass-through to core ----

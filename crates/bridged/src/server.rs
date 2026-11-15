@@ -713,9 +713,18 @@ impl Daemon {
                 let key = p
                     .device
                     .map(|d| self.resolve(&d).map(|i| device_key(&i)).unwrap_or(d));
-                to_value(&LeaseStatusResult {
-                    leases: self.registry.status(key.as_deref()),
-                })
+                let leases = self.registry.status(key.as_deref());
+                let idle = leases
+                    .iter()
+                    .filter_map(|l| {
+                        self.registry.idle_for(&l.device).map(|ms| LeaseIdle {
+                            device: l.device.clone(),
+                            idle_s: ms / 1000,
+                            job_live: self.jobs.device_live(&l.device),
+                        })
+                    })
+                    .collect();
+                to_value(&LeaseStatusResult { leases, idle })
             }
             "device.call" if crate::devtools::claims(params) => self.devtools_call(conn.id, params),
             "device.call" => self.device_call(conn.id, params),

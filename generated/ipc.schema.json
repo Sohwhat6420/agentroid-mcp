@@ -910,6 +910,30 @@
         }
       }
     },
+    "LeaseIdle": {
+      "description": "One row of [`LeaseStatusResult::idle`].",
+      "type": "object",
+      "required": [
+        "device",
+        "idle_s",
+        "job_live"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "idle_s": {
+          "description": "Seconds since the holder's last lease-checked call (or the grant).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "job_live": {
+          "description": "A job is running on the device; its lease does not lapse and is not idle in any useful sense.",
+          "type": "boolean"
+        }
+      }
+    },
     "LeaseReleaseParams": {
       "type": "object",
       "required": [
@@ -951,6 +975,14 @@
         "leases"
       ],
       "properties": {
+        "idle": {
+          "description": "How long each lease's holder has gone without a call, one row per lease. A watcher uses it to raise an alarm on a lease left held by a session that has stopped using the phone. Absent from older daemons.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LeaseIdle"
+          }
+        },
         "leases": {
           "type": "array",
           "items": {
