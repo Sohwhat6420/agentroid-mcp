@@ -47,7 +47,11 @@ final class GuardCore {
     private boolean holdFromEarlierBoot; // the saved hold was made before this boot
     private long refreshedAt;            // elapsedRealtime of the last tick that saw the hold
     private long lastSaved;
-    private boolean onTrusted; // the phone is on the home network now (GuardService's network callback)
+    // The phone is on the home network now, from GuardService's network callback. null = not known yet: the callback
+    // has not decided since the service started or the home setting changed. Until it has, home mode stays out of
+    // every decision, so a poll in that gap cannot read "away" and switch Wireless debugging off under a working
+    // connection (seen on the S24, 15 Nov 2026: off for 12 ms right after the home network was set).
+    private Boolean onTrusted;
     // measurements, shown by `adb shell dumpsys activity service dev.agentroid.bankguard/.GuardService`
     long holds, releases, reasserts, homeWrites, writeFailures, lastHoldLatencyMs = -1, maxHoldLatencyMs = -1;
     private final ArrayDeque<String> events = new ArrayDeque<String>();
@@ -104,7 +108,7 @@ final class GuardCore {
 
     /** For the HoldProvider: should the keeper leave Wireless debugging off right now? */
     synchronized boolean keeperShouldWait() {
-        if (homeMode()) return GuardLogic.keeperShouldWaitHome(st, onTrusted);
+        if (homeMode() && onTrusted != null) return GuardLogic.keeperShouldWaitHome(st, onTrusted);
         return GuardLogic.keeperShouldWait(st, refreshedAt, now(), !holdFromEarlierBoot);
     }
 
@@ -126,13 +130,14 @@ final class GuardCore {
     synchronized void setHome(String ssid, Set<String> bssids) {
         StringBuilder b = new StringBuilder();
         for (String s : bssids) { if (b.length() > 0) b.append(','); b.append(s); }
+        onTrusted = null; // decided again by the callback, for the new setting
         p.edit().putString(KEY_HOME_SSID, ssid == null ? "" : ssid).putString(KEY_HOME_BSSIDS, b.toString()).commit();
         log(ssid == null || ssid.isEmpty() ? "home wifi mode off" : "home wifi set: " + bssids.size() + " access point(s)");
     }
 
     /** The network callback: the phone joined or left the home network (or the home network was changed). */
     synchronized GuardLogic.Action setOnTrusted(boolean t) {
-        boolean changed = t != onTrusted;
+        boolean changed = onTrusted == null || t != onTrusted;
         onTrusted = t;
         if (!homeMode()) return GuardLogic.Action.NONE;
         if (changed) log(t ? "home wifi: joined" : "home wifi: left");
@@ -144,7 +149,7 @@ final class GuardCore {
 
     /** Home mode over an action GuardLogic has just decided for the state in s. */
     private GuardLogic.Action home(GuardLogic.Action a, GuardLogic.Seen s) {
-        return homeMode() ? GuardLogic.withHome(a, st, s, onTrusted) : a;
+        return homeMode() && onTrusted != null ? GuardLogic.withHome(a, st, s, onTrusted) : a;
     }
 
     // ------------------------------------------------------------------------------------------------ the poll
@@ -282,7 +287,7 @@ final class GuardCore {
                 .append(" paused=").append(paused()).append(" keeper_should_wait=").append(keeperShouldWait())
                 .append(" boot=").append(boot).append(" hold_from_earlier_boot=").append(holdFromEarlierBoot).append('\n');
         b.append("home_mode=").append(homeMode()).append(" home_access_points=").append(homeBssids().size())
-                .append(" on_home_wifi=").append(onTrusted).append('\n');
+                .append(" on_home_wifi=").append(onTrusted == null ? "unknown" : String.valueOf(onTrusted)).append('\n');
         b.append("holds=").append(holds).append(" releases=").append(releases).append(" reasserts=").append(reasserts)
                 .append(" home_writes=").append(homeWrites)
                 .append(" write_failures=").append(writeFailures).append(" last_hold_latency_ms=").append(lastHoldLatencyMs)
