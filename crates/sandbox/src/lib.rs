@@ -26,16 +26,26 @@ pub mod job;
 pub mod proto;
 pub mod shell;
 
-use agentroid_core::gate::{self, Call, DeviceMode, Subject};
+#[cfg(windows)]
+use agentroid_core::gate::Subject;
+use agentroid_core::gate::{self, Call, DeviceMode};
+#[cfg(windows)]
 use proto::{ChildLimits, FromChild, ToChild};
 use serde::Serialize;
 use serde_json::Value;
-use shell::{RiskClass, ShellVerdict};
+use shell::RiskClass;
+#[cfg(windows)]
+use shell::ShellVerdict;
+#[cfg(windows)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(windows)]
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::time::Duration;
+use std::time::Instant;
 
 /// The name of the child binary (built from `src/bin/agentroid-sandbox.rs`).
 pub const CHILD_BIN: &str = "agentroid-sandbox";
@@ -70,6 +80,7 @@ impl Device {
     pub fn effective_mode(&self) -> DeviceMode {
         gate::effective_mode(&[&self.serial, &self.hw_serial], self.mode)
     }
+    #[cfg(windows)]
     fn subject(&self) -> Subject<'_> {
         Subject {
             serial: &self.serial,
@@ -219,18 +230,23 @@ pub struct Sandbox {
 }
 
 /// What the stdout reader thread sends the parent loop.
+#[cfg(windows)]
 enum Line {
     Msg(String),
     TooLong,
     Eof,
 }
 
+#[cfg(windows)]
 const MAX_PROTO_LINE: u64 = 4 * 1024 * 1024;
+#[cfg(windows)]
 const POLL: Duration = Duration::from_millis(20);
 /// Slack over `cpu_ms` before the parent kills on job CPU accounting (the child's own interrupt
 /// should stop the script first and report).
+#[cfg(windows)]
 const CPU_GRACE_MS: u64 = 300;
 
+#[cfg(windows)]
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -540,6 +556,7 @@ impl Sandbox {
         // `job` drops here: CloseHandle, and KILL_ON_JOB_CLOSE ends anything left.
     }
 
+    #[cfg(windows)]
     #[allow(clippy::too_many_arguments)]
     fn answer_call(
         &self,
@@ -589,6 +606,7 @@ impl Sandbox {
     }
 }
 
+#[cfg(windows)]
 fn answer_shell(
     res: &mut RunResult,
     at_ms: u64,
@@ -649,11 +667,13 @@ fn answer_shell(
     }
 }
 
+#[cfg(windows)]
 enum Reply {
     Ok(Value),
     Err(String),
 }
 
+#[cfg(windows)]
 impl Reply {
     fn into_msg(self, id: u64) -> ToChild {
         match self {
@@ -673,6 +693,7 @@ impl Reply {
     }
 }
 
+#[cfg(windows)]
 fn send(stdin: &mut ChildStdin, msg: &ToChild) -> std::io::Result<()> {
     let mut line = serde_json::to_string(msg).map_err(std::io::Error::other)?;
     line.push('\n');
@@ -680,11 +701,13 @@ fn send(stdin: &mut ChildStdin, msg: &ToChild) -> std::io::Result<()> {
     stdin.flush()
 }
 
+#[cfg(windows)]
 fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
+#[cfg(windows)]
 fn spawn_reader(stdout: impl Read + Send + 'static) -> mpsc::Receiver<Line> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -712,6 +735,7 @@ fn spawn_reader(stdout: impl Read + Send + 'static) -> mpsc::Receiver<Line> {
     rx
 }
 
+#[cfg(windows)]
 fn spawn_stderr(stderr: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut keep = Vec::new();

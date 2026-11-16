@@ -2,6 +2,8 @@
 //! file: a full session's state dir is scanned for it in every encoding. The credential is a
 //! throwaway under `agentroid:test:` and is deleted afterwards (also when the test fails).
 
+#![cfg(windows)]
+
 mod common;
 
 use std::path::{Path, PathBuf};
