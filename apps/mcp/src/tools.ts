@@ -273,7 +273,7 @@ Every result starts with a health line and carries a structured header and a rec
 Workflow:
 1. list_devices. With one phone connected, device may be left out; with several you must name one. The server never picks for you.
 2. look (screenshot plus UI tree) or ui_tree to see the screen. Prefer ui_tree and indexes over pixel coordinates.
-3. Act with tap, type_text, key, swipe, scroll, open_app and the rest. The server takes the lease for you; only one session may hold a phone, and a second one is refused with the holder's name.
+3. Act with tap, type_text, key, swipe, scroll, open_app and the rest. The server takes the lease for you on the first acting call; reads (look, ui_tree, screenshot, list_apps, getprop, wait) take none and work while another session holds the phone. Only one session may hold a phone, and a second one is refused with the holder's name. A lease unused for 10 minutes is given back (a running job keeps it), and closing the session gives it back.
 4. After an action, read focus_changed in the header. If a dialog or overlay took focus, deal with it before going on.
 
 Options on acting tools: require (elements that must be on screen first), retry (0 to 3; repeats only reads, set_value and open_app, never a tap or key) and verify (an element expected afterwards; after a tap or long_press the screen must also have changed, and after type_text the element must still be there 150 and 600 ms later) are passed to the daemon, which enforces them. If one fails you get an error; do not assume the action worked.

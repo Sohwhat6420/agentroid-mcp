@@ -1072,9 +1072,12 @@ fn health_is_on_every_answer_that_names_a_device_you_hold() {
             n += 1;
         }
         assert_eq!(n, 15);
-        // a call by someone who does not hold the lease is refused before anything: that error's data is the lease
+        // an acting call by someone who does not hold the lease is refused before anything: that error's data is
+        // the lease (a read needs no lease, so a non-holder's look is answered: see reads_need_no_lease_...)
         let mut other = Client::new(&h);
-        let r = other.tool(POCO, json!({ "tool": "look" })).await;
+        let r = other
+            .tool(POCO, json!({ "tool": "tap", "x": 1, "y": 1 }))
+            .await;
         assert_eq!(code(&r), NOT_HOLDER);
         assert!(r["error"]["data"].get("health").is_none());
     });
@@ -1348,5 +1351,153 @@ fn type_text_by_ref_and_the_modes_still_gate_a_ref_tap() {
             .tool(POCO, json!({ "tool": "tap", "ref": "r000001" }))
             .await;
         assert_eq!(code(&r), REFUSED, "{r}");
+    });
+}
+
+/// Regression guard for the forgotten-lease bug: a session that only reads must never end up
+/// holding the phone. Every read, on a phone nobody holds, leaves `lease.status` empty, and the
+/// next session can take the lease at once.
+#[test]
+fn a_read_never_takes_a_lease() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        let mut reader = Client::new(&h);
+        for call in [
+            json!({ "tool": "look" }),
+            json!({ "tool": "ui_tree" }),
+            json!({ "tool": "screenshot" }),
+            json!({ "tool": "list_apps" }),
+            json!({ "tool": "getprop", "key": "ro.product.model" }),
+            json!({ "tool": "wait", "seconds": 0 }),
+        ] {
+            let r = reader.tool(POCO, call.clone()).await;
+            assert!(r.get("error").is_none(), "{call}: {r}");
+            let s = reader.call("lease.status", json!({})).await;
+            assert_eq!(
+                s["result"]["leases"],
+                json!([]),
+                "{call} left a lease behind: {s}"
+            );
+            assert_eq!(s["result"]["idle"], json!([]), "{s}");
+        }
+        let mut next = Client::new(&h);
+        let r = next.call("lease.acquire", json!({ "device": POCO })).await;
+        assert!(
+            r["result"]["epoch"].is_u64(),
+            "after any number of reads the phone is free for the next session: {r}"
+        );
+    });
+}
+
+/// `lease.status` says how long each holder has gone without a call, so a watcher can raise an
+/// alarm on a lease nobody is using (15 Nov 2026).
+#[test]
+fn lease_status_reports_how_long_each_holder_has_been_idle() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        let mut holder = Client::leased(&h, POCO).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let s = holder.call("lease.status", json!({})).await;
+        let row = &s["result"]["idle"][0];
+        assert_eq!(row["device"], s["result"]["leases"][0]["device"], "{s}");
+        assert!(row["idle_s"].as_u64().unwrap() >= 1, "idle at least 1 s: {s}");
+        assert_eq!(row["job_live"], false, "{s}");
+        // a lease-checked call by the holder resets it
+        let r = holder
+            .tool(
+                POCO,
+                json!({ "tool": "tap", "x": 1, "y": 1, "space": "device" }),
+            )
+            .await;
+        assert!(r.get("error").is_none(), "{r}");
+        let s = holder.call("lease.status", json!({})).await;
+        assert_eq!(s["result"]["idle"][0]["idle_s"], 0, "{s}");
+    });
+}
+
+#[test]
+fn reads_need_no_lease_and_still_work_while_another_session_holds_it() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        let mut holder = Client::leased(&h, POCO).await;
+        let mut other = Client::new(&h);
+        h.device.lock().unwrap().calls.clear();
+        for call in [
+            json!({ "tool": "look" }),
+            json!({ "tool": "ui_tree" }),
+            json!({ "tool": "screenshot" }),
+            json!({ "tool": "list_apps" }),
+            json!({ "tool": "getprop", "key": "ro.product.model" }),
+            json!({ "tool": "wait", "seconds": 0 }),
+        ] {
+            let r = other.tool(POCO, call.clone()).await;
+            assert!(
+                r.get("error").is_none(),
+                "a read by a non-holder: {call}: {r}"
+            );
+            assert_eq!(health_of(&r)["mode"], "full");
+        }
+        let r = other
+            .tool(
+                POCO,
+                json!({ "tool": "tap", "x": 1, "y": 1, "space": "device" }),
+            )
+            .await;
+        assert_eq!(code(&r), NOT_HOLDER, "acting still needs the lease: {r}");
+        let calls = h.device.lock().unwrap().calls.clone();
+        assert!(
+            !calls.contains(&"input"),
+            "no read and not the refused tap sent input to the phone: {calls:?}"
+        );
+        let held = other.call("lease.status", json!({ "device": POCO })).await;
+        assert_eq!(
+            held["result"]["leases"][0]["holder"],
+            holder.call("hello", json!({})).await["result"]["holder"],
+            "reading took no lease from the holder: {held}"
+        );
+        let r = holder
+            .tool(
+                POCO,
+                json!({ "tool": "tap", "x": 1, "y": 1, "space": "device" }),
+            )
+            .await;
+        assert!(r.get("error").is_none(), "the holder still acts: {r}");
+    });
+}
+
+#[test]
+fn an_idle_holder_loses_the_lease_to_the_next_asker_and_is_told_so() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        let mut first = Client::leased(&h, POCO).await;
+        let mut second = Client::new(&h);
+        let r = second
+            .call("lease.acquire", json!({ "device": POCO }))
+            .await;
+        assert_eq!(code(&r), LEASE_HELD, "no idle limit: held: {r}");
+        let msg = r["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("idle"),
+            "the refusal says how long the holder has been idle: {msg}"
+        );
+        h.daemon.registry.set_idle_ms(Some(1));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let r = second
+            .call("lease.acquire", json!({ "device": POCO }))
+            .await;
+        assert!(r["result"]["epoch"].is_u64(), "an idle lease lapses: {r}");
+        let r = first
+            .tool(
+                POCO,
+                json!({ "tool": "tap", "x": 1, "y": 1, "space": "device" }),
+            )
+            .await;
+        assert_eq!(
+            code(&r),
+            NOT_HOLDER,
+            "the old holder can no longer act: {r}"
+        );
+        let r = first.tool(POCO, json!({ "tool": "look" })).await;
+        assert!(r.get("error").is_none(), "but it can still look: {r}");
     });
 }

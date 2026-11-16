@@ -14,6 +14,9 @@
 //! bridged --stop                  ask a running daemon to stop (writes the stop file)
 //! bridged --print-schema [PATH]   write the IPC JSON Schema (default generated/ipc.schema.json)
 //! options: --pipe NAME  --state-dir DIR
+//!          --lease-idle-secs N                a lease whose holder makes no call for N seconds goes to
+//!                                             the next session that asks (default 600; 0 = never);
+//!                                             a phone with a live job keeps its lease
 //!          --link-bind ADDR [--link-port N]   run the link hub (the tailnet address; never 0.0.0.0)
 //!          --link-lan                         also allow a private home-LAN ADDR, served as wss://
 //!                                             (TLS 1.3, the certificate the pairing QR pins)
@@ -104,6 +107,8 @@ struct Args {
     audit_anchor: Option<PathBuf>,
     /// Off by default: a failed anchor write is counted, not refused (by design).
     audit_anchor_required: bool,
+    /// `--lease-idle-secs`: an unused lease lapses to the next asker after this long (0: never).
+    lease_idle_secs: u64,
 }
 
 fn num(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u16, String> {
@@ -141,6 +146,7 @@ fn parse_args() -> Result<Args, String> {
         ntfy_base: None,
         audit_anchor: None,
         audit_anchor_required: false,
+        lease_idle_secs: bridged::registry::DEFAULT_IDLE_MS / 1000,
     };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
@@ -164,6 +170,12 @@ fn parse_args() -> Result<Args, String> {
                 a.print_schema = Some(path);
             }
             "--pipe" => a.pipe = it.next().ok_or("--pipe needs a name")?,
+            "--lease-idle-secs" => {
+                a.lease_idle_secs = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--lease-idle-secs needs a number of seconds (0 = never)")?
+            }
             "--state-dir" => {
                 a.state_dir = PathBuf::from(it.next().ok_or("--state-dir needs a directory")?)
             }
@@ -351,6 +363,7 @@ fn bench_approve_refusal(args: &Args, allow: &[String]) -> Option<String> {
 fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
     let registry = bridged::registry::Registry::open(args.state_dir.join("state.json"))
         .map_err(|e| format!("state file: {e}"))?;
+    registry.set_idle_ms(Some(args.lease_idle_secs.saturating_mul(1000)));
     if args.fake && args.adb.is_some() {
         return Err("--fake and --adb are alternatives".into());
     }

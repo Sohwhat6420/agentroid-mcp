@@ -8,7 +8,7 @@ import type { Envelope, ToolResult } from "../src/server-core.ts";
 import { isValid, validate } from "../src/schema.ts";
 import type { Schema } from "../src/schema.ts";
 import { TOOLS, listTools, outputSchemaFor, toolByName } from "../src/tools.ts";
-import { CODE, POCO, RO14, S24, S24_READS, STRANGER } from "./fake-daemon.ts";
+import { CODE, FakeDaemon, POCO, RO14, S24, S24_READS, STRANGER } from "./fake-daemon.ts";
 import { readJson, rig, schemasDir } from "./util.ts";
 
 const receiptSchema = readJson(join(schemasDir(), "receipt.json")) as Schema;
@@ -318,9 +318,11 @@ test("the server takes the lease once, and a second session is refused with the 
     return { c, s: createServer({ daemon: c, session: "other-session" }) };
   })();
   try {
-    await r.call("look", {});
-    await r.call("look", {});
+    await r.call("tap", { index: 1 });
+    await r.call("tap", { index: 1 });
     assert.equal(r.fake.callsTo("lease.acquire"), 1, "leased once, not per call");
+    const look = await other.s.callTool("look", {});
+    assert.equal(look.isError, undefined, "a read works while another session holds the phone");
     const res = await other.s.callTool("tap", { index: 1 });
     assert.equal(env(res).error?.kind, "lease_held");
     assert.match(env(res).error?.message ?? "", /is held by test-session/);
@@ -338,15 +340,76 @@ test("the server takes the lease once, and a second session is refused with the 
 test("after a reconnect the lease is taken again (the old one died with the connection)", async () => {
   const r = await rig([POCO]);
   try {
-    await r.call("look", {});
+    await r.call("tap", { index: 1 });
     r.fake.misbehave = "drop";
-    const dropped = await r.call("look", {});
+    const dropped = await r.call("tap", { index: 1 });
     assert.equal(dropped.isError, true);
-    const again = await r.call("look", {});
+    const again = await r.call("tap", { index: 1 });
     assert.equal(again.isError, undefined, again.content[0]?.text ?? "");
     assert.equal(r.fake.callsTo("lease.acquire"), 2);
   } finally {
     await r.stop();
+  }
+});
+
+test("reads take no lease; an older daemon that wants one for reads gets one, once", async () => {
+  const r = await rig([POCO]);
+  try {
+    await r.call("look", {});
+    await r.call("ui_tree", {});
+    assert.equal(r.fake.callsTo("lease.acquire"), 0, "a session that only looks never locks the phone");
+    r.fake.leaseForReads = true;
+    const before = r.fake.callsTo("device.call");
+    const res = await r.call("look", {});
+    assert.equal(res.isError, undefined, res.content[0]?.text ?? "");
+    assert.equal(r.fake.callsTo("lease.acquire"), 1, "fell back to taking the lease");
+    assert.equal(r.fake.callsTo("device.call"), before + 2, "asked once without, once with");
+    await r.call("look", {});
+    assert.equal(r.fake.callsTo("lease.acquire"), 1, "kept it after that");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("a lease unused for the idle limit is given back, and close gives back the rest", async () => {
+  const fake = new FakeDaemon([POCO]);
+  await fake.start();
+  const { DaemonClient } = await import("../src/daemon.ts");
+  const c = new DaemonClient({ path: fake.path, session: "idle-session" });
+  let t = 1_000_000;
+  const ticks: (() => void)[] = [];
+  // Only the idle check runs on an interval here (watch is off); timeouts never fire.
+  const timers = {
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    setInterval: (fn: () => void) => {
+      ticks.push(fn);
+      return ticks.length;
+    },
+    clearInterval: () => {},
+  };
+  const s = createServer({ daemon: c, session: "idle-session", now: () => t, timers, leaseIdleMs: 600_000, watch: false });
+  const tick = async (): Promise<void> => {
+    for (const f of ticks) f();
+    await new Promise((res) => setTimeout(res, 50));
+  };
+  try {
+    await s.callTool("tap", { index: 1 });
+    assert.equal(fake.callsTo("lease.acquire"), 1);
+    t += 599_000;
+    await tick();
+    assert.equal(fake.callsTo("lease.release"), 0, "not idle long enough");
+    t += 2_000;
+    await tick();
+    assert.equal(fake.callsTo("lease.release"), 1, "idle 10 min: given back");
+    await s.callTool("tap", { index: 1 });
+    assert.equal(fake.callsTo("lease.acquire"), 2, "taken again on the next acting call");
+    s.close();
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(fake.callsTo("lease.release"), 2, "close gives it back");
+  } finally {
+    c.close();
+    await fake.stop();
   }
 });
 

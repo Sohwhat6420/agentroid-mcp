@@ -7,12 +7,35 @@
 //! * `epoch` is one monotonic counter, bumped on every new grant and written to the state file
 //!   (temp file, `sync_all`, rename) *before* the grant is visible, so a crash never leaves a
 //!   grant whose epoch a restart could reuse. A corrupt state file is an error, never a reset to 0.
+//! * Idle lapse: a connection can stay open long after it stopped using a phone (an MCP server lives as
+//!   long as its client's session). With an idle limit set ([`Registry::set_idle_ms`]), a lease whose
+//!   holder has made no lease-checked call for that long is handed to the next connection that asks
+//!   ([`Registry::acquire_lapsing`]), unless the caller says the device is busy (a live job). Every
+//!   successful [`Registry::check_holder`] and re-acquire counts as use.
 
 use crate::proto::Lease;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
+
+/// The default idle limit of the daemon: 10 minutes with no call from the holder.
+pub const DEFAULT_IDLE_MS: u64 = 10 * 60 * 1000;
+
+/// A grant from [`Registry::acquire_lapsing`]: the lease, and the idle one it replaced, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub lease: Lease,
+    pub lapsed: Option<Lease>,
+}
+
+type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
+
+fn monotonic_ms() -> Clock {
+    let t0 = Instant::now();
+    Box::new(move || u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireError {
@@ -33,6 +56,8 @@ pub enum ReleaseOutcome {
 struct Held {
     conn: u64,
     lease: Lease,
+    /// Clock ms of the holder's last lease-checked call (or the grant).
+    last: u64,
 }
 
 struct Inner {
@@ -43,6 +68,9 @@ struct Inner {
 pub struct Registry {
     inner: Mutex<Inner>,
     state: Option<PathBuf>,
+    clock: Clock,
+    /// `None`: a lease never lapses (the behaviour before the idle limit).
+    idle_ms: Mutex<Option<u64>>,
 }
 
 fn read_epoch(path: &Path) -> io::Result<u64> {
@@ -91,7 +119,40 @@ impl Registry {
                 leases: BTreeMap::new(),
             }),
             state: None,
+            clock: monotonic_ms(),
+            idle_ms: Mutex::new(None),
         }
+    }
+
+    /// Replace the clock (tests): milliseconds from any fixed origin.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// Set the idle limit: a lease unused for `ms` may lapse to the next asker. `None` or `Some(0)`: never.
+    pub fn set_idle_ms(&self, ms: Option<u64>) {
+        *self
+            .idle_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ms.filter(|m| *m > 0);
+    }
+
+    pub fn idle_ms(&self) -> Option<u64> {
+        *self
+            .idle_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How long the holder of `device` has been idle, in ms (`None`: not leased).
+    pub fn idle_for(&self, device: &str) -> Option<u64> {
+        let now = (self.clock)();
+        self.lock()
+            .leases
+            .get(device)
+            .map(|h| now.saturating_sub(h.last))
     }
 
     /// Load the epoch from `path` (0 when the file does not exist yet). Creates the parent directory.
@@ -109,6 +170,8 @@ impl Registry {
                 leases: BTreeMap::new(),
             }),
             state: Some(path),
+            clock: monotonic_ms(),
+            idle_ms: Mutex::new(None),
         })
     }
 
@@ -126,14 +189,40 @@ impl Registry {
     }
 
     /// Grant `device` to connection `conn`. Re-acquiring your own lease returns it unchanged.
+    /// Never takes a lease from another holder, however idle (see [`Registry::acquire_lapsing`]).
     pub fn acquire(&self, device: &str, conn: u64, holder: &str) -> Result<Lease, AcquireError> {
+        self.acquire_lapsing(device, conn, holder, false)
+            .map(|g| g.lease)
+    }
+
+    /// As [`Registry::acquire`], but a lease held by another connection that has been idle for the idle
+    /// limit or longer lapses and is granted to `conn` with a new epoch, but only when `may_lapse` (the
+    /// caller passes `false` while the device has a live job, which keeps its lease however quiet it is).
+    /// With no idle limit set, or `may_lapse` false, this is exactly `acquire`.
+    pub fn acquire_lapsing(
+        &self,
+        device: &str,
+        conn: u64,
+        holder: &str,
+        may_lapse: bool,
+    ) -> Result<Grant, AcquireError> {
+        let now = (self.clock)();
+        let idle = self.idle_ms();
         let mut g = self.lock();
-        if let Some(h) = g.leases.get(device) {
-            return if h.conn == conn {
-                Ok(h.lease.clone())
-            } else {
-                Err(AcquireError::Held(h.lease.clone()))
-            };
+        let mut lapsed = None;
+        if let Some(h) = g.leases.get_mut(device) {
+            if h.conn == conn {
+                h.last = now;
+                return Ok(Grant {
+                    lease: h.lease.clone(),
+                    lapsed: None,
+                });
+            }
+            let stale = idle.is_some_and(|ms| now.saturating_sub(h.last) >= ms);
+            if !(may_lapse && stale) {
+                return Err(AcquireError::Held(h.lease.clone()));
+            }
+            lapsed = Some(h.lease.clone());
         }
         let next = g
             .epoch
@@ -154,9 +243,10 @@ impl Registry {
             Held {
                 conn,
                 lease: lease.clone(),
+                last: now,
             },
         );
-        Ok(lease)
+        Ok(Grant { lease, lapsed })
     }
 
     /// Hands out one more epoch without granting a lease (the link hub's epoch for a phone no
@@ -223,10 +313,15 @@ impl Registry {
         self.lock().leases.get(device).map(|h| h.lease.clone())
     }
 
-    /// `Ok` when `conn` holds `device`; otherwise the current lease, if any.
+    /// `Ok` when `conn` holds `device` (which counts as use, for the idle limit); otherwise the current
+    /// lease, if any.
     pub fn check_holder(&self, device: &str, conn: u64) -> Result<(), Option<Lease>> {
-        match self.lock().leases.get(device) {
-            Some(h) if h.conn == conn => Ok(()),
+        let now = (self.clock)();
+        match self.lock().leases.get_mut(device) {
+            Some(h) if h.conn == conn => {
+                h.last = now;
+                Ok(())
+            }
             Some(h) => Err(Some(h.lease.clone())),
             None => Err(None),
         }
@@ -292,6 +387,92 @@ mod tests {
         assert_eq!(r.release_conn(1).len(), 2);
         assert_eq!(r.status(None).len(), 1);
         assert!(r.release_conn(1).is_empty());
+    }
+
+    fn clocked() -> (Registry, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let t = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let c = t.clone();
+        let r =
+            Registry::in_memory().with_clock(move || c.load(std::sync::atomic::Ordering::SeqCst));
+        (r, t)
+    }
+    fn at(t: &std::sync::atomic::AtomicU64, ms: u64) {
+        t.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn an_idle_lease_lapses_to_the_next_asker_with_a_new_epoch() {
+        let (r, t) = clocked();
+        r.set_idle_ms(Some(600_000));
+        let a = r.acquire("D", 1, "a").unwrap();
+        at(&t, 599_999);
+        assert!(
+            matches!(
+                r.acquire_lapsing("D", 2, "b", true),
+                Err(AcquireError::Held(_))
+            ),
+            "not idle long enough"
+        );
+        at(&t, 600_000);
+        let g = r.acquire_lapsing("D", 2, "b", true).unwrap();
+        assert_eq!(g.lapsed, Some(a));
+        assert_eq!(g.lease.holder, "b");
+        assert_eq!(g.lease.epoch, 2, "a lapse is a new grant: new epoch");
+        assert_eq!(
+            r.check_holder("D", 1),
+            Err(Some(g.lease.clone())),
+            "the old holder is told who has it now"
+        );
+    }
+
+    #[test]
+    fn use_keeps_a_lease_from_lapsing() {
+        let (r, t) = clocked();
+        r.set_idle_ms(Some(1_000));
+        r.acquire("D", 1, "a").unwrap();
+        at(&t, 900);
+        assert_eq!(r.check_holder("D", 1), Ok(()), "a call by the holder");
+        at(&t, 1_800);
+        assert!(matches!(
+            r.acquire_lapsing("D", 2, "b", true),
+            Err(AcquireError::Held(_))
+        ));
+        assert_eq!(r.idle_for("D"), Some(900));
+        at(&t, 2_500);
+        r.acquire("D", 1, "a").unwrap(); // re-acquire is use too
+        at(&t, 3_400);
+        assert!(matches!(
+            r.acquire_lapsing("D", 2, "b", true),
+            Err(AcquireError::Held(_))
+        ));
+    }
+
+    #[test]
+    fn a_busy_device_or_no_idle_limit_never_lapses() {
+        let (r, t) = clocked();
+        r.acquire("D", 1, "a").unwrap();
+        at(&t, 10_000_000);
+        assert!(
+            matches!(
+                r.acquire_lapsing("D", 2, "b", true),
+                Err(AcquireError::Held(_))
+            ),
+            "no idle limit: never"
+        );
+        r.set_idle_ms(Some(1_000));
+        assert!(
+            matches!(
+                r.acquire_lapsing("D", 2, "b", false),
+                Err(AcquireError::Held(_))
+            ),
+            "a live job keeps it"
+        );
+        assert!(
+            matches!(r.acquire("D", 2, "b"), Err(AcquireError::Held(_))),
+            "plain acquire never takes a lease"
+        );
+        r.set_idle_ms(Some(0));
+        assert_eq!(r.idle_ms(), None, "0 means never");
     }
 
     #[test]

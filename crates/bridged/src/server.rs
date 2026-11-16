@@ -653,22 +653,38 @@ impl Daemon {
                 let d = self.resolve(&p.device)?;
                 self.require_allowed(&d)?;
                 let key = device_key(&d);
-                match self.registry.acquire(&key, conn.id, &conn.holder()) {
-                    Ok(lease) => {
+                // An idle holder's lease lapses to this asker, unless a live job is using the phone.
+                let may_lapse = !self.jobs.device_live(&key);
+                match self
+                    .registry
+                    .acquire_lapsing(&key, conn.id, &conn.holder(), may_lapse)
+                {
+                    Ok(grant) => {
+                        let lease = grant.lease;
                         // one epoch source: a paired phone's link moves to the new lease's epoch
                         if let Some(link) = self.link.get() {
                             link.on_lease(&key, lease.epoch);
                         }
                         to_value(&lease)
                     }
-                    Err(AcquireError::Held(l)) => Err(RpcError::new(
-                        LEASE_HELD,
-                        format!(
-                            "device {} is held by {} (epoch {})",
-                            l.device, l.holder, l.epoch
-                        ),
-                    )
-                    .with_data(lease_data(&l))),
+                    Err(AcquireError::Held(l)) => {
+                        let idle_s = self.registry.idle_for(&l.device).map_or(0, |ms| ms / 1000);
+                        let rule = match self.registry.idle_ms() {
+                            Some(_) if !may_lapse => {
+                                "; it does not lapse while its job is live".to_string()
+                            }
+                            Some(ms) => format!("; it lapses after {} s idle", ms / 1000),
+                            None => String::new(),
+                        };
+                        Err(RpcError::new(
+                            LEASE_HELD,
+                            format!(
+                                "device {} is held by {} (epoch {}), idle {idle_s} s{rule}",
+                                l.device, l.holder, l.epoch
+                            ),
+                        )
+                        .with_data(lease_data(&l)))
+                    }
                     Err(AcquireError::Persist(e)) => Err(RpcError::new(
                         STATE_ERROR,
                         format!("lease not granted, state file not writable: {e}"),
@@ -697,9 +713,18 @@ impl Daemon {
                 let key = p
                     .device
                     .map(|d| self.resolve(&d).map(|i| device_key(&i)).unwrap_or(d));
-                to_value(&LeaseStatusResult {
-                    leases: self.registry.status(key.as_deref()),
-                })
+                let leases = self.registry.status(key.as_deref());
+                let idle = leases
+                    .iter()
+                    .filter_map(|l| {
+                        self.registry.idle_for(&l.device).map(|ms| LeaseIdle {
+                            device: l.device.clone(),
+                            idle_s: ms / 1000,
+                            job_live: self.jobs.device_live(&l.device),
+                        })
+                    })
+                    .collect();
+                to_value(&LeaseStatusResult { leases, idle })
             }
             "device.call" if crate::devtools::claims(params) => self.devtools_call(conn.id, params),
             "device.call" => self.device_call(conn.id, params),
