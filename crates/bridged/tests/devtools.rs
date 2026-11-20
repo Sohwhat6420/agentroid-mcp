@@ -536,6 +536,237 @@ fn push_rejects_bad_paths_before_touching_the_phone() {
     });
 }
 
+/// `pull_new`'s folder (and `push`'s phone path) may not hold a `.` segment: `/sdcard/./Android/data/
+/// <pkg>` is another app's private folder by a second spelling, so it is refused before the file
+/// guard is asked and before anything is listed on the phone.
+#[test]
+fn pull_new_and_push_reject_single_dot_segments_before_touching_the_phone() {
+    run(async {
+        let dir = tmp_dir("devtools-dot-paths");
+        let local = local_file(&dir, "f.bin", b"abc");
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        for d in [
+            "/sdcard/./Android/data/com.whatsapp/files",
+            "/sdcard/Android/./data/com.whatsapp/files",
+            "/storage/emulated/0/./android/media/com.whatsapp",
+            "/sdcard/Android/data/com.whatsapp/files/.",
+            "/sdcard/Download/./",
+            "/./sdcard/Download",
+        ] {
+            let r = c
+                .tool(POCO, json!({ "tool": "pull_new", "dir": d, "poll_ms": 0 }))
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "{d:?}: {r}");
+            assert!(
+                r["error"]["message"].as_str().unwrap().contains("`.`"),
+                "{d:?}: {r}"
+            );
+            let r = c
+                .tool(
+                    POCO,
+                    json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": format!("{d}/f.bin") }),
+                )
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "push {d:?}: {r}");
+        }
+        no_command_reached(&h);
+    });
+}
+
+/// An invisible character (a zero-width space, a joiner, a byte-order mark) is refused in `pull_new`'s
+/// folder and `push`'s phone path: case-folding storage ignores it, so `/sdcard/Andro\u{200B}id/data/
+/// <pkg>` opens another app's private folder.
+#[test]
+fn pull_new_and_push_reject_invisible_characters_before_touching_the_phone() {
+    run(async {
+        let dir = tmp_dir("devtools-invisible-paths");
+        let local = local_file(&dir, "f.bin", b"abc");
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        for d in [
+            "/sdcard/Andro\u{200B}id/data/com.whatsapp/files",
+            "/sdcard/Android/da\u{200D}ta/com.whatsapp/files",
+            "/sdcard/\u{FEFF}Android/data/com.whatsapp/files",
+        ] {
+            let r = c
+                .tool(POCO, json!({ "tool": "pull_new", "dir": d, "poll_ms": 0 }))
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "{d:?}: {r}");
+            assert!(
+                r["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invisible"),
+                "{d:?}: {r}"
+            );
+            let r = c
+                .tool(
+                    POCO,
+                    json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": format!("{d}/f.bin") }),
+                )
+                .await;
+            assert_eq!(code(&r), INVALID_PARAMS, "push {d:?}: {r}");
+        }
+        no_command_reached(&h);
+    });
+}
+
+/// Real file names keep their invisible characters: a Persian name with a ZWNJ, the family emoji
+/// (ZWJs) and a soft hyphen are pushed to and pulled from `/sdcard/Download/`. Only the storage root
+/// and an `Android` folder (where the guard decides) refuse them.
+#[test]
+fn push_and_pull_new_allow_joiners_and_soft_hyphens_in_file_names() {
+    const NAMES: [&str; 3] = [
+        "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}.pdf",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg",
+        "re\u{AD}port.pdf",
+    ];
+    run(async {
+        let dir = tmp_dir("devtools-joiner-names");
+        let local = local_file(&dir, "f.bin", b"abc");
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        for n in NAMES {
+            let remote = format!("/sdcard/Download/{n}");
+            let r = c
+                .tool(
+                    POCO,
+                    json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": remote }),
+                )
+                .await;
+            assert!(r["result"].is_object(), "push {n:?}: {r}");
+            {
+                let mut p = h.phone.lock().unwrap();
+                p.listing = vec![n.to_string()];
+                p.sizes = VecDeque::from([3, 3]);
+            }
+            let r = c
+                .tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() }))
+                .await;
+            assert_eq!(r["result"]["phone_path"], remote, "pull {n:?}: {r}");
+            assert_eq!(
+                std::fs::read(r["result"]["path"].as_str().unwrap()).unwrap(),
+                b"abc"
+            );
+        }
+        // still refused where the guard decides, before anything reaches the phone
+        let h = start(DeviceMode::Full);
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "push", "local": local.to_string_lossy(), "phone_path": "/sdcard/Andr\u{200D}oid/data/x" }),
+            )
+            .await;
+        assert_eq!(code(&r), INVALID_PARAMS, "{r}");
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "pull_new", "dir": "/sdcard/Andr\u{200D}oid/data/x", "poll_ms": 0 }),
+            )
+            .await;
+        assert_eq!(code(&r), INVALID_PARAMS, "{r}");
+        no_command_reached(&h);
+    });
+}
+
+/// `pull_new` passes over a newer file whose name the file guard would refuse (a shell
+/// metacharacter, an invisible character where the guard decides) and pulls the next one, naming
+/// what it passed over; with nothing else to pull it fails without pulling anything.
+#[test]
+fn pull_new_passes_over_a_newest_name_the_guard_refuses() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-skip");
+        let h = start(DeviceMode::Full);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["it's.png".into(), "Andr\u{200D}oid".into(), "ok.png".into()];
+            p.files.insert("/sdcard/ok.png".into(), b"okay".to_vec());
+            p.sizes = VecDeque::from([4, 4]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() })).await;
+        assert_eq!(r["result"]["phone_path"], "/sdcard/ok.png", "{r}");
+        let text = r["result"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("passed over") && text.contains("it's.png"),
+            "{text}"
+        );
+        assert!(!reached(&h).iter().any(|l| l.contains("it's")));
+        // nothing the guard accepts: an error that names what was passed over, and no pull
+        let h = start(DeviceMode::Full);
+        h.phone.lock().unwrap().listing = vec!["a;b.png".into()];
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0 }),
+            )
+            .await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        assert!(
+            r["error"]["message"].as_str().unwrap().contains("a;b.png"),
+            "{r}"
+        );
+        assert!(!reached(&h).iter().any(|l| l.starts_with("pull ")));
+    });
+}
+
+/// The list of passed-over names is capped: the first ten, then a count of the rest.
+#[test]
+fn pull_new_names_at_most_ten_passed_over_files() {
+    run(async {
+        let h = start(DeviceMode::Full);
+        h.phone.lock().unwrap().listing = (0..15).map(|i| format!("a;{i}.png")).collect();
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c
+            .tool(
+                POCO,
+                json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0 }),
+            )
+            .await;
+        assert_eq!(code(&r), DEVICE_ERROR, "{r}");
+        let msg = r["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("\"a;9.png\"] and 5 more"), "{msg}");
+        assert!(!msg.contains("a;10.png"), "{msg}");
+        assert!(!reached(&h).iter().any(|l| l.starts_with("pull ")));
+    });
+}
+
+/// A name with a bidi override (`invoice\u{202E}fdp.exe`, which Explorer would show as
+/// `invoiceexe.pdf`) is pulled to a laptop name with `_` in its place, and the answer's text shows
+/// the character escaped rather than raw.
+#[test]
+fn pull_new_writes_a_bidi_override_name_as_a_safe_local_name() {
+    run(async {
+        let dir = tmp_dir("devtools-pull-bidi");
+        let h = start(DeviceMode::Full);
+        {
+            let mut p = h.phone.lock().unwrap();
+            p.listing = vec!["invoice\u{202E}fdp.exe".into()];
+            p.files.insert(
+                "/sdcard/Download/invoice\u{202E}fdp.exe".into(),
+                b"MZ!".to_vec(),
+            );
+            p.sizes = VecDeque::from([3, 3]);
+        }
+        let mut c = Client::leased(&h, POCO).await;
+        let r = c.tool(POCO, json!({ "tool": "pull_new", "dir": "/sdcard/Download", "poll_ms": 0, "local_dir": dir.join("inbox").to_string_lossy() })).await;
+        let res = &r["result"];
+        assert_eq!(
+            res["phone_path"], "/sdcard/Download/invoice\u{202E}fdp.exe",
+            "{r}"
+        );
+        let path = res["path"].as_str().unwrap();
+        assert!(path.ends_with("invoice_fdp.exe"), "{path:?}");
+        assert_eq!(std::fs::read(path).unwrap(), b"MZ!");
+        let text = res["text"].as_str().unwrap();
+        assert!(!text.contains('\u{202E}'), "{text:?}");
+        assert!(text.contains("invoice\\u{202e}fdp.exe"), "{text:?}");
+    });
+}
+
 /// The laptop side is fenced: `push` reads only the outbox and `pull_new` writes only the inbox.
 /// A file elsewhere, a `..` name, or a pull into another folder is REFUSED (class `outbox` /
 /// `inbox`) and nothing reaches the phone.
