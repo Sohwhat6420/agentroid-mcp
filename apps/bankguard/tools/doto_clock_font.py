@@ -3,7 +3,7 @@ LED grid that the owner's own clock uses, read dot by dot from a screenshot of i
 Doto: https://github.com/oliverlalan/Doto (SIL OFL 1.1). Needs fontTools; Pillow only for the optional sheet.
 
 - Proportional, like the reference: a glyph's advance is its ink width plus one empty cell; a space is two cells.
-- Digits, A-Z and ! , . : ? are drawn here from the bitmaps below; the lowercase stays Doto's own.
+- Digits, A-Z and ! , . : ? % are drawn here from the bitmaps below; the lowercase stays Doto's own.
 - No contextual alternates (Doto's calt swaps the colon). Renamed DotoClock, as the OFL asks of a modified version.
 usage: python doto_clock_font.py <Doto[ROND,wght].ttf> <out.ttf> [sheet.png]"""
 import sys
@@ -14,10 +14,11 @@ from fontTools.varLib.instancer import instantiateVariableFont
 from fontTools import subset
 
 SRC, OUT = sys.argv[1], sys.argv[2]
-TEXT = "0123456789:.,!? ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+TEXT = "0123456789:.,!?% ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 # Rows top to bottom; an 8th row is below the baseline (the comma's tail). From the reference: 0, 1, 4, 6, 7, the
-# colon, the comma, H E L O !, S A T N V. The rest are the standard 5x7 LED shapes in the same style.
+# colon, the comma, H E L O !, S A T N V. The rest are the standard 5x7 LED shapes in the same style; the % is 7
+# wide, two rings and a slash, as the battery widget the owner had (NewThing) draws it.
 B = {
     "0": ".###.|#...#|#...#|#...#|#...#|#...#|.###.",
     "1": ".#.|##.|.#.|.#.|.#.|.#.|###",
@@ -34,6 +35,7 @@ B = {
     ",": "..|..|..|..|..|..|.#|#.",
     "!": "#|#|#|#|#|.|#",
     "?": ".###.|#...#|....#|...#.|..#..|.....|..#..",
+    "%": ".#....#|#.#..#.|.#..#..|...#...|..#..#.|.#..#.#|#....#.",
     "A": ".###.|#...#|#...#|#...#|#####|#...#|#...#",
     "B": "####.|#...#|#...#|####.|#...#|#...#|####.",
     "C": ".###.|#...#|#....|#....|#....|#...#|.###.",

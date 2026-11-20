@@ -6,7 +6,7 @@
      Built without Gradle (aapt2 + javac + d8, see build.sh). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.agentroid.bankguard"
-    android:versionCode="2"
+    android:versionCode="3"
     android:versionName="0.1-bankguard">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
@@ -25,8 +25,12 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Earbuds widget only: which paired earbuds are connected and their battery. Asked for when that widget is
+         tapped, or granted over adb at setup. Without it the widget says "Tap to enable"; nothing else needs it. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 
-    <!-- To list the apps the owner can tick or put in the dock, to open them, and to open the clock app. -->
+    <!-- To list the apps the owner can tick or put in the dock, to open them, and to open the clock and calendar. -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -35,6 +39,19 @@
         <intent>
             <action android:name="android.intent.action.SHOW_ALARMS" />
         </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.APP_CALENDAR" />
+        </intent>
+        <!-- The calendars the day widget may open (ClockLogic.CALENDARS, the original widget's list). -->
+        <package android:name="com.google.android.calendar" />
+        <package android:name="com.samsung.android.calendar" />
+        <package android:name="com.oneplus.calendar" />
+        <package android:name="com.miui.calendar" />
+        <package android:name="com.android.calendar" />
+        <package android:name="com.htc.calendar" />
+        <package android:name="com.lge.calendar" />
+        <package android:name="com.sonyericsson.calendar" />
         <!-- The clock apps a dot clock may open (ClockLogic.KNOWN, the original widget's list). -->
         <package android:name="com.google.android.deskclock" />
         <package android:name="com.sec.android.app.clockpackage" />
@@ -159,6 +176,51 @@
             </intent-filter>
             <meta-data android:name="android.appwidget.provider" android:resource="@xml/dock_info" />
         </receiver>
+        <!-- The owner's NewThing widgets, copied without their alarms (ClockWidget.GoodDay, InfoWidgets). Exported
+             for the launcher's APPWIDGET_UPDATE only. -->
+        <receiver
+            android:name=".ClockWidget$GoodDay"
+            android:label="@string/day_greeting_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/day_greeting_info" />
+        </receiver>
+        <receiver
+            android:name=".InfoWidgets$Year"
+            android:label="@string/year_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/year_info" />
+        </receiver>
+        <receiver
+            android:name=".InfoWidgets$Battery"
+            android:label="@string/battery_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/battery_info" />
+        </receiver>
+        <receiver
+            android:name=".InfoWidgets$Buds"
+            android:label="@string/buds_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/buds_info" />
+        </receiver>
+        <!-- NOT exported: only the earbuds widget's own tap opens it, to ask for Bluetooth access. -->
+        <activity
+            android:name=".InfoWidgets$Grant"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <!-- EXPORTED for the launcher (APPWIDGET_CONFIGURE). It only edits a dock widget of THIS app: it checks that
              the widget id belongs to DockWidget and closes otherwise. -->
         <activity

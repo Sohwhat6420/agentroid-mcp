@@ -46,6 +46,7 @@ a shell pm grant "$PKG" android.permission.WRITE_SECURE_SETTINGS
 a shell appops set "$PKG" ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null || true   # Android 13+ sideload guard
 a shell appops set "$PKG" GET_USAGE_STATS allow
 a shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+a shell pm grant "$PKG" android.permission.BLUETOOTH_CONNECT 2>/dev/null || true   # earbuds widget only
 a shell dumpsys deviceidle whitelist +"$PKG" >/dev/null
 
 echo "== check the grants took =="

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Day greeting (2x2): HAVE A GOOD / FRIDAY with its fainter copies / 06:03 PM. Positions from the original
+     (Calander03WidgetR), measured with both drawn side by side at the S24's 2x2 cell (188 x 212 dp) in a test host on
+     the POCO, 20 Nov 2026; the day centred. Each line is a bitmap of DotoClock text drawn by ClockWidget.GoodDay; a
+     bitmap's caps start 0.26 em below its top, hence the margins. -->
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/w_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/w_card_nt">
+
+    <ImageView
+        android:id="@+id/w_greeting"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerHorizontal="true"
+        android:layout_marginTop="21.2dp"
+        android:importantForAccessibility="no" />
+
+    <ImageView
+        android:id="@+id/w_day"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="12dp"
+        android:scaleType="centerInside" />
+
+    <ImageView
+        android:id="@+id/w_time"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerHorizontal="true"
+        android:layout_marginTop="165.8dp" />
+</RelativeLayout>

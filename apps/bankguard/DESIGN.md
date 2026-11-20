@@ -56,6 +56,24 @@ screen-on; off, it does nothing. A clock change, timezone or locale change also 
 - A bank on the bank guard's list opens from the dock through OpenSafely, so debugging is off before the bank starts.
 - Tapping a clock opens the phone's alarms.
 
+## The NewThing copies (20 Nov 2026)
+The owner's last four NewThing widgets, copied so NewThing can go. Each was drawn beside its original in a test host on
+the POCO at the S24's cell size and tuned until the two matched; the art (earbuds, battery face) is this app's own.
+
+| Widget | Original (wakeups on the S24) | This one | Tap |
+| --- | --- | --- | --- |
+| Day greeting, 2x2 | Calander03WidgetR: an exact RTC_WAKEUP every minute (571 in 15 h) | Minute tick while the screen is on | The calendar: NewThing's list (Google first), else the default, else date settings |
+| Year in dots, 4x2 | YearsDaysCountR: redraws on every minute tick | Redraws only when the date changes | The default calendar (`APP_CALENDAR`) |
+| Battery face, 2x2 | BatteryWidgetEmojiR: RTC_WAKEUP every 15 min | `ACTION_BATTERY_CHANGED`, only while placed; redraws on a new percent | Battery usage |
+| Earbuds battery, 2x2 | EarBudsBattery2R: NewThing's 30-minute update | Bluetooth broadcasts, only while placed | Bluetooth settings; without `BLUETOOTH_CONNECT`, a screen that asks for it |
+
+- All four: `updatePeriodMillis` 0, no alarm. The battery and Bluetooth receivers are registered by GuardService only
+  while such a widget is on a home screen (`battery_armed`, `bluetooth_armed` and `info_events` in its dump).
+- With the screen off, a battery change only marks the widget stale; it is drawn at screen-on.
+- The day greeting is 12-hour, as the original's default, whatever the phone's setting.
+- The earbuds' battery uses the hidden `BluetoothDevice.getBatteryLevel()` by reflection and the system's
+  `BATTERY_LEVEL_CHANGED` broadcast, as the original does; a phone that hides it shows "Connected" without a number.
+
 ## Motion
 None, on purpose. These are restrained surfaces under rule 4 of the design standard, and the battery is the point.
 - Animating a widget means redrawing it on a timer, which is what this replaces.

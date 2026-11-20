@@ -85,6 +85,9 @@ public final class GuardService extends Service {
                 if (Intent.ACTION_SCREEN_ON.equals(i.getAction())) {
                     ClockWidget.forgetClockTarget(); // a clock app installed or removed since is picked up
                     drawClocks();
+                    InfoWidgets.Year.tick(GuardService.this, false);
+                    InfoWidgets.Battery.screenOn(GuardService.this);
+                    InfoWidgets.Buds.screenOn(GuardService.this);
                 }
             } });
         }
@@ -98,7 +101,11 @@ public final class GuardService extends Service {
     private final BroadcastReceiver clock = new BroadcastReceiver() {
         @Override public void onReceive(Context c, final Intent i) {
             h.post(new Runnable() { public void run() {
-                if (interactive || !Intent.ACTION_TIME_TICK.equals(i.getAction())) drawClocks();
+                boolean tick = Intent.ACTION_TIME_TICK.equals(i.getAction());
+                if (interactive || !tick) {
+                    drawClocks();
+                    InfoWidgets.Year.tick(GuardService.this, !tick); // a new day only, unless the date or time moved
+                }
             } });
         }
     };
@@ -106,6 +113,59 @@ public final class GuardService extends Service {
     private void drawClocks() {
         clockDraws++;
         ClockWidget.renderAll(this);
+    }
+
+    /**
+     * The battery and earbuds widgets' listeners, registered only while such a widget is placed (widgetsChanged), on
+     * the service's thread. Both are the system's own broadcasts; neither sets an alarm.
+     */
+    private final BroadcastReceiver battery = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            infoEvents++;
+            InfoWidgets.Battery.changed(GuardService.this, i, interactive);
+        }
+    };
+    private final BroadcastReceiver bluetooth = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            infoEvents++;
+            InfoWidgets.Buds.changed(GuardService.this, i, interactive);
+        }
+    };
+    private boolean batteryArmed, bluetoothArmed;
+    private long infoEvents;
+
+    /** The running service, so a widget placed or removed can re-arm the listeners (null when not running). */
+    private static volatile GuardService live;
+
+    static void widgetsChanged(Context c) {
+        final GuardService s = live;
+        if (s != null) s.h.post(new Runnable() { public void run() { s.armInfo(); } });
+    }
+
+    private void armInfo() {
+        boolean wantBattery = InfoWidgets.placed(this, InfoWidgets.Battery.class);
+        if (wantBattery != batteryArmed) {
+            if (wantBattery) registerReceiver(battery, new IntentFilter(Intent.ACTION_BATTERY_CHANGED), null, h);
+            else try { unregisterReceiver(battery); } catch (Throwable ignored) { }
+            batteryArmed = wantBattery;
+        }
+        boolean wantBt = InfoWidgets.placed(this, InfoWidgets.Buds.class) && InfoWidgets.Buds.permitted(this);
+        if (wantBt != bluetoothArmed) {
+            if (wantBt) {
+                // Exported: Bluetooth's broadcasts come from its own app, not the system. Display only, and the
+                // battery-level one is a protected broadcast.
+                if (Build.VERSION.SDK_INT >= 33) {
+                    registerReceiver(bluetooth, InfoWidgets.Buds.filter(), null, h, Context.RECEIVER_EXPORTED);
+                } else {
+                    registerReceiver(bluetooth, InfoWidgets.Buds.filter(), null, h);
+                }
+                InfoWidgets.Buds.refresh(this);
+                new InfoWidgets.Buds().renderAll(this);
+            } else {
+                try { unregisterReceiver(bluetooth); } catch (Throwable ignored) { }
+            }
+            bluetoothArmed = wantBt;
+        }
     }
 
     // Home Wi-Fi mode: the name and access point each Wi-Fi network up now was last seen with (poll thread only).
@@ -214,7 +274,12 @@ public final class GuardService extends Service {
         registerReceiver(clock, t);
         PowerManager pm = getSystemService(PowerManager.class);
         interactive = pm == null || pm.isInteractive();
-        h.post(new Runnable() { public void run() { drawClocks(); } });
+        h.post(new Runnable() { public void run() {
+            drawClocks();
+            InfoWidgets.Year.tick(GuardService.this, true);
+            armInfo();
+        } });
+        live = this;
         core.prefs().registerOnSharedPreferenceChangeListener(prefsChanged);
     }
 
@@ -446,14 +511,18 @@ public final class GuardService extends Service {
         w.println("interactive=" + interactive + " wifi_networks=" + wifiUp.size() + " polling=" + polling
                 + " top=" + visible.top + " visible=" + visible.size() + " home=" + home
                 + " ticks=" + ticks + " mean_tick_us=" + (ticks == 0 ? 0 : tickNanos / ticks / 1000)
-                + " clock_draws=" + clockDraws);
+                + " clock_draws=" + clockDraws + " info_events=" + infoEvents + " battery_armed=" + batteryArmed
+                + " bluetooth_armed=" + bluetoothArmed);
     }
 
     @Override
     public void onDestroy() {
         polling = false;
+        live = null;
         try { unregisterReceiver(screen); } catch (Throwable ignored) { }
         try { unregisterReceiver(clock); } catch (Throwable ignored) { }
+        if (batteryArmed) try { unregisterReceiver(battery); } catch (Throwable ignored) { }
+        if (bluetoothArmed) try { unregisterReceiver(bluetooth); } catch (Throwable ignored) { }
         try { cm.unregisterNetworkCallback(net); } catch (Throwable ignored) { }
         core.prefs().unregisterOnSharedPreferenceChangeListener(prefsChanged);
         if (thread != null) thread.quitSafely();

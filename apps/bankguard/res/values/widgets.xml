@@ -18,4 +18,20 @@
     <string name="clock_large_desc">A large dot-matrix time with the day, date and month. No alarms, no wakeups.</string>
     <string name="dock_label">App dock</string>
     <string name="dock_desc">A horizontal pill of up to six apps you choose. Redrawn only when you change it.</string>
+
+    <!-- The day, year, battery and earbuds widgets copy the owner's NewThing Widgets Pro originals; colours sampled
+         from those (20 Nov 2026). -->
+    <color name="w_nt_card">#FF1D1D1D</color>
+    <color name="w_nt_red">#FFBC312B</color>
+    <color name="w_nt_grey_text">#FF6C696D</color>
+
+    <string name="day_greeting_label">Day greeting</string>
+    <string name="day_greeting_desc">HAVE A GOOD FRIDAY and the time, on a dark card. Tap for the calendar. No alarms, no wakeups.</string>
+    <string name="year_label">Year in dots</string>
+    <string name="year_desc">A dot for every day of the year and the days left. Tap for the calendar. Redrawn once a day.</string>
+    <string name="year_remaining">REMAINING</string>
+    <string name="battery_label">Battery face</string>
+    <string name="battery_desc">The battery level with a face that changes with it. Tap for battery usage. Redrawn only when the level changes.</string>
+    <string name="buds_label">Earbuds battery</string>
+    <string name="buds_desc">Your connected earbuds and their battery. Tap for Bluetooth. Redrawn only when Bluetooth tells it something changed.</string>
 </resources>

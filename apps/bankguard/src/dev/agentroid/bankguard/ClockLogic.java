@@ -37,4 +37,24 @@ public final class ClockLogic {
         for (String p : KNOWN) if (launchable.contains(p)) return p;
         return null;
     }
+
+    /**
+     * NewThing's calendar list (CalendarIntentHelper.getAutoDetectedCalendarIntent), in its order. Its day widget
+     * (Calander03WidgetR) opens the first of these that is installed, then the phone's default calendar
+     * (MAIN + APP_CALENDAR), then Date and time settings.
+     */
+    public static final String[] CALENDARS = {
+        "com.google.android.calendar", "com.samsung.android.calendar", "com.oneplus.calendar", "com.miui.calendar",
+        "com.android.calendar", "com.htc.calendar", "com.lge.calendar", "com.sonyericsson.calendar",
+    };
+
+    /**
+     * The calendar the day widget opens: the first of CALENDARS with a launcher entry, as the original (which tries
+     * its list before the default); else the default calendar app if it has one; else null (the settings fallback).
+     */
+    public static String chooseCalendar(String defaultApp, Set<String> launchable) {
+        for (String p : CALENDARS) if (launchable.contains(p)) return p;
+        if (defaultApp != null && !CHOOSER.equals(defaultApp) && launchable.contains(defaultApp)) return defaultApp;
+        return null;
+    }
 }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The NewThing-style card behind the day, year, battery and earbuds widgets: #1D1D1D (sampled from the originals),
+     22 dp corners (the original's rounded_corner_bgs_r). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@color/w_nt_card" />
+    <corners android:radius="22dp" />
+</shape>

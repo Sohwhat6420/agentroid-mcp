@@ -81,4 +81,61 @@ final class ClockRender {
     static Bitmap line(Context c, float sp, String[] text, int[] colour, float gapEm, boolean shadow) {
         return line(c, sp, text, colour, gapEm, shadow, 0);
     }
+
+    /**
+     * One colour, letters closer together than the font sets them: each advance shortened by trimEm (NewThing's
+     * widgets set the same dot glyphs tighter than DotoClock's own spacing).
+     */
+    static Bitmap tight(Context c, float sp, String text, int colour, float trimEm) {
+        return draw(c, sp, text, colour, 0, trimEm, false);
+    }
+
+    /**
+     * The day widget's word: drawn once in full colour, with two fainter copies above and two below (alpha 0.35 one
+     * step away, 0.2 two steps away), as the original stacks five copies of it. stepEm apart; the full one on top.
+     */
+    static Bitmap echo(Context c, float sp, String text, int colour, float stepEm, float trimEm) {
+        return draw(c, sp, text, colour, stepEm, trimEm, true);
+    }
+
+    private static Bitmap draw(Context c, float sp, String text, int colour, float stepEm, float trimEm, boolean copies) {
+        float px = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, sp, c.getResources().getDisplayMetrics());
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setTypeface(face(c));
+        p.setTextSize(px);
+        float step = copies ? stepEm * px : 0, trim = trimEm * px;
+        float[] adv = new float[text.length()];
+        float w = 0;
+        for (int i = 0; i < adv.length; i++) {
+            adv[i] = p.measureText(text, i, i + 1) - trim;
+            w += adv[i];
+        }
+        int bw = Math.max(1, (int) Math.ceil(w + trim - 0.1f * px));
+        int bh = Math.max(1, (int) Math.ceil(1.2f * px + 4 * step));
+        Bitmap b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
+        Canvas cv = new Canvas(b);
+        float base = 2 * step + 0.95f * px;
+        int[] k = copies ? new int[] {-2, 2, -1, 1, 0} : new int[] {0};
+        float[] alpha = copies ? new float[] {0.2f, 0.2f, 0.35f, 0.35f, 1f} : new float[] {1f};
+        for (int i = 0; i < k.length; i++) {
+            p.setColor(colour);
+            p.setAlpha(Math.round(255 * alpha[i]));
+            float x = 0;
+            for (int j = 0; j < adv.length; j++) {
+                cv.drawText(text, j, j + 1, x, base + k[i] * step, p);
+                x += adv[j];
+            }
+        }
+        return b;
+    }
+
+    /** Keeps only what DotoClock draws (A-Z, digits, space and . , ! ? : %), upper-cased; for names from outside. */
+    static String drawable(String s) {
+        StringBuilder b = new StringBuilder();
+        for (char ch : s.toUpperCase(java.util.Locale.ROOT).toCharArray()) {
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || " .,!?:%".indexOf(ch) >= 0) b.append(ch);
+            else if (ch == '-' || ch == '_' || ch == '(' || ch == ')') b.append(' ');
+        }
+        return b.toString().replaceAll(" +", " ").trim();
+    }
 }

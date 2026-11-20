@@ -36,11 +36,14 @@ import java.util.Set;
  */
 public abstract class ClockWidget extends AppWidgetProvider {
     static final int INK = 0xFFF4F4F5, DIM = 0xFF9A9AA0, RED = 0xFFCD3733;
-    static final Class<?>[] ALL = {Greeting.class, Row.class, Large.class};
+    static final Class<?>[] ALL = {Greeting.class, Row.class, Large.class, GoodDay.class};
 
     abstract int layout();
 
     abstract void fill(Context c, RemoteViews rv, Date now, boolean h24);
+
+    /** What a tap opens: the clock app for the dot clocks. */
+    Intent tapIntent(Context c) { return clockIntent(c); }
 
     @Override
     public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
@@ -66,8 +69,9 @@ public abstract class ClockWidget extends AppWidgetProvider {
     void render(Context c, AppWidgetManager m, int id) {
         RemoteViews rv = new RemoteViews(c.getPackageName(), layout());
         fill(c, rv, new Date(), DateFormat.is24HourFormat(c));
-        // The whole widget opens the clock app, as the owner's original does (see ClockLogic for why not SHOW_ALARMS).
-        rv.setOnClickPendingIntent(R.id.w_root, PendingIntent.getActivity(c, 100 + id % 1000, clockIntent(c),
+        // The whole widget opens the clock app, as the owner's original does (see ClockLogic for why not SHOW_ALARMS);
+        // the day widget opens the calendar.
+        rv.setOnClickPendingIntent(R.id.w_root, PendingIntent.getActivity(c, 100 + id % 1000, tapIntent(c),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
         m.updateAppWidget(id, rv);
     }
@@ -77,7 +81,36 @@ public abstract class ClockWidget extends AppWidgetProvider {
 
     /** Forget the clock app (called at screen-on, on placement and on a time change), so an app installed or removed
      *  since is picked up at the next redraw. */
-    static void forgetClockTarget() { clockTarget = null; }
+    static void forgetClockTarget() { clockTarget = null; calendarTarget = null; }
+
+    private static volatile Intent calendarTarget;
+
+    /** The calendar app's launch intent (ClockLogic.chooseCalendar), kept like the clock's. */
+    static Intent calendarIntent(Context c) {
+        Intent t = calendarTarget;
+        if (t == null) calendarTarget = t = findCalendarIntent(c);
+        return new Intent(t);
+    }
+
+    private static Intent findCalendarIntent(Context c) {
+        PackageManager pm = c.getPackageManager();
+        String def = null;
+        try {
+            ResolveInfo ri = pm.resolveActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_CALENDAR),
+                    PackageManager.MATCH_DEFAULT_ONLY);
+            if (ri != null && ri.activityInfo != null) def = ri.activityInfo.packageName;
+        } catch (Throwable ignored) { }
+        Set<String> launchable = new HashSet<String>();
+        List<String> probe = new ArrayList<String>(Arrays.asList(ClockLogic.CALENDARS));
+        if (def != null) probe.add(def);
+        for (String p : probe) {
+            try { if (pm.getLaunchIntentForPackage(p) != null) launchable.add(p); } catch (Throwable ignored) { }
+        }
+        String pkg = ClockLogic.chooseCalendar(def, launchable);
+        Intent i = pkg == null ? null : pm.getLaunchIntentForPackage(pkg);
+        if (i == null) i = new Intent(Settings.ACTION_DATE_SETTINGS); // NewThing's own fallback
+        return i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+    }
 
     static Intent clockIntent(Context c) {
         Intent t = clockTarget;
@@ -171,6 +204,33 @@ public abstract class ClockWidget extends AppWidgetProvider {
                     new int[] {DIM, RED, DIM}, 0.6f, false));
             rv.setContentDescription(R.id.w_time, t);
             rv.setContentDescription(R.id.w_sub, fmt("EEEE d MMMM", d));
+        }
+    }
+
+    /**
+     * HAVE A GOOD / FRIDAY (red, with fainter copies above and below) / 06:03 PM, on a dark card: the owner's NewThing
+     * "Date Greeting" (Calander03WidgetR). Its tap opens the calendar, as the original's does. The original wakes the
+     * phone every minute with its own exact alarm for the time line; this one is redrawn on the system's minute tick
+     * while the screen is on, like the dot clocks.
+     */
+    public static final class GoodDay extends ClockWidget {
+        static final int NT_INK = 0xFFF1F1F1, NT_RED = 0xFFBC312B;
+
+        @Override int layout() { return R.layout.widget_day_greeting; }
+
+        @Override Intent tapIntent(Context c) { return calendarIntent(c); }
+
+        @Override void fill(Context c, RemoteViews rv, Date d, boolean h24) {
+            // 12-hour whatever the phone's setting, as the original (its own "24-hour clock" option is off by default).
+            String t = caps(fmt("hh:mm a", d));
+            String day = caps(fmt("EEEE", d));
+            // Sizes from the original drawn side by side with this one: caps 14.5 dp and 21 dp (DotoClock caps are
+            // 0.69 em), letters 0.05 em closer than DotoClock sets them.
+            rv.setImageViewBitmap(R.id.w_greeting, ClockRender.tight(c, 21, "HAVE A GOOD", NT_INK, 0.05f));
+            rv.setImageViewBitmap(R.id.w_day, ClockRender.echo(c, 30.4f, day, NT_RED, 0.46f, 0.05f));
+            rv.setImageViewBitmap(R.id.w_time, ClockRender.tight(c, 21, t, NT_INK, 0.05f));
+            rv.setContentDescription(R.id.w_day, "Have a good " + fmt("EEEE", d));
+            rv.setContentDescription(R.id.w_time, t);
         }
     }
 }
