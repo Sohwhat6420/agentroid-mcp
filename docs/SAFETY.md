@@ -63,6 +63,16 @@ The same guard covers the two ways round the screen. Raw shell lines from the sc
 
 **The laptop side is fenced too.** `push` (full devices only) reads only files inside `%LOCALAPPDATA%\agentroid\files\outbox`, and `pull_new` writes only inside `%LOCALAPPDATA%\agentroid\files\inbox` (both under the daemon's `--state-dir`). A plain name is taken inside that folder. An absolute path must resolve, links followed, to a place inside it. Anything else, such as an SSH key, a `.env` file, a `..` name or a pull into your Startup folder, is refused before the phone is touched. To send a file to the phone, copy it into the outbox first. Until 11 Nov the laptop side was not restricted at all, so a `full` token could copy any file your Windows user can read.
 
+## How phone text reaches the model
+
+The guard limits what a misled model can do. A second, weaker layer tries to keep it from being misled in the first place. It is in the MCP server (`apps/mcp/src/untrusted.ts`), not the daemon:
+
+- Every tool result prints text that was read from the phone, or that describes it, between `<phone-data ID>` and `</phone-data ID>`. That covers the UI tree, command output, file names, and the daemon's refusals, which quote the on-screen label they matched. `ID` is random for each result and chosen after the text was read, so nothing on the phone can write the line that closes its own block.
+- The server instructions tell the model that this block is data and never instructions, and that the server's own notices (the `SESSION ACTION` line after a job ends) count only outside it. A line inside the block that imitates that notice is kept but prefixed with `[phone text]`.
+- The one-line health header carries a window title and a model name, which the phone chooses. Both are stripped of line breaks, control and bidirectional characters and cut to a fixed length.
+
+This is marking, not proof. A model can still be talked round by text it was told is data. OWASP lists "Segregate and identify external content" as one of seven mitigations for LLM01:2025, and says of all of them that "it is unclear if there are fool-proof methods of prevention for prompt injection". The guard, the device modes and the approval channel are what hold when the marking fails.
+
 ## What it catches
 
 Each line is a real test case. The fixtures are UI trees: two recorded from a real phone, the rest built by hand. The full table, with the exact call and the rule that fired, is in [`generated/redteam/results.md`](../generated/redteam/results.md) and is regenerated on every test run.

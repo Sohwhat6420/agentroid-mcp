@@ -31,6 +31,7 @@ import { Supervisor } from "./supervise.ts";
 import type { JobSnapshot, Notice } from "./supervise.ts";
 import { INSTRUCTIONS, TOOLS, listTools, outputSchemaFor, toolByName } from "./tools.ts";
 import type { ErrorKind, Level, Profile, ToolDef, WireTool } from "./tools.ts";
+import { fence } from "./untrusted.ts";
 
 // JSON-RPC application codes (crates/bridged/src/proto.rs).
 const CODE = { LEASE_HELD: -32001, NOT_HOLDER: -32002, REFUSED: -32003, DEVICE_ERROR: -32004, UNKNOWN_DEVICE: -32005, INVALID_PARAMS: -32602 } as const;
@@ -184,6 +185,26 @@ const CALL_RESULT_SCHEMA: Schema = {
   required: ["tool", "text"],
   properties: { tool: S, text: S, image_bytes: { type: ["integer", "null"], minimum: 0 } },
 };
+
+/**
+ * Errors whose message is this server's own wording about the call itself (the arguments, the tool
+ * name, a time limit, the pipe). Every other error message was written by the daemon about a phone
+ * and can quote what the phone shows (a refusal quotes the on-screen label it matched, a device
+ * error carries adb's output), so it goes inside the phone-data fence like any other phone text.
+ */
+const SERVER_WORDED: ReadonlySet<ErrorKind> = new Set<ErrorKind>(["invalid_input", "unknown_tool", "timeout", "transport", "bad_reply", "bad_output"]);
+
+/** The text of one result, in the order it is printed after the health line. */
+interface ResultText {
+  /** The server's own line before the body (an error's label); may be empty. */
+  lead: string;
+  /** The answer itself. */
+  body: string;
+  /** True when `body` was read from, or describes, a phone: it is printed inside the phone-data fence. */
+  fenced: boolean;
+  /** The server's own notices (supervision cards), printed after the body and never fenced. */
+  notes: string[];
+}
 
 const GENERIC_DEF: ToolDef = { name: "?", description: "", input: true, data: { type: "object" }, read: false, minimal: false, route: "device_call", daemon: "planned" };
 
@@ -586,7 +607,8 @@ export function createServer(opts: ServerOptions): Server {
     const def = toolByName(name);
     let data: Record<string, unknown> | undefined;
     let error: ToolError | undefined;
-    let body = "";
+    // every successful answer comes from the daemon and describes a phone: fenced unless shown otherwise
+    const text: ResultText = { lead: "", body: "", fenced: true, notes: [] };
     // MCP progress while the call is in flight, only when the client gave a progressToken
     let beat: unknown;
     const progress = extra.progress;
@@ -616,11 +638,19 @@ export function createServer(opts: ServerOptions): Server {
       };
       const out = await withDeadline(work(), name, def?.route === "job");
       data = out.data;
-      body = out.body;
+      text.body = out.body;
     } catch (e) {
       const f = e instanceof ToolFailure ? e : mapDaemonError(e);
       error = f.err;
-      body = `${LABEL[f.err.kind] ?? "Error"}: ${f.err.message}`;
+      const label = LABEL[f.err.kind] ?? "Error";
+      // a daemon-coded invalid_input echoes the daemon's view of the call, which may name phone content
+      if (SERVER_WORDED.has(f.err.kind) && f.err.code === null) {
+        text.body = `${label}: ${f.err.message}`;
+        text.fenced = false;
+      } else {
+        text.lead = `${label}:`;
+        text.body = f.err.message;
+      }
       // a refusal may carry the health the daemon could give for the device (never asked for separately)
       const h = (f.err.data as { health?: unknown } | undefined)?.health;
       if (h !== undefined) ctx.observation = mergeObservations(ctx.observation, parseObservation(h));
@@ -631,13 +661,13 @@ export function createServer(opts: ServerOptions): Server {
     // stuck / done notices (from this call or from the watcher) go out with the next result, once
     const notices: Notice[] = supervisor.drain();
     if (notices.length > 0) {
-      body = [body, ...notices.map((n) => n.card)].filter((l) => l.length > 0).join("\n");
+      text.notes = notices.map((n) => n.card);
       if (data !== undefined && def?.route === "job") data = { ...data, supervision: notices };
     }
-    return finish(def ?? GENERIC_DEF, name, runId, ctx, data, error, body, { t0, cpu0, busy0 });
+    return finish(def ?? GENERIC_DEF, name, runId, ctx, data, error, text, { t0, cpu0, busy0 });
   }
 
-  function finish(def: ToolDef, name: string, runId: string, ctx: { device: string; observation: Observation }, data: Record<string, unknown> | undefined, error: ToolError | undefined, body: string, m: { t0: number; cpu0: number; busy0: number }): ToolResult {
+  function finish(def: ToolDef, name: string, runId: string, ctx: { device: string; observation: Observation }, data: Record<string, unknown> | undefined, error: ToolError | undefined, text: ResultText, m: { t0: number; cpu0: number; busy0: number }): ToolResult {
     const baseline = tracker.lastForeground(ctx.device);
     let header: Header;
     try {
@@ -673,12 +703,15 @@ export function createServer(opts: ServerOptions): Server {
       const msg = `the ${name} result failed its output schema: ${describeIssues(issues)}`;
       const e: ToolError = { kind: "bad_output", code: null, message: msg };
       env = { ok: false, error: e, header, receipt: mkReceipt(false, [msg]) };
-      body = `${LABEL.bad_output}: ${msg}`;
+      // the server's own words about a schema: the rejected answer itself is not repeated
+      text = { lead: "", body: `${LABEL.bad_output}: ${msg}`, fenced: false, notes: text.notes };
       if (validate(env, schema).length > 0) {
         env = { ok: false, error: e, header: blankHeader(), receipt: buildReceipt({ runId, device: "none", tool: name, ok: false, wallTimeS: 0, laptopCpuS: 0, retries: 0, errors: [msg] }) };
       }
     }
-    const lines = [headerLine(env.header), body];
+    // Order: the health line, the server's own lead, the answer (fenced when it is phone text), the
+    // server's notices, the error kind. Only the fenced part can hold text the phone chose.
+    const lines = [headerLine(env.header), text.lead, text.fenced ? fence(text.body) : text.body, ...text.notes];
     if (!env.ok) lines.push(`error kind: ${env.error?.kind ?? "?"}`);
     const result: ToolResult = { content: [{ type: "text", text: lines.filter((l) => l.length > 0).join("\n") }], structuredContent: env };
     if (!env.ok) result.isError = true;
