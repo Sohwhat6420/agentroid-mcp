@@ -828,13 +828,18 @@ fn a_doctor_call_holds_the_screen_awake_and_the_session_ending_restores_it() {
             (Some("1800000".into()), Some("7".into())),
             "{notes:?}"
         );
-        drop(c); // the session ends: the restore runs on its own thread
+        // the session ends: the restore runs on its own thread
+        drop(c);
+        // The two keys are restored one after the other, the timeout first. Waiting for the timeout
+        // alone left a gap in which stay-on was still 7 when the assertion below read it, so wait
+        // for both.
+        let restored = (Some("30000".to_string()), Some("0".to_string()));
         for _ in 0..200 {
-            if held().0.as_deref() == Some("30000") {
+            if held() == restored {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(held(), (Some("30000".into()), Some("0".into())));
+        assert_eq!(held(), restored);
     });
 }
