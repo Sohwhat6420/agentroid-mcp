@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-NO_WINDOW = 0x08000000
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 
 
 def chunks(names: list[str], size: int) -> list[list[str]]:

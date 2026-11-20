@@ -38,7 +38,7 @@ def main() -> int:
     state = Path(tmp) / "state"
     pipe = rf"\\.\pipe\agentroid-aw-smoke-{os.getpid()}"
     proc = subprocess.Popen([str(BRIDGED), "--adb", "auto", "--allow-emulators", "--pipe", pipe, "--state-dir", str(state)],
-                            creationflags=0x08000000, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            creationflags=(0x08000000 if sys.platform == "win32" else 0), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     client = None
     try:
         log = state / "bridged.log"
@@ -58,7 +58,7 @@ def main() -> int:
     finally:
         if client:
             client.close()
-        subprocess.run([str(BRIDGED), "--stop", "--state-dir", str(state)], creationflags=0x08000000, timeout=30)
+        subprocess.run([str(BRIDGED), "--stop", "--state-dir", str(state)], creationflags=(0x08000000 if sys.platform == "win32" else 0), timeout=30)
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:

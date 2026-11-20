@@ -5,7 +5,7 @@ import os
 ADB = os.environ.get("AGENTROID_ADB", "adb")
 
 def dump():
-    r = subprocess.run([ADB, "-s", "emulator-5554", "exec-out", "uiautomator", "dump", "/dev/tty"], capture_output=True, creationflags=0x08000000, timeout=60)
+    r = subprocess.run([ADB, "-s", "emulator-5554", "exec-out", "uiautomator", "dump", "/dev/tty"], capture_output=True, creationflags=(0x08000000 if sys.platform == "win32" else 0), timeout=60)
     t = r.stdout.decode("utf-8", "replace")
     return ("<hierarchy" in t, len(t))
 

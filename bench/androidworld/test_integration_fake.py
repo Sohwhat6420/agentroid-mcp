@@ -19,7 +19,7 @@ import agentroid_mcp as am
 
 SCAFFOLD = Path(__file__).resolve().parents[2]
 BRIDGED = SCAFFOLD / "target" / "debug" / "bridged.exe"
-CREATE_NO_WINDOW = 0x08000000
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 
 
 @unittest.skipUnless(os.name == "nt" and BRIDGED.exists(), f"{BRIDGED} not built (cargo build -p agentroid-bridged)")

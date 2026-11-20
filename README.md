@@ -1,226 +1,353 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/banner-dark.svg">
+  <img src="docs/media/banner-light.svg" width="100%" alt="Agentroid: give your AI agent a real Android phone. A real screenshot of a Xiaomi POCO X6 Pro home screen, shown on a phone on a desk (the phone body and the desk are a generated picture), sits beside an example: you ask the AI to open Claude on the phone; it looks at the screen, taps the Claude app, then asks only for what changed. One look costs up to 50 times fewer tokens than Android's raw screen description: 229 tokens for the short answer and 1,241 for the full list, against 11,565, measured on one real home screen.">
+</picture>
+
 # Agentroid
 
-![Status: preview](docs/media/badge-preview.svg) ![Benchmark: in progress](docs/media/badge-benchmark.svg)
+**Your AI agent drives a real Android phone, for [9 to 50 times fewer tokens](#what-one-look-costs) per look at the screen.**
 
-Agentroid lets an AI agent that speaks MCP, such as Claude Code, look at and operate an Android phone or emulator over adb. The MCP server makes no model calls, so it needs no model API key, and the safety checks run in a Rust daemon rather than in a prompt.
+Agentroid is an MCP server (MCP is the plug-in standard AI agents use for tools). It lets an agent such as Claude Code see the screen, tap, type, swipe and open apps on a phone you own. It hands the agent a short text list in place of Android's raw screen description (the comparison behind "9 to 50 times") or a screenshot, so a long task fits before the AI runs out of room.
 
-It is meant for developers and testers who want an agent to drive an Android device, and for people with spare or test phones.
+[![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-167C4A?labelColor=0A1410)](LICENSE)
+[![Status: preview 0.1.0](https://img.shields.io/badge/status-preview%200.1.0-167C4A?labelColor=0A1410)](#status-and-limits)
+[![MCP server](https://img.shields.io/badge/MCP-server-167C4A?labelColor=0A1410)](#how-it-works)
+[![Runs on Windows 11](https://img.shields.io/badge/runs%20on-Windows%2011-167C4A?labelColor=0A1410)](#quick-start)
+[![Tested on a POCO X6 Pro, Android 15](https://img.shields.io/badge/tested%20on-POCO%20X6%20Pro%20%C2%B7%20Android%2015-167C4A?labelColor=0A1410)](#works-on)
 
-> **Preview: a trial and demo release.** It works and is tested, but it is not 1.0, and the benchmark run is still in progress ([Benchmark](#benchmark) shows only what has been measured so far). Read [Project status](#project-status) before you try it. In this build the daemon is Windows-only, and out of the box it will drive emulators, not physical phones.
+[Quick start](#quick-start) · [What one look costs](#what-one-look-costs) · [Works on](#works-on) · [How it works](#how-it-works) · [Safety](#safety) · [Docs](#docs)
 
-## The parts
+<!-- DEMO SLOT. When docs/media/demo-poco.gif exists, point this image at it and rewrite the alt text and the caption below to match that recording. -->
+<p align="center">
+  <img src="docs/media/demo-3.gif" width="760" alt="A real recording. Left: the Calculator app on a Xiaomi POCO X6 Pro. Right: the calls sent to Agentroid. One call carries six taps; the phone shows 9 x 8 + 7 = 79 and the call returns one 'done' row per tap.">
+</p>
 
-| | What it is | Evidence today |
+<p align="center"><sub>Real recording, POCO X6 Pro: one call, six taps; 49 s on the phone, shown at 4×. A script sent the calls, not Claude Code.</sub></p>
+
+## What one look costs
+
+An AI pays for everything it reads, in tokens, and everything it reads stays in its memory for the rest of the task. So the size of one look at the screen decides both the bill and how many steps fit.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/tokens-dark.svg">
+  <img src="docs/media/tokens-light.svg" width="100%" alt="Two charts for one real phone screen. First, the tokens one look costs: Android's raw screen description 11,565; a screenshot 3,867; Agentroid's full list 1,241; Agentroid's short answer, the default, 229; Agentroid's 'what changed?' when nothing had, 35. Second, how many looks fit in a 200,000-token context window: 17 with the raw description, 51 with screenshots, 161 with Agentroid's full list, 873 with Agentroid's short answer.">
+</picture>
+
+| What the AI is shown | Tokens | Looks that fit in 200,000 tokens | 1,000 looks cost |
+| --- | ---: | ---: | ---: |
+| Android's raw screen description (`uiautomator dump`, the XML Android hands any app that asks what is on screen) | 11,565 | 17 | USD 46.26 |
+| A screenshot of the phone (1220×2712 PNG) | 3,867 | 51 | USD 15.47 |
+| **Agentroid, the full list** (every element; tappable ones get a short id) | **1,241** | **161** | **USD 4.96** |
+| **Agentroid, the short answer** (the default) | **229** | **873** | **USD 0.92** |
+| **Agentroid, "what changed?"** when nothing had | **35** | a follow-up, not a first look | |
+
+- **Measured:** the token column. The home screen of a Xiaomi POCO X6 Pro as recorded on 20 Oct 2026 (the screenshot row is the same phone's home screen on 14 Nov 2026), counted on 14 Nov 2026 with Anthropic's token counter for Claude Opus 5.5. The raw counts and how to repeat them: [docs/media/src/token-counts.json](docs/media/src/token-counts.json).
+- **Arithmetic from those counts:** about 50× (11,565 ÷ 229) and about 9× (11,565 ÷ 1,241), the looks that fit (200,000 ÷ tokens, rounded down) and the cost (USD 4 per million input tokens, the Claude Opus 5.5 list price).
+- **The catch:** these are sizes of one screen, not a benchmark of whole tasks. On this screen the short answer holds only the clock widget, so an AI looking for an app icon asks for the full list: 1,241 tokens, still about 9× smaller than the raw description. A task benchmark on AndroidWorld is in progress: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+<details>
+<summary>See the actual text the AI gets for that screen</summary>
+
+<br>
+
+The text below is what Agentroid's own code produces from [the recorded screen](crates/core/tests/redteam/recorded/poco-launcher-2026-10-20.xml). To fit side by side, long lines are wrapped at 40 characters.
+
+<table>
+<tr>
+<th width="50%">Agentroid's short answer: 453 characters, 229 tokens</th>
+<th width="50%">Android's raw description: 30,910 characters, 11,565 tokens</th>
+</tr>
+<tr>
+<td valign="top">
+
+```text
+[0] ScreenView "Clock / 1:07 / Tuesday, 
+  20 Oct" [label from child] id=workspac
+  e scrollable @(610,1332) rccbccd
+[1] FrameLayout "Clock" clickable,long-c
+  lickable @(610,476) r2bb170
+[2] FrameLayout "1:07 / Tuesday, 20 Oct 
+  / No data" [label from child] clickabl
+  e @(610,476) r37be77
+[3] View "1:07 / Tuesday, 20 Oct / No da
+  ta" [label from child] clickable @(610
+  ,476) r941e62
+[4] View "1:07" @(324,275)
+[5]
+[cut: 2150 more characters; ask for leve
+  l "default"]
+```
+
+</td>
+<td valign="top">
+
+```text
+<?xml version='1.0' encoding='UTF-8' sta
+ndalone='yes' ?><hierarchy rotation="0">
+<node index="0" text="" resource-id="" c
+lass="android.widget.FrameLayout" packag
+e="com.mi.android.globallauncher" conten
+t-desc="" checkable="false" checked="fal
+se" clickable="false" enabled="true" foc
+usable="false" focused="false" scrollabl
+e="false" long-clickable="false" passwor
+d="false" selected="false" bounds="[0,0]
+[1220,2712]"><node index="0" text="" res
+ource-id="" class="android.widget.Linear
+Layout" package="com.mi.android.globalla
+uncher" content-desc="" checkable="false
+… 30,910 characters in all, on one line
+```
+
+</td>
+</tr>
+</table>
+
+The full list of the same screen (2,550 characters, 1,241 tokens). Each line is one thing on the screen; a line that can be tapped ends in a short id such as `r352116`:
+
+```text
+[0] ScreenView "Clock / 1:07 / Tuesday, 20 Oct" [label from child] id=workspace scrollable @(610,1332) rccbccd
+[1] FrameLayout "Clock" clickable,long-clickable @(610,476) r2bb170
+[2] FrameLayout "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r37be77
+[3] View "1:07 / Tuesday, 20 Oct / No data" [label from child] clickable @(610,476) r941e62
+[4] View "1:07" @(324,275)
+[5] View "Tuesday, 20 Oct" @(344,395)
+[6] View "No data" @(946,335)
+[7] RelativeLayout "Search / Google Search / Google app" [label from child] long-clickable @(610,1191) r2645e5
+[8] AppWidgetHostView "Search" @(610,1166)
+[9] FrameLayout "googleapp_search_widget_ghost_google_logo" clickable @(163,1166) re1ea72
+[10] FrameLayout "googleapp_search_widget_ghost_text_search" clickable @(538,1166) rc125ac
+[11] FrameLayout "googleapp_search_widget_ghost_voice_search" clickable @(913,1166) ra06a82
+[12] FrameLayout "googleapp_search_widget_ghost_lens" clickable @(1057,1166) re6519e
+[13] ImageView "Google Search" id=googleapp_search_widget_background clickable @(610,1166) r0dc6ef
+[14] ImageButton "Google app" id=googleapp_search_widget_google_logo clickable @(163,1166) ra75aca
+[15] ImageButton "Voice search" id=googleapp_search_widget_voice_btn clickable @(913,1166) r51c012
+[16] ImageButton "Camera search" id=googleapp_search_widget_lens_btn clickable @(1057,1166) r7dc530
+[17] TextView "Gallery" clickable,long-clickable @(181,1477) r1f043e
+[18] RelativeLayout "Google" clickable,long-clickable @(467,1477) r33578d
+[19] ImageView "Google" id=icon_icon @(467,1447)
+[20] TextView "Google" id=icon_title @(467,1583)
+[21] TextView "Play Store" clickable,long-clickable @(753,1477) rd47592
+[22] TextView "Themes" clickable,long-clickable @(1039,1477) rda65b2
+[23] TextView "Security" desc="1 unread from Security" clickable,long-clickable @(181,1763) r557e2b
+[24] TextView "Settings" desc="1 unread from Settings" clickable,long-clickable @(467,1763) r352116
+[25] TextView "Cleaner" clickable,long-clickable @(753,1763) r653a51
+[26] SeekBar "Page 1. Total pages: 2" scrollable @(610,2260) rff2766
+[27] ImageView "Open App drawer" clickable @(610,2260) r2b26e6
+[28] ScreenView "Phone / Messages / Chrome" [label from child] id=hotseat_content_screen scrollable @(610,2472) r25bfbd
+[29] TextView "Phone" clickable,long-clickable @(181,2472) rf642c8
+[30] TextView "Messages" clickable,long-clickable @(467,2472) rd7243f
+[31] TextView "Chrome" clickable,long-clickable @(753,2472) r9ff1f0
+[32] TextView "Camera" clickable,long-clickable @(1039,2472) r22466f
+```
+
+Print the three texts and their character counts yourself:
+
+```powershell
+cargo run -p agentroid-core --example readme_tree_sizes
+```
+
+</details>
+
+## Works on
+
+| | Tested with | What happened |
 | --- | --- | --- |
-| **1. An agent drives a phone** | Claude Code reads the screen as a numbered UI tree and taps, types and scrolls on an emulator or an allowed phone, through 27 MCP tools. | Works. Exercised on an Android 13 emulator and on one physical phone (Xiaomi POCO X6 Pro, Android 15, HyperOS 2.0). See [Demo](#demo). |
-| **2. A benchmark score card** | The same loop run against AndroidWorld's 116 tasks on an emulator, scored by AndroidWorld itself. | **In progress.** Measured so far (11 Nov 2026): 16 of 20 passed on a 20-task pilot with every safety refusal kept (no stand-in approver). A partial full run that has reached 16 of the 116 tasks passed 6 with the emulator-only stand-in approver, or 5 counting only tasks that needed no approval; the guard asked for approval once. See [Benchmark in progress](#benchmark-in-progress). An earlier run with a different policy passed 61 of the 116 tasks (52.6%); its result files are not in this repository, so treat it as unverified. |
-| **3. The connection keeper** | An Android module (`android/keeper`) that turns Wireless debugging back on after a Wi-Fi drop, a crash or a reboot, so the adb link to the phone returns with no tap. | Measured on one phone: after Wi-Fi was switched off for 10 s, the adb link was back 12 to 13 s later in 3 of 3 rounds, with no tap; it also came back after a process crash and after a cold boot, before the first unlock. This is not yet tested against a real router outage. The standalone build is documented in [apps/keeper](apps/keeper) (no Gradle, 40 logic tests in CI). Limits in [The connection keeper](#the-connection-keeper). |
-| **4. The phone helps the laptop** | Sharing local AI work between laptop and phone: one model split across both, or the phone running speech and vision while the laptop answers. | **PENDING.** Designed, not built or measured. It is listed because it is part of the project; no number is claimed. |
-| **5. A screen guard with a public red-team** | Before any tap, swipe, keystroke or link, the daemon reads the screen and refuses payments, transfers, factory resets, credential entry and security-setting changes, whatever the model was told. Every decision goes into a hash-chained audit log. | 44 of 44 hostile test cases refused or held, 12 of 12 ordinary actions still allowed, 4 known misses published (a fifth is now partly caught). Four blind rounds written by agents that never saw the rules scored **11 of 20** (13 after a test-runner selector fix), **12, 12 and 18 of 20** before their misses were fixed. See [docs/SAFETY.md](docs/SAFETY.md). |
+| **Real phone** | Xiaomi POCO X6 Pro, Android 15 (HyperOS 2.0) | Driven end to end, regularly, over wireless adb. The recordings on this page are this phone. |
+| **Real phone** | Samsung Galaxy S24 Ultra (SM-S928B), Android 17 | Connected and read. Kept read-only on purpose: it is the owner's personal phone, so his build hard-codes it as a protected device that answers reads only. |
+| **Emulator** | Android 13 emulator | Works. |
+| **AI agent** | Claude Code | The only MCP client tried so far. |
 
-**Only tested with Claude Code.** Claude Code is the only MCP client Agentroid has been tried with; nothing is claimed for any other client.
-
-## What it does
-
-- **27 MCP tools.** 23 device tools (reads and actions) and 4 job tools. You can read the screen as a numbered UI tree (`ui_tree`, `look`), tap, long-press, swipe, scroll, type, press keys, unlock, open apps, URLs and activities, list installed apps, read system properties, run read-only diagnostics (`doctor`), and copy files to and from the phone (`push`, `pull_new`). Not everything is finished: `pixel_probe` and `look`'s `element` and `ocr` options are not implemented in this build and always return an error, and `set_value` sets text fields only.
-- **Stable refs.** Each interactive line of a UI tree ends in a short ref that stays the same for the same element after a scroll or re-layout, unlike its index. `ui_tree` can return only what changed since an earlier snapshot.
-- **Plain adb.** The live transport reads the screen with `uiautomator dump` and acts with `adb shell input`. No app has to be installed on the phone.
-- **Text, not pictures.** `screenshot` and `look` capture the screen on your machine, but this build does not send image bytes back to the agent; it works from the text tree.
-- **Uses the calling agent as the brain.** The MCP server and the daemon make no model calls, so each result reports 0 tokens and 0 cost for the bridge itself.
-- **More than one phone, one session each.** A phone is leased to one session at a time, and a second session is refused with the holder's name. When several devices are connected and a call names none, the MCP server refuses instead of choosing.
-- **The screen stays on while you work.** On a `full` phone, a session's first call raises the screen timeout to 30 minutes and turns on stay-awake while plugged in. Your own values come back when the last session disconnects, after 15 minutes with no call, or when the daemon stops; a value you changed meanwhile is left alone. Both changes are written to `leases.json` first, so after a crash the next daemon puts them back. Lock, PIN and password settings are never touched. Emulators are skipped, and so are `read_only` phones, except the one hardcoded protected phone, which gets these two settings and nothing else (see [docs/SAFETY.md](docs/SAFETY.md)). The hold runs in the background, so no call waits for it. `AGENTROID_NO_STAY_AWAKE=1` turns it off.
-- **Jobs on the daemon.** `job_start` runs a YAML flow, or a short list of steps in one app, on the daemon so that each step does not cost a model round trip. Steps are written to a journal before they are sent, a job can be paused, stopped and resumed, and a finished run can be saved as a replayable flow (`record`), with an export to Maestro commands.
-- **An optional helper app.** The `android/` folder holds an Android helper (accessibility service, input method, link service). It is built and unit-tested, but this build's live transport has no link to it yet, so no tool needs it today. See [Quick start](#quick-start).
-- **No telemetry.** Nothing is sent to the project or to any analytics service. There are two optional outbound paths, both to [ntfy](https://ntfy.sh), and both are off until you set them up:
-  - **Job pushes.** If you create `%USERPROFILE%\.agentroid\ntfy-topic.txt` (one line: a private topic name), the MCP server posts a short push when a job becomes stuck or done. It carries the run id, the flow name and step counts, not screen content. Set `AGENTROID_NO_PUSH=1` to turn it off.
-  - **Approval requests.** If you start the daemon with `--approval-topic-file <file>`, every `asked` action posts an approval request to that topic and waits for your Allow or Deny. The request carries the tool, the phone's **hardware serial**, the guard's reason (which quotes the matched on-screen label, such as `"Delete"`) and the target label. The default server is `https://ntfy.sh`; `--ntfy-base <url>` points it at your own. `AGENTROID_NO_PUSH` does not affect this path.
-
-  Treat both topic names as secrets, and prefer a self-hosted ntfy server.
-
-## Safety model
-
-The checks live in the daemon (`bridged`), not in a prompt. They run on every call after the model has asked and before anything reaches adb, so a confused or prompt-injected model cannot argue its way past them. They bound what an agent can do. They cannot tell whether a particular tap is a good idea.
-
-- **Device allowlist.** Nothing is driven by default. The daemon refuses any call aimed at a device whose hardware serial you have not named, with `--allow-serial <serial>` (repeatable), a line in `allow.txt` in its state directory, or `--allow-file <path>`. Emulators are admitted only with `--allow-emulators`.
-- **Deny-by-default adb guard.** Every adb command the daemon sends passes through a guard. It refuses adb subcommands it does not know, always refuses `kill-server`, `start-server`, `keygen`, `pair` and `reconnect`, requires an explicit target for per-device commands, requires `connect` and `disconnect` to name exactly one address, and reads the real hardware serial behind a target before it lets a command out. The guard works at the level of adb subcommands, so on its own it does not restrict what a `shell` command contains. That restriction comes from the tool layer, next.
-- **No free shell.** None of the 27 tools takes a raw shell command. `doctor`, and the `agentroid.shell` function available inside `run_script`, accept only complete command patterns for read-only diagnostics, refuse any shell metacharacter or quote, and refuse everything else. `run_script` runs JavaScript in QuickJS in a child process under a Windows Job Object (64 MB memory limit, CPU deadline, no `eval`, no file or network access). `push` copies a file from your machine to the phone and is allowed on `full` devices only. Both sides are fenced: on the phone, shared storage only; on the laptop, `push` reads only from `%LOCALAPPDATA%\agentroid\files\outbox` and `pull_new` writes only to `...\files\inbox`. Copy a file into the outbox before you ask for it to be pushed.
-- **Device modes.** The gate knows three modes. `full` allows everything. `helper` allows only gestures, keys and typing. `read_only` refuses every call that changes anything and answers reads only. The HTTP listener enforces a mode per access token. On the plain stdio path an allowed device runs as `full` unless the daemon is started with `--read-only-serial <hardware serial>` for it, which makes it answer reads only; `helper` cannot be set for a device there yet. The serial is matched as an allowlist entry is: the hardware serial or the adb serial with case ignored, and the wireless adb name `adb-<serial>-...`, so the phone stays read-only over Wi-Fi too. The daemon will not start if that serial is not on the allowlist.
-- **Screen guard.** Every acting call (tap, long-press, swipe, type, key, open an app, a URL or an activity, unlock) is checked against what is on the screen at that moment. It gets one of three verdicts. `allowed` runs. `blocked` does not run: payments and checkout, banking apps, factory reset, typing into password or one-time-code fields, card numbers, device-admin and accessibility grants, and turning on "install unknown apps" for a source. `asked` covers send, delete, install, uninstall and permission dialogs: with the approval channel on (`--approval-topic-file`, see [Turn on approvals](#quick-start)), you get a push with Allow and Deny buttons and have 90 seconds to answer, otherwise the call is refused; with no channel set up it is refused at once. The agent waits 100 seconds for the call, so it is still waiting while your Allow can run. Do not install the ntfy app on the phone being driven, because its Allow button would be on the agent's own screen. Cancel, Back, Close and Navigate up are always allowed. The guard is plain Rust rules with no model call, so prompt injection on the screen cannot argue with it, and it reads the screen again if the stored copy is more than 2 seconds old. It reads text, descriptions and ids in 16 languages (plus Tagalog payment words), folds look-alike letters, and checks taps by coordinate as well as by name. Known misses: buttons drawn inside games, icon-only buttons with no label, a one-time code typed into an ordinary chat box that never mentions a code, and a pop-up inside the 2-second window. The full list is in [docs/SAFETY.md](docs/SAFETY.md). To keep an agent away from money or account data altogether, still prefer an emulator, a phone with no payment methods signed in, or a `read_only` device.
-- **Tamper-evident audit log.** Each decision, allowed or refused, is a JSON line chained to the one before it by SHA-256. It is written before the action is sent, and an action is refused if the log cannot be written. `agentroid audit verify <log>` reports an edited line, a re-hashed edit or lines cut off the end. It rotates every 10,000 records or 7 days, and `--audit-anchor <path>` writes the chain head to a second place (ideally off the machine), which catches a log rewritten from scratch (best effort by default; `--audit-anchor-required` refuses the action if the anchor cannot be written).
-- **Shell and files.** Raw shell lines from `run_script` and `push`/`pull_new` go through the same gate and log: wiping, security-setting, credential-store and input-injection commands are refused outright, and in this build every other line that is not on the read-only list is refused too. Pushes and pulls are limited to shared storage on the phone.
-- **Flow risk labels.** Flow steps still carry a risk label (R0 to R5), and a flow with any step rated R2 or higher is refused before its first step. The label is written by the flow's author, which may be the agent, so the screen guard on every step is the real control. A permission pop-up, an unknown overlay or a `checkpoint` step pauses the job for a person.
-- **Lock screen.** `unlock` wakes the screen and swipes away a swipe-only lock screen. If a PIN, pattern or password is set, it reports that the phone is still locked and stops.
-- **Journal and receipts.** The intent of every acting step is written to the run journal and flushed to disk before the step is sent, and every tool result carries a receipt (calls, wall time, retries, errors). A refusal returns its reason to the caller. The run journal itself is an ordinary append-only file; the tamper-evident record of every guard decision is the audit log above.
-- **Local access.** The daemon listens on a Windows named pipe that admits only the current user, rejects remote clients, and will not start if another process already owns the name. Any process running as your Windows user can still talk to it.
-- **Remote access (optional).** The HTTP listener binds one literal address, either your tailnet IPv4 (100.64.0.0/10) or 127.0.0.1, and refuses 0.0.0.0, LAN addresses and host names. Each bearer token is limited to one device and one mode and is stored in Windows Credential Manager. The helper app's phone link dials out to the laptop on the tailnet, and the helper opens no listening socket. The link authenticates both ends with P-256 signatures but Agentroid does not encrypt it, so it depends on the private network underneath. This path has been tested against fakes and not yet end to end on a real phone.
-
-See [SECURITY.md](SECURITY.md) to report a vulnerability.
-
-### Responsible use
-
-Use Agentroid on devices you own or are authorised to test. It does not bypass a PIN, pattern or password lock screen. It is not built to defeat app protections or to run fake accounts, and contributions for that will not be accepted. This is a project rule, not something the code enforces.
+A phone is never driven until you name it. You allow each phone by its serial number, and emulators with a separate switch.
 
 ## Quick start
 
-**Requirements**
+**You need** Windows 11 (**Windows only for now**; Windows 10 should work but has not been tried), [adb](https://developer.android.com/tools/releases/platform-tools) (Android's debugging bridge, part of Android's platform-tools), a recent stable [Rust](https://rustup.rs) with the Visual Studio C++ Build Tools, [Node.js](https://nodejs.org) 22.6 or later, and [Claude Code](https://claude.com/claude-code). Run everything below in PowerShell.
 
-- Windows 10 or 11. The daemon uses a named pipe and Windows APIs and refuses to start elsewhere. Tested on Windows 11 Home (build 10.0.26200); Windows 10 has not been tried.
-- `adb` from the Android platform-tools. `bridged --adb auto` looks for scrcpy's `adb`, then `ANDROID_HOME` or `ANDROID_SDK_ROOT`, then `%LOCALAPPDATA%\Android\Sdk`, then `adb` on `PATH`. Tested with adb 1.0.41 (platform-tools 37.0.0 from scrcpy 4.1 and 37.0.1 from the SDK); no older version has been tried, so no minimum is claimed.
-- A recent stable Rust toolchain. The lock file is format 4, and the project was built with Rust 1.99.0. No older toolchain has been tried and `Cargo.toml` declares no `rust-version`.
-- Node.js 22.6 or later. The MCP server runs its TypeScript directly with `node --experimental-strip-types`, which older versions do not have. It was developed on Node 22.17.0.
-- The Visual Studio C++ Build Tools (the "Desktop development with C++" workload). The MSVC Rust toolchain needs them, and the `run_script` sandbox compiles QuickJS from C.
-- `curl` on `PATH` (Windows 10 and 11 include it), used by the approval channel.
-- The `claude` command-line tool, to register the MCP server.
-- An MCP client. The commands below use Claude Code, the only client tested.
-- An Android emulator, or a physical phone whose hardware serial you allow (see the note after the commands). The helper app, if you build it, targets Android 10 (API 29) and later. The lowest Android version for the adb-only path has not been established; it was run on Android 13 (emulator) and Android 15 (phone).
-
-**Install and run** (PowerShell, from the repository root)
+**1. Get the code and build it**
 
 ```powershell
 git clone https://github.com/Sohwhat6420/agentroid-mcp.git
-cd agentroid-mcp
-cargo build --release --workspace
-
-# Start an emulator or connect a phone, then check that adb lists it as "device".
-adb devices -l
-
-# Start the daemon. It has no console window, so the command returns at once.
-.\target\release\bridged.exe --adb auto --allow-emulators
-
-# Check that it started: the log should end with a "listening on" line.
-Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 5
-
-# Install the MCP server and register it with Claude Code.
-cd apps\mcp
-npm ci
-claude mcp add agentroid -- node --experimental-strip-types "<full path to>\agentroid\apps\mcp\src\sdk-wiring.ts"
 ```
-
-To stop the daemon: `.\target\release\bridged.exe --stop`.
-
-**If the daemon does not start.** Because it has no console, a mistyped flag (for example `--allow-emulator` without the `s`) makes it exit at once and leaves no trace, not even in `bridged.log`. If no new `listening on` line appears, check each flag against the list at the top of `crates/bridged/src/main.rs`.
-
-**Turn on approvals (optional).** Without them every `asked` action (send, delete, uninstall, a permission) is refused. Put a private, hard-to-guess ntfy topic name on one line of a file, for example `%LOCALAPPDATA%\agentroid\ntfy-topic.key`, subscribe to that topic in the ntfy app on a phone or browser that the agent is not driving, and start the daemon with `--approval-topic-file <that file>` (add `--ntfy-base <url>` for your own ntfy server). Each request carries the tool, the phone's hardware serial and the matched on-screen label (see [What it does](#what-it-does)).
-
-Then ask your agent something like: *"Use Agentroid to list the connected devices, look at the screen, and tell me what is on it."*
-
-Nothing is driven until you name it. For an emulator start the daemon with `--allow-emulators`. For a physical phone find its hardware serial (`adb shell getprop ro.serialno`) and start it with `--allow-serial <that serial>`, or put the serial on a line of `allow.txt` in the daemon's state directory (`#` starts a comment; UTF-8 or UTF-16 text). Entries are hardware serials of 6 to 64 letters and digits, matched ignoring case; addresses and fragments are refused. A bad or unreadable allow file stops the daemon rather than being ignored. The default state directory is `%LOCALAPPDATA%\agentroid`.
-
-**Check a phone (read-only)**
 
 ```powershell
-.\target\release\agentroid-setup.exe doctor --device <adb serial>
+cd agentroid-mcp
 ```
 
-`doctor` reads settings from the phone and prints the exact fix for each problem it finds. `agentroid-setup` looks for `adb` on your `PATH` unless you pass `--adb <path>`. `agentroid-setup --dry-run` prints what `setup` would change without writing anything, and `agentroid-setup --undo` reverts a setup run. `setup` records a device profile and a `devices.toml` entry; the daemon does not read `devices.toml` yet.
+```powershell
+cargo build --release --workspace
+```
 
-**Which parts need the helper app?** None of the tools in this build. Everything above runs over plain adb. The helper (intended for accessibility-based tree reads, non-ASCII typing and the phone link) is not connected to the live transport yet, so non-ASCII text typing answers that the helper is not installed. If you want to build it anyway, the route that has been run is `android/build-helper.sh` (JDK 17 and the Android SDK, no Gradle); it reads three library jars from a folder you name with `HELPER_LIBS`. The CI job `android-helper` builds it on every push: it fetches the jars from Maven Central, checks their SHA-256s and uploads the debug APK, so copy that job's steps to build it yourself. The Gradle build (`./gradlew assembleHelperDebug testDebugUnitTest`) also works: it was run once by hand (25 Oct 2026) and produced the debug APK, but CI does not run it. Either way the result is a debug build to sideload with `adb install`, not a release, and neither route builds the connection keeper: that has its own build in [apps/keeper](apps/keeper).
+The first build compiles every dependency, so it is the slow step. Keep this PowerShell window open: steps 2 to 4 use it.
 
-**Troubleshooting**
+**2. Connect your phone and read its serial number**
 
-- *The phone is not listed, or is `unauthorized`.* Turn on USB debugging in Developer options, accept the computer's key on the phone, and check `adb devices -l` shows `device`.
-- *Wireless debugging.* Pair the phone yourself with adb in your own terminal. Agentroid's guard refuses `adb pair` by design.
-- *Wireless connections drop when Agentroid starts.* An adb client of a different build from the running adb server restarts the server and drops wireless connections. `--adb auto` prefers scrcpy's adb for that reason, so run the same adb everywhere, or pass a path with `--adb`.
-- *Another automation tool is running.* Only one UI-automation connection exists per phone. Stop uiautomator2, Appium or similar tools on the laptop; `agentroid-setup doctor` flags them.
-- *The screen looks stale right after an action.* The new screen can take a second or more to reach the tree on an emulator. Read again, or use `wait`.
-- *Xiaomi HyperOS.* `agentroid-setup`'s quirks list asks for Developer options > USB debugging (Security settings) and Install via USB, which need a SIM and a signed-in Mi account once, and for Autostart and battery "No restrictions" for the helper app. These quirks were recorded on one phone and not all re-measured.
+Turn on USB debugging in the phone's Developer options, plug it in (or connect over wireless debugging) and accept the prompt on the phone.
 
-## Benchmark
+```powershell
+adb devices -l
+```
 
-### Benchmark in progress
+```powershell
+$serial = (adb shell getprop ro.serialno).Trim()
+```
 
-There is no full 116-task score yet. Everything below was measured, and each row gives its date and configuration. Nothing here is projected. Per-task result files are published with the full run; until then, treat these as the author's report.
+With several devices connected, disconnect the others for this step.
 
-**1. A 20-task pilot: which additions help** (11 Nov 2026; `bench/androidworld/subset-20.json`; Claude Opus 5.5 through `claude -p`; one attempt per task; Android 13 emulator on a Windows laptop; no stand-in approver, so the guard's refusals count as fails). Each addition was kept only if it beat the best score so far by its threshold. One run per stage, so a 1-task difference is close to noise.
+**3. Start Agentroid for that phone**
 
-| Stage | Adds | Passed of 20 | Kept |
-| --- | --- | --- | --- |
-| A0 | the base loop (policy v3, agent mode) | 15 | baseline |
-| +screens | a screenshot with each turn | 16 | no (needed 17) |
-| +planner | a separate planner | 14 | no |
-| +verifier | a separate verifier must agree before "complete" | **16** | **yes** |
-| +notes | a scratchpad, on top of the verifier | 15 | no |
-| +stall | a re-plan after a stall, on top of the verifier | 15 | no |
+```powershell
+.\target\release\bridged.exe --adb auto --allow-serial $serial
+```
 
-**2. Run 2, the full task list with the verifier: partial** (11 Nov 2026; `subset-all.json` in order; the same model and laptop; the bench stand-in approver on). It was stopped for laptop memory after 16 of the 116 tasks.
+The daemon has no window, so the command returns at once. Read the last line of its log:
 
-| Tasks run | Passed (with approvals) | Passed (guarded: no approval needed) | Asks answered by the stand-in |
-| --- | --- | --- | --- |
-| 16 of 116 | 6 | 5 | 1 |
+```powershell
+Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 1
+```
 
-"Guarded" counts only tasks that passed without the guard asking for a human yes. On an emulator nobody can tap Allow, so the stand-in approver (`--bench-approve`, emulator only, audited as `approved:bench`) answers instead. Both numbers are reported, along with the count of asks. The approval counter in `run_pilot.py` was fixed at 20:15, before the second chunk, and the first chunk was recounted from its saved audit log.
+It should say:
 
-**What comes next.** The rest of the benchmark runs on GitHub Actions emulators. Those runs are their own hardware configuration and are never added to the laptop numbers above. There will be two configurations: run 2 (verifier, the guard as it was) and run 3 (verifier and screens, with the stopwatch fix below), each on the full 116.
+```text
+bridged 0.1.0 listening on \\.\pipe\agentroid
+```
 
-**A known limit the runs found.** The guard reads the screen with `uiautomator dump`, which waits for the screen to be still. On a screen that never stops changing, such as a running stopwatch, it gives up with "could not get idle state". The guard then cannot read the screen and refuses the tap: safe, but a lost task. On 11 Nov the stock dump read 0 of 3 times on the emulator with a stopwatch running. A small read-only fallback reader read 3 of 3. bridged now uses the fallback for that one error, and run 3 measures the change. Details are in [docs/SAFETY.md](docs/SAFETY.md).
+If no new `listening on` line appears, open "when it does not start" under step 5.
 
-**How it is run.** This is the *executor* setup. AndroidWorld's own harness sets each task up and scores it. Agentroid's agent loop (`bench/androidworld/run_pilot.py`) plays the task, with a Claude model as the policy.
+**4. Add it to Claude Code**
 
-- Policy v3 (`bench/androidworld/policy-v3/`): one warm `claude -p` session per task acts as the executor, with tools, settings and MCP servers switched off, so the model only answers. The switchable additions in the table above (verifier, screens and the others) are separate one-shot calls.
-- At each step the model is given the task, its recent actions and AndroidWorld's numbered list of UI elements, and returns one action in AndroidWorld's `JSONAction` vocabulary (14 action types). Agentroid carries the action out through its MCP tools.
-- The step budget per task is AndroidWorld's own: the task's complexity times 10.
-- Success is AndroidWorld's own `is_successful` for the task, checked after the last step.
-- The runs are on an Android emulator with a headless x86_64 Google APIs image (Android 13, API 33).
-- The task list is `bench/androidworld/subset-all.json` (116 tasks, the complete AndroidWorld registry as of 28 Oct 2026: the names match exactly). Many tasks use AndroidWorld's own apps, which must be installed on the emulator first. A task that cannot be set up or scored is recorded as unscored. The headline rate is passed tasks out of all 116, so an unscored task counts against the score; the rate over scored tasks only is shown beside it.
-- Model, number of attempts (one per task), date and the commit of this repository go in the table when the run is done.
-- The policy used for the release run was written after reading the failures of an earlier run, so the result is not a held-out score: it measures a loop that was tuned on this same task list.
-- Policy v3 calls the model through the `claude` CLI (`--backend claude-p`; `AGENTROID_CLAUDE` names another binary). The older policies call it through a dispatcher script you supply (`AGENTROID_DISPATCH`). The scripts in `bench/androidworld/` read the SDK, emulator and APK locations from environment variables (`ANDROID_SDK_ROOT`, `ANDROID_AVD_HOME`, `AW_APKS`, `AW_PYTHON`). For the older policies no dispatcher is included, so a run on another machine needs one written first. The offline tests run anywhere.
+```powershell
+cd apps\mcp
+```
 
-**Compare only like with like.** These results are not comparable with leaderboard entries that use a different agent loop or observation. An entry that uses a different agent loop, prompt or observation (AndroidWorld's own reference agents, M3A and T3A, are examples of agents with their own loop) measures something different. Here the loop, the prompt and the action executor are Agentroid's, and the model sees AndroidWorld's element list rather than Agentroid's own tree, so the number measures this loop with this model and this executor, not the model alone. Known differences from AndroidWorld's own executor, such as how a double tap, a text field clear and a scroll on element 0 are performed, are listed in `bench/androidworld/ACTION-SPACE.md`. A second mode, where the model calls Agentroid's tools directly, has had a smoke test only and has no results.
+```powershell
+npm ci
+```
 
-## The connection keeper
+```powershell
+claude mcp add --scope user agentroid -- node --experimental-strip-types "$PWD\src\sdk-wiring.ts"
+```
 
-`android/keeper` is an Android module for a phone you leave connected over Wireless debugging. A standalone 25 KB build of the same keeper, with its own build and setup scripts, is in [apps/keeper](apps/keeper). adb over Wi-Fi switches itself off when the Wi-Fi drops, the phone reboots or the app that holds it is killed, and the next command then fails until someone taps the Wireless debugging tile. The keeper checks on a 15-minute alarm (Doze stretches that to about 20 minutes) and whenever the network is lost or comes back, and switches Wireless debugging back on. It also registers for the boot broadcast that runs before the first unlock, so a phone that restarts overnight comes back without a tap.
+Check that Claude Code can reach it. The list should show `agentroid` as connected:
 
-What it needs: a one-time `adb shell pm grant` of `WRITE_SECURE_SETTINGS` (only adb can give it), Wireless debugging switched on once, and, on Xiaomi HyperOS, Autostart and battery "No restrictions". Android asks "Allow wireless debugging on this network?" once for each Wi-Fi access point (BSSID); tick *Always allow* for each one you use, because the keeper cannot answer that prompt.
+```powershell
+claude mcp list
+```
 
-What was measured, all on one phone (Xiaomi POCO X6 Pro, Android 15, HyperOS 2.0) over wireless adb, with no USB cable at any point:
+**5. Ask your agent**
 
-- *Wi-Fi switched off for 10 s, screen off, phone unplugged:* the adb link was back after 12, 12 and 13 s (3 of 3 rounds), with no tap. These used a fixed address (`adb tcpip 5555`); a recovery of the TLS port alone was not timed.
-- *Process crash (`am crash`):* the keeper was running again after about 17 minutes, through its alarm.
-- *Cold boot behind the lock screen* (the phone had shut down on a flat battery, and was restarted): Wireless debugging was switched on before the first unlock, and the laptop reconnected about three minutes later without a tap. This happened once, by accident, and was not repeated.
-- *Not tested:* a real router outage, and a second access point (which needs its one prompt tapped).
+```text
+Use Agentroid to list the connected devices, look at the screen and tell me what is on it.
+```
 
-Limits: on this phone the Wi-Fi itself sometimes took 4 to 30 minutes to rejoin after being switched off with the screen off and the phone unplugged, and the adb link came back about 40 s after the Wi-Fi did. The keeper cannot shorten that. A later version wakes the screen for a few seconds while the network is gone to speed the rejoin; it is installed but has not been seen to fire in a test, so no claim is made for it. A flat battery stops everything. The 5555 address does not survive a reboot (the keeper restores Wireless debugging, and the TLS entry reconnects, but `adb tcpip 5555` must be run again).
+<details>
+<summary>Using an emulator, a smaller tool list, other MCP clients, stopping it, and when it does not start</summary>
 
-## Demo
+<br>
 
-The three clips below are real recordings of the phone screen (Android's own `screenrecord`) beside the actual tool calls and results. A short script acted as the MCP client for the recording, so Claude Code was not in the loop. Agentroid has only been tested with Claude Code as the MCP client; these clips show the tools and their results, not any other client. The device key and the one-line status header are left out, and long results are cut to their first lines.
+**An emulator instead of a phone.** Start the emulator, then start the daemon with the emulator switch:
 
-![The phone's Calculator on the left and the MCP calls on the right: look, then four taps. The display goes from 0 to 7 x 6 = 42.](docs/media/demo-1.gif)
+```powershell
+.\target\release\bridged.exe --adb auto --allow-emulators
+```
 
-*An MCP client drives a phone: `look`, then `tap` four times, then `look` again. Played at 1.5x.*
+**A smaller tool list.** The AI loads the tool list once at the start: all 27 tools cost 4,635 tokens. The `minimal` profile keeps 8 of them for 1,331 tokens. Use this line in place of the one in step 4:
 
-![Three doctor calls. The read-only dumpsys battery runs; pm clear and settings put are each refused with a reason and an error kind.](docs/media/demo-2.gif)
+```powershell
+claude mcp add --scope user agentroid -e AGENTROID_PROFILE=minimal -- node --experimental-strip-types "$PWD\src\sdk-wiring.ts"
+```
 
-*The checks live in the daemon: a read-only diagnostic runs, a command that would clear an app's data or change a setting is refused before it reaches adb. Paced for reading; the real calls took under half a second each.*
+**Other MCP clients (not tried yet).** Claude Code is the only client tested. A client that reads the usual `mcpServers` JSON should take this entry, with the path changed to where you cloned the repository:
 
-![job_start with six tap steps on the phone's Calculator. The phone shows 9 x 8 + 7 = 79 and the call returns one done row per step.](docs/media/demo-3.gif)
+```json
+{
+  "mcpServers": {
+    "agentroid": {
+      "command": "node",
+      "args": ["--experimental-strip-types", "C:\\code\\agentroid-mcp\\apps\\mcp\\src\\sdk-wiring.ts"]
+    }
+  }
+}
+```
 
-*One `job_start` call in sync mode runs six steps and returns a row per step plus a receipt. The run took 49 s on the phone (most of it reading the screen between taps); the clip plays it at 4x and holds the result. The job view is not shown.*
+**Stop the daemon** (from the repository root):
 
-## Project status
+```powershell
+.\target\release\bridged.exe --stop
+```
 
-Agentroid is a preview, released for trial and demo. The Cargo workspace and the MCP package are both version 0.1.0; nothing is published to crates.io or npm.
+**If it does not start.** The daemon has no console, so a mistyped switch makes it exit at once and leaves nothing in the log. If no new `listening on` line appears, check each switch against the list at the top of [`crates/bridged/src/main.rs`](crates/bridged/src/main.rs). The log shows what earlier starts wrote:
 
-*What works.* The daemon with a fake device and with a live adb transport behind the guard; the 27-tool MCP server over stdio, and an optional HTTP listener for a tailnet; flows and jobs with a journal, pause and resume, and record and replay. The Rust workspace has a test suite (`cargo test --workspace`) and the MCP server has one (`npm test` in `apps/mcp`).
+```powershell
+Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 20
+```
 
-*What is experimental or missing.*
+Full requirements, wireless debugging notes and troubleshooting: [docs/REFERENCE.md](docs/REFERENCE.md#setup-notes).
 
-- Windows only: the daemon listens on a named pipe. A Unix-socket listener for Linux, needed for the CI benchmark runs, is written but not yet built or tested.
-- On a screen that never goes still (a running stopwatch), the stock screen read fails. bridged now falls back to a read-only reader for that case; see [Benchmark in progress](#benchmark-in-progress).
-- Per-device modes are set on the command line only: an allowed device runs as `full` unless `bridged` is started with `--read-only-serial <hardware serial>` for it, which makes it answer reads only. `helper` cannot be set for a device yet, and `agentroid-setup` writes a `devices.toml` that the daemon does not read. Emulators and allowed physical phones both work.
-- The helper app is not connected to the live transport, so non-ASCII typing is unavailable.
-- Screenshots are not returned to the agent as images.
-- The phone link over a tailnet has been tested against fakes, not end to end on a real phone.
-- The helper's build scripts are not portable yet, and the Gradle build has been run only once, by hand. The connection keeper's standalone build is in [apps/keeper](apps/keeper).
-- `pixel_probe` and `look`'s `element` and `ocr` options are not implemented.
+</details>
 
-*Tested on.* So far the live transport has been exercised on an Android 13 emulator (x86_64, Google APIs) and one physical phone, a Xiaomi POCO X6 Pro running Android 15 and HyperOS 2.0. The only MCP client tried is Claude Code.
+## How it works
 
-## Contributing
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/how-dark.svg">
+  <img src="docs/media/how-light.svg" width="100%" alt="Three parts in a row. Your AI agent (Claude Code, on your PC) asks Agentroid to look, tap or type. Agentroid, an MCP server and a small daemon on your PC, checks each action and makes no AI calls of its own, then drives your Android phone over adb, by USB or Wi-Fi. Coming back, the phone's raw screen description is 11,565 tokens; Agentroid hands the AI a short list of 229 tokens.">
+</picture>
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Agentroid is an MCP server (MCP is the plug-in standard AI agents such as Claude Code use for tools) plus a small daemon on your PC that talks to the phone over adb. Your agent stays the brain. Agentroid is its eyes and hands, and it keeps what the agent reads small in five ways:
+
+- **A short answer first.** A look returns the first 400 characters of the screen list and a one-line note on how to ask for more (the `digest` level). The agent pays for detail only when it needs it.
+- **"What changed?" instead of a second look.** After the first look the agent can ask only for the lines that were added, changed or removed (`since=`). When nothing changed, that answer is 35 tokens.
+- **Names that survive a scroll.** Each tappable thing gets a short id such as `r352116` that stays the same when the screen scrolls or re-lays out (a stable ref), so the agent does not have to look again to find it.
+- **Several steps in one call.** A list of steps runs on your PC as one job (`job_start`). The recording at the top is six taps for one call and one reply.
+- **No AI inside.** Agentroid makes 0 model calls and needs no API key of its own. Every reply carries a receipt that says so.
+
+<details>
+<summary>One more recording: look, tap four times, look again</summary>
+
+<br>
+
+<p align="center">
+  <img src="docs/media/demo-1.gif" width="760" alt="A real recording. Left: the phone's Calculator. Right: the calls: look, then four taps, then look again. The display goes from 0 to 7 x 6 = 42.">
+</p>
+
+<p align="center"><sub>Played at 1.5× speed. A short script sent the calls, not Claude Code.</sub></p>
+
+</details>
+
+## Safety
+
+An agent with a phone in its hands needs limits that it cannot talk its way past, so the checks live in the daemon and not in a prompt. Nothing is driven unless you allowed that phone by serial number. Every action is checked against what is on the screen at that moment: payments, banking apps, factory resets and typing into password or one-time-code fields are refused, and sending, deleting, installing and permission dialogs are refused unless you approve them from another device (an optional approval channel). There is no free shell: the only shell commands that run are read-only diagnostics from a fixed list, and anything else is refused. Every decision goes into a hash-chained log, which shows if anyone edits it afterwards. The guard is plain rules, so it has blind spots: what it catches, what it misses and the red-team results are published in [docs/SAFETY.md](docs/SAFETY.md). Use it on phones you own or are allowed to test.
+
+<p align="center">
+  <img src="docs/media/demo-2.gif" width="760" alt="A real recording of three diagnostic calls. Reading the battery state runs. Clearing an app's data and changing a setting are each refused with a reason before anything reaches the phone.">
+</p>
+
+<p align="center"><sub>A read-only check runs; two commands that would change the phone are refused before they reach it. Paced for reading.</sub></p>
+
+## Status and limits
+
+Agentroid is a preview (0.1.0). It works and is tested, but it is not 1.0.
+
+- **Windows only** for the daemon in this build, tested on Windows 11. A Linux listener is written but not built or tested.
+- **Build it from source.** Nothing is published to crates.io or npm yet.
+- **An allowed phone gets full access unless you say otherwise.** Start the daemon with `--read-only-serial <hardware serial>` to make an allowed phone answer reads only. The helper mode exists in the daemon but cannot be set for a phone yet.
+- **Text, not pictures.** The agent reads the screen as a text list. `screenshot` and `look` do not send image bytes to the agent in this build.
+- **Not implemented yet:** `pixel_probe`, and `look`'s `element` and `ocr` options. `set_value` sets text fields only.
+- **One AI client tried:** Claude Code.
+- **No task benchmark yet.** The AndroidWorld runs so far are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+## How it was built
+
+[Ethan Soh](https://github.com/Sohwhat6420) directs the design and testing; AI coding agents wrote most of the code under his direction.
+
+## Docs
+
+- [docs/REFERENCE.md](docs/REFERENCE.md): every feature, the full setup notes and troubleshooting.
+- [docs/SAFETY.md](docs/SAFETY.md): how the screen guard decides, and its published red-team results.
+- [docs/BENCHMARK.md](docs/BENCHMARK.md): the AndroidWorld runs so far.
+- [docs/CONNECTION-KEEPER.md](docs/CONNECTION-KEEPER.md): the Android module that brings wireless adb back after a Wi-Fi drop or a reboot.
+- [docs/media/src](docs/media/src): the scripts that draw the pictures on this page from the measured figures, and the raw token counts. The banner's phone body and desk are a generated picture; the screen in it is a real screenshot.
+- [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## Licence
 

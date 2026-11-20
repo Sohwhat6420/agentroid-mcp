@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE))
 import agentroid_mcp as am  # noqa: E402
 import run_pilot as rp  # noqa: E402
 
-NO_WINDOW = 0x08000000
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 
 
 def count(env, label: str) -> int:

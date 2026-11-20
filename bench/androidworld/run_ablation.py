@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Sequence
 
 HERE = Path(__file__).resolve().parent
-NO_WINDOW = 0x08000000
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # creationflags is Windows-only
 ORDER = ("screens", "planner", "verifier", "notes", "stall")
 # gain over the best score so far needed to keep a change (one run each, so under 2 tasks is noise)
 THRESHOLD = {"screens": 2, "planner": 2, "verifier": 1, "notes": 0, "stall": 0}
