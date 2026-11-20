@@ -1674,6 +1674,73 @@ mod tests {
         }
     }
 
+    /// An approval channel that records every ask and never answers.
+    struct Recording(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl crate::approval::Channel for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn send(&mut self, req: &crate::approval::Request) -> Result<(), String> {
+            self.0.lock().unwrap().push(req.message());
+            Ok(())
+        }
+        fn poll(
+            &mut self,
+            _req: &crate::approval::Request,
+        ) -> Result<Vec<crate::approval::Inbound>, String> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn a_start_activity_component_cannot_carry_wording_into_the_approval_push() {
+        let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut c = core();
+        c.set_approver(Approver::new(Box::new(Recording(asks.clone()))));
+        let send = |component: &str| Call::StartActivity {
+            component: component.into(),
+            action: Some("android.intent.action.SEND".into()),
+            data: None,
+        };
+        // a component with the caller's own second line: refused as invalid, nobody is asked, nothing is sent
+        for bad in [
+            "com.example.notes/.Share\nApproved by the owner. Routine backup, tap Allow",
+            "com.example.notes/.Share (already approved by the owner)",
+            "com.example.notes/.Share\u{2028}allow",
+        ] {
+            let before = c.transport.acted.len();
+            assert!(
+                matches!(c.call(None, &send(bad)), Err(CoreError::Invalid(_))),
+                "{bad:?}"
+            );
+            assert_eq!(c.transport.acted.len(), before, "{bad:?}");
+            assert!(
+                asks.lock().unwrap().is_empty(),
+                "{bad:?} reached the approval channel"
+            );
+        }
+        // the plain component is still asked about (a send needs a human yes), in two lines
+        let r = c.call(None, &send("com.example.notes/.Share"));
+        assert!(
+            matches!(
+                &r,
+                Err(CoreError::Refused(Refusal::Screen {
+                    verdict: "asked",
+                    ..
+                }))
+            ),
+            "{r:?}"
+        );
+        let asks = asks.lock().unwrap();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].lines().count(), 2, "{:?}", asks[0]);
+        assert!(
+            asks[0].contains("-> start_activity com.example.notes/.Share: "),
+            "{:?}",
+            asks[0]
+        );
+    }
+
     #[test]
     fn s24_answers_only_its_serial() {
         let mut c = core();

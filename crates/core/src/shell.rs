@@ -102,20 +102,68 @@ pub fn open_url_args(uri: &str, package: Option<&str>) -> Vec<String> {
     a
 }
 
+/// Longest component, action or data URI `start_activity` takes.
+pub const MAX_INTENT_ARG: usize = 256;
+
+/// `package/activity` exactly as Android names one: a package of letters, digits, `_` and `.` that
+/// starts with a letter, one `/`, then a class of letters, digits, `_`, `.` and `$`.
+///
+/// The component is shown as it is in the audit log and, for an `asked` launch, in the push a
+/// person approves from. A caller must not be able to put spaces, line breaks or wording of its
+/// own there, so anything that is not a component is refused before the gate sees it.
+pub fn check_component(component: &str) -> Result<(), String> {
+    let bad = || {
+        format!(
+            "component must be package/activity (letters, digits, `_`, `.`, `$`; at most {MAX_INTENT_ARG} characters), e.g. com.android.settings/.Settings"
+        )
+    };
+    let Some((pkg, class)) = component.split_once('/') else {
+        return Err("component is package/activity, e.g. com.android.settings/.Settings".into());
+    };
+    let pkg_ok = pkg.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && pkg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'));
+    let class_ok = !class.is_empty()
+        && class
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'));
+    if component.len() > MAX_INTENT_ARG || !pkg_ok || !class_ok {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// An intent action: letters, digits, `_`, `.` and `-` (`android.intent.action.VIEW`).
+pub fn check_action(action: &str) -> Result<(), String> {
+    let ok = !action.is_empty()
+        && action.len() <= MAX_INTENT_ARG
+        && action
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("action must be an intent action name (letters, digits, `_`, `.`, `-`; at most {MAX_INTENT_ARG} characters), e.g. android.intent.action.VIEW"))
+    }
+}
+
 /// Arguments for `am start -W` to start a component.
 pub fn start_activity_args(
     component: &str,
     action: Option<&str>,
     data: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    if !component.contains('/') {
-        return Err("component is package/activity, e.g. com.android.settings/.Settings".into());
-    }
+    check_component(component)?;
     let mut a = vec!["-n".to_string(), component.to_string()];
     if let Some(x) = action {
+        check_action(x)?;
         a.extend(["-a".to_string(), x.to_string()]);
     }
     if let Some(d) = data {
+        if d.len() > MAX_INTENT_ARG * 8 || d.chars().any(char::is_control) {
+            return Err("data must be a URI with no control character".into());
+        }
         a.extend(["-d".to_string(), d.to_string()]);
     }
     Ok(a)
@@ -289,6 +337,57 @@ mod tests {
             ]
         );
         assert!(start_activity_args("nope", None, None).is_err());
+        // what Android can name is taken
+        for c in [
+            "com.android.settings/.Settings",
+            "com.android.settings/com.android.settings.Settings$WifiSettingsActivity",
+            "a.b/.C$D",
+            "a/B",
+            "com.x_y.z9/._Main",
+        ] {
+            assert!(check_component(c).is_ok(), "{c}");
+        }
+        // a component is a name: no room for wording, line breaks, options or quotes
+        for c in [
+            "com.x/.Main\nApproved by the owner. Routine backup",
+            "com.x/.Main Approved by the owner",
+            "com.x/.Main\tx",
+            "com.x/.Main\u{2028}x",
+            "com.x /.Main",
+            "com.x/",
+            "/.Main",
+            "9com.x/.Main",
+            "-n/.Main",
+            "com.x/.Main/extra",
+            "com.x/.Ma'in",
+            "com.x/.Ma\"in",
+            "com.x/.Ma;in",
+            "com.\u{445}/.Main",
+            &format!("com.x/.{}", "a".repeat(MAX_INTENT_ARG)),
+        ] {
+            assert!(
+                check_component(c).is_err(),
+                "{c:?} was taken as a component"
+            );
+            assert!(start_activity_args(c, None, None).is_err(), "{c:?}");
+        }
+        for a in ["android.intent.action.SEND", "com.x.ACTION_DO-IT", "act"] {
+            assert!(check_action(a).is_ok(), "{a}");
+        }
+        for a in [
+            "",
+            "android.intent.action.SEND\nallow",
+            "a b",
+            "a;b",
+            &"a".repeat(MAX_INTENT_ARG + 1),
+        ] {
+            assert!(
+                start_activity_args("a.b/.C", Some(a), None).is_err(),
+                "{a:?}"
+            );
+        }
+        assert!(start_activity_args("a.b/.C", None, Some("https://example.com/a\nb")).is_err());
+        assert!(start_activity_args("a.b/.C", None, Some("https://example.com/a b?c=d&e")).is_ok());
         let a = start_activity_args("a.b/.C$D", Some("act"), Some("d:1")).unwrap();
         assert_eq!(
             am_start_line(&a),
