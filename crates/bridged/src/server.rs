@@ -247,6 +247,8 @@ pub struct Daemon {
     /// The laptop folder `push` reads from (`outbox`) and `pull_new` writes to (`inbox`).
     /// Unset: `devtools::default_files_dir()`. `bridged` sets `<state dir>/files`.
     pub(crate) files_dir: OnceLock<PathBuf>,
+    /// The largest file `pull_new` will fetch, in bytes. Unset: `devtools::DEFAULT_MAX_PULL_BYTES`.
+    pub(crate) max_pull_bytes: OnceLock<u64>,
     /// Session stay-awake (`crate::awake`), once attached (live adb only).
     pub(crate) awake: OnceLock<Arc<crate::awake::SessionAwake>>,
     /// The `Arc` this daemon lives in, so a job thread can own a handle to it.
@@ -361,6 +363,7 @@ impl Daemon {
             link: OnceLock::new(),
             waits: OnceLock::new(),
             files_dir: OnceLock::new(),
+            max_pull_bytes: OnceLock::new(),
             awake: OnceLock::new(),
             me: me.clone(),
         })
@@ -396,6 +399,11 @@ impl Daemon {
     /// Set the laptop folder for `push` (its `outbox`) and `pull_new` (its `inbox`). Once; later calls are ignored.
     pub fn set_files_dir(&self, dir: PathBuf) {
         let _ = self.files_dir.set(dir);
+    }
+
+    /// Set the largest file `pull_new` will fetch, in bytes. Once; later calls are ignored.
+    pub fn set_max_pull_bytes(&self, bytes: u64) {
+        let _ = self.max_pull_bytes.set(bytes);
     }
 
     /// The attached link hub.

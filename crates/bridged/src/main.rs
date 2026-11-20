@@ -29,6 +29,7 @@
 //!                                             audited as `bench`, never as a human. Refused unless the
 //!                                             allow list is exactly --allow-emulators, and the channel
 //!                                             itself refuses any non-emulator hardware serial
+//!          --max-pull-mb N                    the largest file pull_new fetches, in MiB (default 512)
 //!          --audit-anchor PATH                D3b: a second copy of the audit chain head, written
 //!                                             after every record (put it off this machine: a synced
 //!                                             folder, a network share); best effort by default
@@ -100,6 +101,8 @@ struct Args {
     ntfy_base: Option<String>,
     /// `--bench-approve`: the emulator-only stand-in approver (AndroidWorld "with approvals" score).
     bench_approve: bool,
+    /// `--max-pull-mb`: the largest file `pull_new` fetches, in MiB (`None`: the daemon's default).
+    max_pull_mb: Option<u64>,
     /// D3b `--audit-anchor`: the off-machine head copy.
     audit_anchor: Option<PathBuf>,
     /// Off by default: a failed anchor write is counted, not refused (by design).
@@ -139,6 +142,7 @@ fn parse_args() -> Result<Args, String> {
         approval_topic_file: None,
         approval_inbound_file: None,
         ntfy_base: None,
+        max_pull_mb: None,
         audit_anchor: None,
         audit_anchor_required: false,
     };
@@ -196,6 +200,14 @@ fn parse_args() -> Result<Args, String> {
                 a.audit_anchor = Some(PathBuf::from(
                     it.next().ok_or("--audit-anchor needs a path")?,
                 ))
+            }
+            "--max-pull-mb" => {
+                a.max_pull_mb = Some(
+                    it.next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|n| (1..=1_048_576).contains(n))
+                        .ok_or("--max-pull-mb needs a whole number of MiB, 1 to 1048576")?,
+                )
             }
             "--audit-anchor-required" => a.audit_anchor_required = true,
             "--audit-anchor-best-effort" => a.audit_anchor_required = false,
@@ -525,6 +537,9 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
     }
     // push reads only <state dir>\files\outbox; pull_new writes only <state dir>\files\inbox
     daemon.set_files_dir(args.state_dir.join("files"));
+    if let Some(mb) = args.max_pull_mb {
+        daemon.set_max_pull_bytes(mb * 1024 * 1024);
+    }
     // the link hub (2.12): only when an address is given; link-hub refuses 0.0.0.0 and the LAN
     let mut hub_ip: Option<std::net::IpAddr> = None;
     if let Some(bind) = &args.link_bind {
