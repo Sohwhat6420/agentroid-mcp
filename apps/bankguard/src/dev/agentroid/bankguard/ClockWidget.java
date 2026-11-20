@@ -6,13 +6,21 @@ import android.appwidget.AppWidgetProvider;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.provider.AlarmClock;
+import android.provider.Settings;
 import android.text.format.DateFormat;
 import android.widget.RemoteViews;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * The dot clocks. A launcher will not load this app's font inside a widget (see ClockRender), so each clock is drawn
@@ -36,6 +44,7 @@ public abstract class ClockWidget extends AppWidgetProvider {
 
     @Override
     public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+        forgetClockTarget();
         for (int id : ids) render(c, m, id);
         // The service is what ticks the clock. It normally runs from boot; make sure of it (Android may refuse a
         // foreground start from here, and then the boot receiver or opening the app starts it).
@@ -47,6 +56,7 @@ public abstract class ClockWidget extends AppWidgetProvider {
         String a = i.getAction();
         if (Intent.ACTION_TIME_CHANGED.equals(a) || Intent.ACTION_TIMEZONE_CHANGED.equals(a)
                 || Intent.ACTION_LOCALE_CHANGED.equals(a)) {
+            forgetClockTarget();
             renderAll(c);
             return;
         }
@@ -56,12 +66,43 @@ public abstract class ClockWidget extends AppWidgetProvider {
     void render(Context c, AppWidgetManager m, int id) {
         RemoteViews rv = new RemoteViews(c.getPackageName(), layout());
         fill(c, rv, new Date(), DateFormat.is24HourFormat(c));
-        Intent clock = new Intent(AlarmClock.ACTION_SHOW_ALARMS);
-        if (clock.resolveActivity(c.getPackageManager()) != null) {
-            rv.setOnClickPendingIntent(R.id.w_root, PendingIntent.getActivity(c, 100 + id % 1000, clock,
-                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
-        }
+        // The whole widget opens the clock app, as the owner's original does (see ClockLogic for why not SHOW_ALARMS).
+        rv.setOnClickPendingIntent(R.id.w_root, PendingIntent.getActivity(c, 100 + id % 1000, clockIntent(c),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
         m.updateAppWidget(id, rv);
+    }
+
+    /** The clock app's launch intent, worked out once and kept: a minute's redraw asks the package manager nothing. */
+    private static volatile Intent clockTarget;
+
+    /** Forget the clock app (called at screen-on, on placement and on a time change), so an app installed or removed
+     *  since is picked up at the next redraw. */
+    static void forgetClockTarget() { clockTarget = null; }
+
+    static Intent clockIntent(Context c) {
+        Intent t = clockTarget;
+        if (t == null) clockTarget = t = findClockIntent(c);
+        return new Intent(t);
+    }
+
+    private static Intent findClockIntent(Context c) {
+        PackageManager pm = c.getPackageManager();
+        String alarmApp = null;
+        try {
+            ResolveInfo ri = pm.resolveActivity(new Intent(AlarmClock.ACTION_SHOW_ALARMS), PackageManager.MATCH_DEFAULT_ONLY);
+            if (ri != null && ri.activityInfo != null) alarmApp = ri.activityInfo.packageName;
+        } catch (Throwable ignored) { }
+        Set<String> launchable = new HashSet<String>();
+        List<String> probe = new ArrayList<String>(Arrays.asList(ClockLogic.KNOWN));
+        if (alarmApp != null) probe.add(alarmApp);
+        for (String p : probe) {
+            try { if (pm.getLaunchIntentForPackage(p) != null) launchable.add(p); } catch (Throwable ignored) { }
+        }
+        String pkg = ClockLogic.choose(alarmApp, launchable);
+        Intent i = pkg == null ? null : pm.getLaunchIntentForPackage(pkg);
+        if (i == null) i = new Intent(Settings.ACTION_DATE_SETTINGS); // NewThing's own fallback
+        // As a launcher icon starts an app: back to the app's task as it was left, not a fresh copy on top.
+        return i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
     }
 
     /** Redraw every placed clock. Cheap when none is placed: one lookup per provider. */
@@ -96,7 +137,8 @@ public abstract class ClockWidget extends AppWidgetProvider {
             // Heavier dots on the time only: in the original, its dots nearly touch (side by side, 14 Nov 2026).
             rv.setImageViewBitmap(R.id.w_time, ClockRender.line(c, 56, new String[] {t}, new int[] {INK}, 0, true,
                     0.02f));
-            rv.setImageViewBitmap(R.id.w_date, ClockRender.line(c, 22, caps(fmt("EEE, d MMM", d)), INK, true));
+            // "EEE, dd MMM", as the original (TimeDateLargeR): FRI, 06 NOV, not FRI, 6 NOV.
+            rv.setImageViewBitmap(R.id.w_date, ClockRender.line(c, 22, caps(fmt("EEE, dd MMM", d)), INK, true));
             rv.setContentDescription(R.id.w_time, t);
             rv.setContentDescription(R.id.w_date, fmt("EEEE d MMMM", d));
         }

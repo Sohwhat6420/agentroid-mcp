@@ -6,7 +6,7 @@
      Built without Gradle (aapt2 + javac + d8, see build.sh). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.agentroid.bankguard"
-    android:versionCode="1"
+    android:versionCode="2"
     android:versionName="0.1-bankguard">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
@@ -35,6 +35,15 @@
         <intent>
             <action android:name="android.intent.action.SHOW_ALARMS" />
         </intent>
+        <!-- The clock apps a dot clock may open (ClockLogic.KNOWN, the original widget's list). -->
+        <package android:name="com.google.android.deskclock" />
+        <package android:name="com.sec.android.app.clockpackage" />
+        <package android:name="com.oneplus.deskclock" />
+        <package android:name="com.miui.clock" />
+        <package android:name="com.android.deskclock" />
+        <package android:name="com.htc.android.worldclock" />
+        <package android:name="com.lge.clock" />
+        <package android:name="com.sonyericsson.organizer" />
     </queries>
 
     <!-- "Agentroid Companion": the bank guard and the home-screen widgets (dot clocks, app dock) in one small app.

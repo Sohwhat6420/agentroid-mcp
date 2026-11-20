@@ -82,7 +82,10 @@ public final class GuardService extends Service {
             h.post(new Runnable() { public void run() {
                 interactive = !Intent.ACTION_SCREEN_OFF.equals(i.getAction());
                 onScreen();
-                if (Intent.ACTION_SCREEN_ON.equals(i.getAction())) drawClocks();
+                if (Intent.ACTION_SCREEN_ON.equals(i.getAction())) {
+                    ClockWidget.forgetClockTarget(); // a clock app installed or removed since is picked up
+                    drawClocks();
+                }
             } });
         }
     };

@@ -170,9 +170,10 @@ jobs:
       - name: Logic tests
         run: |
           mkdir -p out/test
-          javac -d out/test src/dev/agentroid/bankguard/GuardLogic.java src/dev/agentroid/bankguard/DockLogic.java test/GuardLogicTest.java test/DockLogicTest.java
+          javac -d out/test src/dev/agentroid/bankguard/GuardLogic.java src/dev/agentroid/bankguard/DockLogic.java src/dev/agentroid/bankguard/ClockLogic.java test/GuardLogicTest.java test/DockLogicTest.java test/ClockLogicTest.java
           java -cp out/test GuardLogicTest
           java -cp out/test DockLogicTest
+          java -cp out/test ClockLogicTest
       - name: Shell scripts parse
         run: bash -n build.sh && bash -n setup-bankguard.sh
       - name: Android SDK packages (platform 36, build-tools 36.0.0)
