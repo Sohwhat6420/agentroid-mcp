@@ -69,6 +69,17 @@ public final class KeeperLogic {
         return paused;
     }
 
+    /** v0.4: also skip while the Agentroid Bank Guard holds (a banking app is open and debugging must stay off). */
+    public static boolean shouldSkipRun(boolean paused, boolean bankGuardHolds) {
+        return paused || bankGuardHolds;
+    }
+
+    /** The bank guard's answer (content://dev.agentroid.bankguard.hold, one int column "held"): only an explicit 1
+     *  holds; no guard installed, no row, or anything unreadable is null and means "no hold". */
+    public static boolean bankGuardHolds(Integer held) {
+        return held != null && held == 1;
+    }
+
     /** The log line emitted when a run reverts. Matches the brief's required string. */
     public static String logLineFor(Outcome o) {
         switch (o) {

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A pair of white stem earbuds with a red dot, drawn for this app (the original widget uses a photo of Nothing's
+     Ear; this is a plain stand-in of the same size and colours). The right bud is the left one mirrored. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="125dp"
+    android:height="84dp"
+    android:viewportWidth="125"
+    android:viewportHeight="84">
+
+    <group android:name="left">
+        <!-- ear tip -->
+        <path android:fillColor="#FFCFCFD2" android:pathData="M12,30 a10,11 0 1,0 20,0 a10,11 0 1,0 -20,0 Z" />
+        <!-- head -->
+        <path android:fillColor="#FFF2F2F2" android:pathData="M17,21 a16,16 0 1,0 32,0 a16,16 0 1,0 -32,0 Z" />
+        <path android:fillColor="#FF2B2B2E" android:pathData="M30,19 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+        <!-- stem: a clear shell with a lighter core -->
+        <path android:fillColor="#FFDCDCDF" android:pathData="M33,22 h13 v52 a6.5,6.5 0 0 1 -13,0 Z" />
+        <path android:fillColor="#FFF7F7F7" android:pathData="M36.5,26 h6 v47 a3,3 0 0 1 -6,0 Z" />
+        <!-- red dot -->
+        <path android:fillColor="#FFC8302C" android:pathData="M36,31 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 Z" />
+    </group>
+
+    <group android:name="right" android:pivotX="62.5" android:scaleX="-1">
+        <path android:fillColor="#FFCFCFD2" android:pathData="M12,30 a10,11 0 1,0 20,0 a10,11 0 1,0 -20,0 Z" />
+        <path android:fillColor="#FFF2F2F2" android:pathData="M17,21 a16,16 0 1,0 32,0 a16,16 0 1,0 -32,0 Z" />
+        <path android:fillColor="#FF2B2B2E" android:pathData="M30,19 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+        <path android:fillColor="#FFDCDCDF" android:pathData="M33,22 h13 v52 a6.5,6.5 0 0 1 -13,0 Z" />
+        <path android:fillColor="#FFF7F7F7" android:pathData="M36.5,26 h6 v47 a3,3 0 0 1 -6,0 Z" />
+        <path android:fillColor="#FFC8302C" android:pathData="M36,31 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 Z" />
+    </group>
+</vector>

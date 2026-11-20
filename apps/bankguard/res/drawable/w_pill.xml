@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A stadium: fully round ends at any size (a square view becomes a circle). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@color/w_surface" />
+    <corners android:radius="999dp" />
+</shape>

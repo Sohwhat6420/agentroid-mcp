@@ -4,10 +4,15 @@
      Built without Gradle (aapt2 + javac + d8, see build.sh). No listening socket, ever. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.agentroid.keeper"
-    android:versionCode="3"
-    android:versionName="0.3-keeper">
+    android:versionCode="4"
+    android:versionName="0.4-keeper">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
+
+    <!-- v0.4: to ask the Agentroid Bank Guard (apps/bankguard), if installed, whether a banking app is open. -->
+    <queries>
+        <package android:name="dev.agentroid.bankguard" />
+    </queries>
 
     <!-- Outbound heartbeat only; there is no listening socket. -->
     <uses-permission android:name="android.permission.INTERNET" />

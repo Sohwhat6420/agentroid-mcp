@@ -74,6 +74,14 @@ public class KeeperLogicTest {
         check("shouldSkipRun skips only when paused",
                 KeeperLogic.shouldSkipRun(true) && !KeeperLogic.shouldSkipRun(false));
 
+        // ---- v0.4 the bank guard's hold ----
+        check("shouldSkipRun skips while the bank guard holds",
+                KeeperLogic.shouldSkipRun(false, true) && KeeperLogic.shouldSkipRun(true, false)
+                        && !KeeperLogic.shouldSkipRun(false, false));
+        check("only held=1 is a hold",
+                KeeperLogic.bankGuardHolds(1) && !KeeperLogic.bankGuardHolds(0)
+                        && !KeeperLogic.bankGuardHolds(null) && !KeeperLogic.bankGuardHolds(2));
+
         long D = 7_200_000L, M = 43_200_000L;
         eq("nudge: first after 15 s", KeeperLogic.nudgeDelayMs(0), 15_000L);
         eq("nudge: then every 45 s", KeeperLogic.nudgeDelayMs(5), 45_000L);
