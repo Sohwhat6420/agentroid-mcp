@@ -330,7 +330,7 @@ Agentroid is a preview (0.1.0). It works and is tested, but it is not 1.0.
 
 - **Windows only** for the daemon in this build, tested on Windows 11. A Linux listener is written but not built or tested.
 - **Build it from source.** Nothing is published to crates.io or npm yet.
-- **Every allowed phone gets full access.** Per-device modes (read-only, helper) exist in the daemon but cannot be set from configuration yet.
+- **An allowed phone gets full access unless you say otherwise.** Start the daemon with `--read-only-serial <hardware serial>` to make an allowed phone answer reads only. The helper mode exists in the daemon but cannot be set for a phone yet.
 - **Text, not pictures.** The agent reads the screen as a text list. `screenshot` and `look` do not send image bytes to the agent in this build.
 - **Not implemented yet:** `pixel_probe`, and `look`'s `element` and `ocr` options. `set_value` sets text fields only.
 - **One AI client tried:** Claude Code.

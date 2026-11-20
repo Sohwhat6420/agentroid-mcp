@@ -410,12 +410,33 @@ impl<T: Transport, C: Clock> Core<T, C> {
                 .any(|a| a.eq_ignore_ascii_case(&d.hw_serial) || matches_adb_serial(a, &d.serial))
     }
 
-    fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
+    /// The mode the gate applies to a device: what was configured for it, except the protected
+    /// phone, which is always `read_only`.
+    ///
+    /// A configured entry names a device exactly as an allowlist entry does ([`Core::allowed`]): it
+    /// matches the hardware serial with case ignored, the adb serial, or the wireless adb name
+    /// `adb-<serial>-...`. A serial typed in another letter case, or a phone that connected over
+    /// Wi-Fi, must not fall back to `full`. When several entries match, the narrowest mode wins.
+    pub fn mode_of(&self, d: &DeviceInfo) -> DeviceMode {
+        // the ranking counts only what can change the phone: `helper` keeps gestures, keys and
+        // typing, which `read_only` refuses, so it ranks between `full` and `read_only`. It is not
+        // wider than `read_only` in every way: `helper` refuses `doctor diagnose` and the raw adb
+        // tools, while `read_only` answers `doctor diagnose`. So a device matched by both a
+        // `helper` and a `read_only` entry would get `doctor diagnose` back; that cannot happen
+        // yet, as the daemon never configures `helper` for a device.
+        let narrowness = |m: DeviceMode| match m {
+            DeviceMode::Full => 0,
+            DeviceMode::Helper => 1,
+            DeviceMode::ReadOnly => 2,
+        };
         let configured = self
             .modes
-            .get(&d.hw_serial)
-            .or_else(|| self.modes.get(&d.serial))
-            .copied()
+            .iter()
+            .filter(|(entry, _)| {
+                entry.eq_ignore_ascii_case(&d.hw_serial) || matches_adb_serial(entry, &d.serial)
+            })
+            .map(|(_, m)| *m)
+            .max_by_key(|m| narrowness(*m))
             .unwrap_or_default();
         gate::effective_mode(&[&d.serial, &d.hw_serial], configured)
     }
@@ -1611,6 +1632,60 @@ mod tests {
             )
             .is_ok());
         assert!(c.transport.acted.is_empty());
+    }
+
+    #[test]
+    fn a_configured_mode_follows_the_device_however_its_serial_is_written_or_connected() {
+        let acted = |c: &mut Core<FakeDevice, FakeClock>| {
+            c.call(
+                None,
+                &Call::Key {
+                    name: "back".into(),
+                },
+            )
+        };
+        // the hardware serial in another letter case (the allowlist ignores case; so must the mode)
+        for entry in [
+            POCO_SERIAL.to_ascii_lowercase(),
+            POCO_SERIAL.to_string(),
+            FAKE_POCO_ADB.to_string(),
+        ] {
+            let mut c = core();
+            c.set_mode(&entry, DeviceMode::ReadOnly);
+            assert!(
+                matches!(
+                    acted(&mut c),
+                    Err(CoreError::Refused(Refusal::ReadOnly { .. }))
+                ),
+                "{entry}"
+            );
+            assert!(c.transport.acted.is_empty(), "{entry}");
+        }
+        // the same phone seen over wireless adb, before its hardware serial is known
+        let c = core();
+        let mut c2 = core();
+        c2.set_mode(&POCO_SERIAL.to_ascii_lowercase(), DeviceMode::ReadOnly);
+        let wireless = DeviceInfo {
+            serial: format!("adb-{POCO_SERIAL}-AbCdEf._adb-tls-connect._tcp"),
+            model: "m".into(),
+            hw_serial: String::new(),
+        };
+        assert_eq!(c.mode_of(&wireless), DeviceMode::Full, "nothing configured");
+        assert_eq!(c2.mode_of(&wireless), DeviceMode::ReadOnly);
+        // another phone is not caught by a near miss, and the narrowest of two entries wins
+        let other = DeviceInfo {
+            serial: "192.0.2.77:5555".into(),
+            model: "m".into(),
+            hw_serial: format!("{POCO_SERIAL}X"),
+        };
+        assert_eq!(c2.mode_of(&other), DeviceMode::Full);
+        let mut c3 = core();
+        c3.set_mode(POCO_SERIAL, DeviceMode::Full);
+        c3.set_mode(FAKE_POCO_ADB, DeviceMode::ReadOnly);
+        assert!(matches!(
+            acted(&mut c3),
+            Err(CoreError::Refused(Refusal::ReadOnly { .. }))
+        ));
     }
 
     #[test]

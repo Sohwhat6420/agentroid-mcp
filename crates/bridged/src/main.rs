@@ -11,6 +11,10 @@
 //!                                 one per line in FILE (default <state dir>\allow.txt, `#` comments)
 //! bridged --adb auto --allow-emulators
 //!                                 also drive `emulator-*` serials
+//! bridged --adb auto --allow-serial SERIAL --read-only-serial SERIAL
+//!                                 an allowed phone that answers reads only (look, ui_tree, getprop,
+//!                                 doctor...): every acting call, push, pull_new and run_script is
+//!                                 refused there. Repeatable; SERIAL must also be allowed
 //! bridged --stop                  ask a running daemon to stop (writes the stop file)
 //! bridged --print-schema [PATH]   write the IPC JSON Schema (default generated/ipc.schema.json)
 //! options: --pipe NAME  --state-dir DIR
@@ -84,6 +88,8 @@ struct Args {
     allow_serials: Vec<String>,
     /// `--allow-file`: one serial per line; default `<state dir>/allow.txt` when it exists.
     allow_file: Option<PathBuf>,
+    /// `--read-only-serial`, repeatable: allowed hardware serials that run in `read_only` mode.
+    read_only_serials: Vec<String>,
     stop: bool,
     print_schema: Option<PathBuf>,
     pipe: String,
@@ -126,6 +132,7 @@ fn parse_args() -> Result<Args, String> {
         bench_approve: false,
         allow_serials: vec![],
         allow_file: None,
+        read_only_serials: vec![],
         stop: false,
         print_schema: None,
         pipe: bridged::PIPE_NAME.to_string(),
@@ -152,6 +159,10 @@ fn parse_args() -> Result<Args, String> {
             "--allow-serial" => a
                 .allow_serials
                 .push(it.next().ok_or("--allow-serial needs a hardware serial")?),
+            "--read-only-serial" => a.read_only_serials.push(
+                it.next()
+                    .ok_or("--read-only-serial needs a hardware serial")?,
+            ),
             "--allow-file" => {
                 a.allow_file = Some(PathBuf::from(it.next().ok_or("--allow-file needs a path")?))
             }
@@ -355,9 +366,12 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
         return Err("--fake and --adb are alternatives".into());
     }
     if args.adb.is_none()
-        && (!args.allow_serials.is_empty() || args.allow_file.is_some() || args.allow_emulators)
+        && (!args.allow_serials.is_empty()
+            || args.allow_file.is_some()
+            || args.allow_emulators
+            || !args.read_only_serials.is_empty())
     {
-        return Err("--allow-serial, --allow-file and --allow-emulators need --adb (the fake device has a fixed allowlist)".into());
+        return Err("--allow-serial, --allow-file, --allow-emulators and --read-only-serial need --adb (the fake device has a fixed allowlist)".into());
     }
     let adb_path = args.adb.as_deref().map(resolve_adb);
     let backend: Box<dyn DeviceBackend> = if args.fake {
@@ -474,7 +488,21 @@ fn run(args: &Args, stop_file: &Path) -> Result<(), String> {
                 "approval channel: none (every `asked` verdict is refused; pass --approval-topic-file)",
             ),
         }
-        Box::new(CoreBackend::new(core))
+        // Device modes: `full` unless named read_only here. Set before the first call can arrive.
+        let read_only = bridged::allow::read_only(&args.read_only_serials, &allow)
+            .map_err(|e| format!("device modes: {e}"))?;
+        let mut backend = CoreBackend::new(core);
+        for serial in &read_only {
+            backend.set_mode(serial, DeviceMode::ReadOnly);
+        }
+        log(
+            &args.state_dir,
+            &format!(
+                "device modes: {} read_only, every other allowed device full",
+                read_only.len()
+            ),
+        );
+        Box::new(backend)
     } else {
         Box::new(NoDevices)
     };

@@ -102,6 +102,24 @@ pub fn build(
     Ok(out)
 }
 
+/// The `--read-only-serial` entries: each is a hardware serial ([`check_entry`]) that is also on
+/// the allowlist, without repeats. An entry that is not allowed is an error and not a no-op: a
+/// mistyped serial would otherwise leave the phone it was meant for in `full` mode with no word said.
+pub fn read_only(flags: &[String], allow: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = vec![];
+    for f in flags {
+        let entry = f.trim();
+        check_entry(entry)?;
+        if !allow.iter().any(|a| a.eq_ignore_ascii_case(entry)) {
+            return Err(format!("--read-only-serial {entry:?} is not on the allowlist: name the same hardware serial with --allow-serial (or in allow.txt), so a mistyped serial cannot leave a phone in full mode"));
+        }
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(entry)) {
+            out.push(entry.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Everything the daemon does to get its list: flags, the file (`explicit` is `--allow-file`, else
 /// `<state_dir>/allow.txt` if it exists) and `--allow-emulators`. Any problem is an error.
 pub fn load(
@@ -140,6 +158,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn read_only_entries_must_be_allowed_serials() {
+        let allow = s(&["ABCDEF123", "ZZZZZZ99", "emulator-"]);
+        assert_eq!(read_only(&[], &allow).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            read_only(&s(&["abcdef123", " ZZZZZZ99 ", "ABCDEF123"]), &allow).unwrap(),
+            s(&["abcdef123", "ZZZZZZ99"]),
+            "case is ignored, as the allowlist ignores it, and a repeat is one entry"
+        );
+        // a serial that is not allowed (a typo of an allowed one) stops the daemon instead of doing nothing
+        let e = read_only(&s(&["ABCDEF124"]), &allow).unwrap_err();
+        assert!(e.contains("is not on the allowlist"), "{e}");
+        // and it must be a serial at all
+        for bad in ["emulator-", "abc", "192.0.2.9:5555", "has space1"] {
+            assert!(read_only(&s(&[bad]), &allow).is_err(), "{bad}");
+        }
     }
 
     #[test]
