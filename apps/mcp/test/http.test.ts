@@ -7,7 +7,7 @@ import http from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { DaemonClient } from "../src/daemon.ts";
-import { BindRefused, checkBindAddress, checkPort, parseConfig, startHttpServer } from "../src/http-wiring.ts";
+import { BindRefused, checkBindAddress, checkPort, parseConfig, scopedDaemon, startHttpServer } from "../src/http-wiring.ts";
 import type { HttpConfig, LogEntry, RunningServer } from "../src/http-wiring.ts";
 import { TokenTable, newToken } from "../src/tokens.ts";
 import type { Mode } from "../src/tokens.ts";
@@ -30,7 +30,7 @@ const tok = (): string => {
 interface Rig {
   fake: FakeDaemon;
   srv: RunningServer;
-  t: { pocoFull: string; pocoRead: string; ro14Read: string; s24Full: string };
+  t: { pocoFull: string; pocoRead: string; pocoHelper: string; ro14Read: string; s24Full: string };
   stop(): Promise<void>;
 }
 
@@ -40,10 +40,11 @@ async function makeRig(config: Partial<HttpConfig> = {}, devices: FakeDevice[] =
   const fake = new FakeDaemon(devices);
   await fake.start();
   const store = new MemoryStore();
-  const t = { pocoFull: tok(), pocoRead: tok(), ro14Read: tok(), s24Full: tok() };
+  const t = { pocoFull: tok(), pocoRead: tok(), pocoHelper: tok(), ro14Read: tok(), s24Full: tok() };
   const put = (d: FakeDevice, m: Mode, token: string): Promise<void> => store.put(d.hw_serial, m, token);
   await put(POCO, "full", t.pocoFull);
   await put(POCO, "read_only", t.pocoRead);
+  await put(POCO, "helper", t.pocoHelper);
   await put(RO14, "read_only", t.ro14Read);
   await put(S24, "full", t.s24Full); // a token cannot widen the daemon's S24 rule; tested below
   const daemon = new DaemonClient({ path: fake.path, session: "http-test", defaultTimeoutMs: 5000 });
@@ -290,6 +291,65 @@ test("a token bound to read_only is refused an acting tool, and the daemon never
     assert.match(refusal?.token_id ?? "", new RegExp(`^${POCO.hw_serial}/read_only#[0-9a-f]{10}$`));
   } finally {
     await client.close();
+  }
+});
+
+test("a helper token gets gestures, keys and typing; every tool that needs adb shell is refused before the daemon sees it", async () => {
+  const client = await connect(R.srv, R.t.pocoHelper);
+  try {
+    // the fake device is `full`, as every device is over the pipe today: only the token's mode can refuse
+    const before = R.fake.requests.length;
+    const jobCalls = (): number => R.fake.requests.slice(before).filter((q) => q.method.startsWith("job.")).length;
+    const refused: [string, Record<string, unknown>][] = [
+      ["unlock", {}],
+      ["open_app", { package: "com.android.settings" }],
+      ["open_url", { uri: "https://example.com" }],
+      ["start_activity", { component: "com.android.settings/.Settings" }],
+      ["push", { local: "a.txt", phone_path: "/sdcard/Download/a.txt" }],
+      ["pull_new", { dir: "/sdcard/Download" }],
+      ["doctor", { diagnose: "dumpsys battery" }],
+      ["run_script", { script: "1" }],
+      ["job_start", { steps: [{ id: "s1", kind: "tap" }], app: "com.android.settings" }],
+    ];
+    const seen = deviceCalls(R.fake).length;
+    for (const [name, args] of refused) {
+      const r = await client.callTool({ name, arguments: args });
+      assert.equal(r.isError, true, name);
+      assert.equal(sc(r).error?.kind, "refused", `${name}: ${JSON.stringify(sc(r).error)}`);
+      assert.match(sc(r).error?.message ?? "", /this token is helper, so it may only call read tools \(not doctor\), gestures, keys and typing/, name);
+    }
+    assert.equal(deviceCalls(R.fake).length, seen, "no refused device.call reached the daemon");
+    assert.equal(jobCalls(), 0, "no job method reached the daemon");
+    assert.equal(LOGS.findLast((e) => e.reason === "token_mode")?.tool, "job_start");
+    // what helper is for still works
+    for (const [name, args] of [["tap", { x: 10, y: 20 }], ["type_text", { text: "hi" }], ["key", { name: "back" }], ["swipe", { x1: 1, y1: 1, x2: 2, y2: 2 }], ["look", {}], ["ui_tree", {}]] as const) {
+      const r = await client.callTool({ name, arguments: args });
+      assert.equal(sc(r).ok, true, `${name}: ${JSON.stringify(sc(r).error)}`);
+    }
+  } finally {
+    await client.close();
+  }
+});
+
+test("the scoped daemon refuses a helper token the same calls on its own (the second layer)", async () => {
+  const fake = new FakeDaemon([POCO]);
+  await fake.start();
+  const inner = new DaemonClient({ path: fake.path, session: "scope-test", defaultTimeoutMs: 5000 });
+  try {
+    const d = scopedDaemon(inner, { serial: POCO.hw_serial, mode: "helper", id: "t" });
+    for (const tool of ["open_url", "start_activity", "open_app", "unlock", "push", "pull_new", "doctor"]) {
+      await assert.rejects(d.request("device.call", { device: POCO.device, call: { tool } }), /refused by the token scope: this token is helper/, tool);
+    }
+    for (const method of ["job.start", "job.run_script", "job.resume", "job.pause", "job.stop"]) {
+      await assert.rejects(d.request(method, { device: POCO.device, run_id: "r" }), /refused by the token scope: this token is helper/, method);
+    }
+    assert.equal(fake.callsTo("device.call"), 0);
+    await d.request("lease.acquire", { device: POCO.device });
+    const ok = (await d.request("device.call", { device: POCO.device, call: { tool: "tap", x: 1, y: 1 } })) as { tool: string };
+    assert.equal(ok.tool, "tap");
+  } finally {
+    inner.close();
+    await fake.stop();
   }
 });
 

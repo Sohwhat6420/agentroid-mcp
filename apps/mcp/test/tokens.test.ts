@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { TOOLS } from "../src/tools.ts";
 import { TARGET_PREFIX, TokenTable, bearer, fingerprint, modeAllows, namesBoundDevice, newToken, parseTarget, targetFor } from "../src/tokens.ts";
 import { MemoryStore } from "./fake-store.ts";
 import { mcpRoot } from "./util.ts";
@@ -58,11 +59,25 @@ test("tokens: bearer() takes only `Bearer <token>`", () => {
   for (const h of [undefined, "", "Basic abc", "Bearer", "Bearer ", "Bearer a b", "abc", "Token abc"]) assert.equal(bearer(h), undefined);
 });
 
-test("tokens: the mode rule: read_only gets read tools only; full and helper get every tool", () => {
-  assert.equal(modeAllows("read_only", true), true);
-  assert.equal(modeAllows("read_only", false), false);
-  assert.equal(modeAllows("full", false), true);
-  assert.equal(modeAllows("helper", false), true);
+test("tokens: the mode rule: read_only gets read tools only; full gets every tool; helper gets reads, gestures, keys and typing", () => {
+  for (const t of TOOLS) {
+    assert.equal(modeAllows("full", t.read, t.name), true, `full ${t.name}`);
+    assert.equal(modeAllows("read_only", t.read, t.name), t.read, `read_only ${t.name}`);
+  }
+  // helper, tool by tool: the daemon's helper routes (crates/core/src/gate.rs) and nothing that needs adb shell
+  const helperMay = TOOLS.filter((t) => modeAllows("helper", t.read, t.name)).map((t) => t.name).sort();
+  assert.deepEqual(helperMay, ["getprop", "job_status", "key", "lease", "list_apps", "list_devices", "long_press", "look", "pixel_probe", "screenshot", "scroll", "set_value", "swipe", "tap", "type_text", "ui_tree", "wait"]);
+  for (const name of ["unlock", "open_app", "open_url", "start_activity", "push", "pull_new", "doctor", "run_script", "job_start", "job_stop"]) {
+    const def = TOOLS.find((t) => t.name === name);
+    assert.ok(def, name);
+    assert.equal(modeAllows("helper", def.read, name), false, `helper must not reach ${name}`);
+  }
+  // the daemon's job methods, as the scoped daemon names them
+  for (const m of ["job.start", "job.resume", "job.pause", "job.stop", "job.run_script"]) assert.equal(modeAllows("helper", false, m), false, m);
+  for (const m of ["job.status", "job.receipt", "job.dry_run"]) assert.equal(modeAllows("helper", true, m), true, m);
+  // an unknown name is never an acting permission
+  assert.equal(modeAllows("helper", false, "undefined"), false);
+  assert.equal(modeAllows("read_only", false, ""), false);
 });
 
 test("tokens: the device rule matches only the bound hardware serial's row", () => {

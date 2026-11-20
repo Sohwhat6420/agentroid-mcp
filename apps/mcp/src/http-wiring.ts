@@ -33,7 +33,7 @@ import type { Server as Core, ServerOptions } from "./server-core.ts";
 import { Supervisor } from "./supervise.ts";
 import { callIsRead, toolByName } from "./tools.ts";
 import type { Profile } from "./tools.ts";
-import { bearer, modeAllows, namesBoundDevice } from "./tokens.ts";
+import { bearer, modeAllows, modeLimit, namesBoundDevice } from "./tokens.ts";
 import type { Binding, DeviceRow, TokenTable } from "./tokens.ts";
 
 export const MCP_PATH = "/mcp";
@@ -211,7 +211,7 @@ export function scopedDaemon(inner: DaemonLike, b: Binding): DaemonLike {
           await checkDevice(params.device);
           const tool = (params.call as { tool?: unknown } | undefined)?.tool;
           const def = typeof tool === "string" ? toolByName(tool) : undefined;
-          if (!modeAllows(b.mode, def?.read === true)) throw scopeRefusal(`${String(tool)} refused by the token scope: this token is ${b.mode}, so it may only call read tools`);
+          if (!modeAllows(b.mode, def?.read === true, String(tool))) throw scopeRefusal(`${String(tool)} refused by the token scope: this token is ${b.mode}, ${modeLimit(b.mode)}`);
           return inner.request(method, params, opts);
         }
         // 2.11a: the job methods. read_only tokens get READ_JOB_METHODS only (job_status, and
@@ -225,7 +225,7 @@ export function scopedDaemon(inner: DaemonLike, b: Binding): DaemonLike {
         case "job.resume":
         case "job.stop":
         case "job.receipt": {
-          if (!modeAllows(b.mode, READ_JOB_METHODS.has(method))) throw scopeRefusal(`${method} refused by the token scope: this token is ${b.mode}, so it may only call read tools`);
+          if (!modeAllows(b.mode, READ_JOB_METHODS.has(method), method)) throw scopeRefusal(`${method} refused by the token scope: this token is ${b.mode}, ${modeLimit(b.mode)}`);
           if (method === "job.start" || method === "job.dry_run" || method === "job.run_script") {
             await checkDevice(params.device);
             return inner.request(method, params, opts);
@@ -324,8 +324,8 @@ export async function startHttpServer(opts: StartOptions): Promise<RunningServer
           let why: string | null = null;
           let reason = "";
           // a call's own arguments may make it a read (job_start with dry_run: true)
-          if (!modeAllows(b.mode, callIsRead(def, args))) {
-            why = `${def.name} refused: this token is ${b.mode}, so it may only call read tools`;
+          if (!modeAllows(b.mode, callIsRead(def, args), def.name)) {
+            why = `${def.name} refused: this token is ${b.mode}, ${modeLimit(b.mode)}`;
             reason = "token_mode";
           } else if (typeof args.device === "string" && !namesBoundDevice(b, args.device, await boundRow(daemon, b))) {
             why = `device ${JSON.stringify(args.device)} refused: this token is bound to one device, and that is not it`;
