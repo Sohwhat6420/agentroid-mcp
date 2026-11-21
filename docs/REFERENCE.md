@@ -2,7 +2,7 @@
 
 > Moved here from the README on 14 Nov 2026, unchanged except for links, so the README can lead with the context budget.
 
-Contents: [The parts](#the-parts) · [What it does](#what-it-does) · [Safety model](#safety-model) · [Setup notes](#setup-notes) · [Demo](#demo) · [Project status](#project-status)
+Contents: [The parts](#the-parts) · [What it does](#what-it-does) · [Tools](#tools) · [Errors](#errors) · [Environment variables](#environment-variables) · [Safety model](#safety-model) · [Setup notes](#setup-notes) · [Demo](#demo) · [Project status](#project-status)
 
 ## The parts
 
@@ -32,6 +32,91 @@ Contents: [The parts](#the-parts) · [What it does](#what-it-does) · [Safety mo
   - **Approval requests.** If you start the daemon with `--approval-topic-file <file>`, every `asked` action posts an approval request to that topic and waits for your Allow or Deny. The request carries the tool, the phone's **hardware serial**, the guard's reason (which quotes the matched on-screen label, such as `"Delete"`) and the target label. The default server is `https://ntfy.sh`; `--ntfy-base <url>` points it at your own. `AGENTROID_NO_PUSH` does not affect this path.
 
   Treat both topic names as secrets, and prefer a self-hosted ntfy server.
+
+## Tools
+
+All 27 tools, in the order the server lists them. "Read only" tools carry MCP's `readOnlyHint` and are the ones a `read_only` HTTP token may call (`job_start` with `dry_run: true` counts as a read too); what a `read_only` device answers is decided by the daemon's own gate. The `minimal` profile (`AGENTROID_PROFILE=minimal`) lists only the 8 marked "yes". The table is made from `apps/mcp/src/tools.ts` (`npm run docs` in `apps/mcp` rewrites it, and `npm test` fails if it is out of date).
+
+<!-- gen:tools -->
+| Tool | Kind | Read only | In `minimal` | What it does |
+| --- | --- | --- | --- | --- |
+| `list_devices` | device | yes | yes | List connected phones: key, model, mode, lease holder. |
+| `lease` | device | no | no | Take, release or check the lease on a phone. Acting calls take it for you. |
+| `look` | device | yes | yes | Screenshot plus UI tree. element and ocr: not implemented yet (error). |
+| `ui_tree` | device | yes | yes | UI tree as text. |
+| `screenshot` | device | yes | no | Take a screenshot. |
+| `tap` | device | no | yes | Tap an index, ref or point. |
+| `long_press` | device | no | no | Press and hold an index, ref or point. |
+| `swipe` | device | no | no | Swipe from (x1, y1) to (x2, y2). |
+| `scroll` | device | no | no | Scroll the screen one page. |
+| `type_text` | device | no | yes | Type text into the focused field or a tree index. |
+| `key` | device | no | yes | Press a key: back, home, enter, recents, ... |
+| `unlock` | device | no | no | Wake and unlock the phone. |
+| `open_app` | device | no | no | Launch an app by package name. |
+| `open_url` | device | no | no | Open a URL, optionally in one package. |
+| `start_activity` | device | no | no | Start an activity by component. |
+| `list_apps` | device | yes | no | List installed packages, optionally filtered. |
+| `wait` | device | yes | no | Wait up to 100 seconds for the screen to settle. |
+| `getprop` | device | yes | yes | Read one system property (adb shell getprop). |
+| `set_value` | device | no | no | Set a text field to a value and read it back (text fields only). |
+| `pixel_probe` | device | yes | no | Not implemented yet (always an error). |
+| `pull_new` | device | no | no | Fetch a new file from the phone into the daemon's inbox once its size is stable across two polls. |
+| `push` | device | no | no | Copy a file from the daemon's outbox folder to a phone path (full devices only). |
+| `doctor` | device | yes | yes | Read-only diagnostics: dumpsys <service>, getprop, settings get, pm list, ... |
+| `job_start` | job | no | no | Start a flow, or steps in app; returns run_id. mode sync waits and returns a row per step. dry_run: check on saved trees. resume_run_id: resume a paused job. record: a done run saves a replayable flow; flow may be that file's name. |
+| `job_status` | job | yes | no | A job's state in one line; with its receipt once it has ended. |
+| `job_stop` | job | no | no | Stop a job, or pause it (mode pause). |
+| `run_script` | job | no | no | Run sandboxed JavaScript (full devices). |
+<!-- /gen:tools -->
+
+## Errors
+
+A tool call never fails at the protocol level. A failure is a normal result with `isError: true`, `ok: false`, an `error` object `{kind, code, message, data?}`, and the same header and receipt as a success. The text form ends with a line `error kind: <kind>, run <run id>`; the run id is the receipt's `run_id`, so a refusal can be matched to its receipt from the text alone.
+
+- `kind` is one of the 13 below. The list is closed: a new kind is a breaking change.
+- `code` is the daemon's JSON-RPC error code when the error came from `bridged` (for example -32003 for `refused`), otherwise `null`.
+- `message` is the daemon's own text, unchanged, for errors that came from the daemon. A refusal quotes its reason: do not retry it or look for a way round it.
+
+The table is made from `apps/mcp/src/errors.ts`.
+
+<!-- gen:errors -->
+| Kind | What it means | Repeat the call? |
+| --- | --- | --- |
+| `invalid_input` | The arguments do not match the tool's input schema, or the daemon rejected them as invalid. | Only after fixing the input, the device or the lease. |
+| `unknown_tool` | No tool has that name in this server's profile. | No: the same call fails the same way. |
+| `refused` | A safety check refused the call: the device mode, the screen guard, the token scope or the protected-device rule. | No: the same call fails the same way. |
+| `lease_held` | Another session holds the lease on this device. | Only after fixing the input, the device or the lease. |
+| `not_holder` | This session does not hold the lease the call needs (it lapsed, or the connection to bridged was replaced). | Only after fixing the input, the device or the lease. |
+| `unknown_device` | No connected, allowed device matches the name given. | Only after fixing the input, the device or the lease. |
+| `ambiguous_device` | Several devices are connected and the call named none, so the server will not choose. | Only after fixing the input, the device or the lease. |
+| `device_error` | The phone or adb failed while carrying out the call. | Look at the screen first: the action may have happened. |
+| `daemon_error` | bridged failed in a way that has no more specific kind. | Look at the screen first: the action may have happened. |
+| `timeout` | No answer within the call's time limit (never more than 110 s). | Look at the screen first: the action may have happened. |
+| `transport` | The MCP server cannot reach bridged over its named pipe. | Yes, once bridged is reachable again. |
+| `bad_reply` | bridged answered with something that is not a valid JSON-RPC reply. | No: the same call fails the same way. |
+| `bad_output` | The result failed the tool's own output schema, so it was replaced by this error. | No: the same call fails the same way. |
+<!-- /gen:errors -->
+
+Errors thrown before any tool runs (a bad HTTP listener config, a bad token entry, a missing credstore helper) are JavaScript errors with a stable `code`: `config`, `bind_refused` (an address or port the listener refuses, a kind of `config` error), `token` and `credstore`. Their messages never contain a token.
+
+## Environment variables
+
+None is needed for the quick start. A variable set to anything other than the value shown has no effect.
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `AGENTROID_PROFILE` | MCP server (stdio) | `minimal` lists the 8-tool profile; anything else lists all 27 tools. |
+| `AGENTROID_SESSION` | MCP server (stdio) | The session label sent to `bridged`, which becomes the lease holder's name. Default `claude-<process id>`. |
+| `AGENTROID_PIPE` | MCP server (stdio and HTTP) | The named pipe to reach `bridged` on. Default `\\.\pipe\agentroid`. |
+| `AGENTROID_NO_PUSH` | MCP server (stdio and HTTP) | `1` turns job pushes off. It does not affect approval requests. |
+| `AGENTROID_HTTP_CONFIG` | HTTP listener | The config file, when `--config` is not given. |
+| `AGENTROID_CREDSTORE` | HTTP listener, token admin | The credstore helper binary. Default: `target/release`, then `target/debug`, of the repository. |
+| `AGENTROID_NO_STAY_AWAKE` | `bridged` | `1` turns the stay-awake hold off. |
+| `AGENTROID_AWAKE_IDLE_S` | `bridged` | Seconds with no call before the stay-awake hold is given back. At least 60; default 900 (15 minutes). |
+| `AGENTROID_NO_S24_AWAKE` | `bridged` | `1` leaves the protected phone out of the stay-awake hold (see [SAFETY.md](SAFETY.md)). |
+| `AGENTROID_NO_IDLE_FALLBACK` | `bridged` | `1` turns off the read-only fallback reader for screens that never go still. For benchmark comparisons only. |
+| `AGENTROID_STATE_DIR` | `agentroid-link` | The state directory. Default `%LOCALAPPDATA%\agentroid`. |
+| `AGENTROID_ADB` | `agentroid-link` | The `adb` binary. Default `adb` on `PATH`. |
 
 ## Safety model
 
@@ -145,7 +230,7 @@ The three clips below are real recordings of the phone screen (Android's own `sc
 
 ## Project status
 
-Agentroid is a preview, released for trial and demo. The Cargo workspace and the MCP package are both version 0.1.0; nothing is published to crates.io or npm.
+Agentroid 1.0.0 is the first tagged release. The Cargo workspace and the MCP package are both version 1.0.0; nothing is published to crates.io or npm. From 1.0.0 the tool names and inputs, the result shape and the [error kinds](#errors) follow semantic versioning: changing or removing any of them needs a new major version. The changes are listed in [CHANGELOG.md](../CHANGELOG.md).
 
 *What works.* The daemon with a fake device and with a live adb transport behind the guard; the 27-tool MCP server over stdio, and an optional HTTP listener for a tailnet; flows and jobs with a journal, pause and resume, and record and replay. The Rust workspace has a test suite (`cargo test --workspace`) and the MCP server has one (`npm test` in `apps/mcp`).
 
