@@ -197,11 +197,21 @@ export const HEADER_SCHEMA: Schema = {
   },
 };
 
+/**
+ * A phone-supplied name (window title, package) as one short line. Apps choose their window titles, so a title is
+ * untrusted text: without this, a title holding a newline could add a forged line (a fake "SESSION ACTION" or a
+ * second header) to the top of a result (OWASP LLM01, audit of 21 Nov 2026).
+ */
+export function oneLine(s: string, max = 80): string {
+  const t = s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]+/g, " ").replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
 /** The header as one line of text, put first in every result so the model sees it without parsing JSON. */
 export function headerLine(h: Header): string {
   const val = <T>(f: Field<T>, show: (x: T) => string): string => (f.v === "unknown" ? `unknown${f.age_s === null ? "" : ` (${f.age_s}s ago)`}` : show(f.v));
-  const fg = val(h.foreground, (x) => x.title ?? x.package ?? "?");
-  const focus = h.focus_changed.v === "unknown" ? "unknown" : h.focus_changed.v ? `YES -> ${h.focus_changed.title ?? "?"}` : "no";
+  const fg = val(h.foreground, (x) => oneLine(x.title ?? x.package ?? "?"));
+  const focus = h.focus_changed.v === "unknown" ? "unknown" : h.focus_changed.v ? `YES -> ${oneLine(h.focus_changed.title ?? "?")}` : "no";
   const who = [val(h.alias, (x) => x), val(h.model, (x) => x), val(h.mode, (x) => x)].join(" / ");
   return (
     `[${who}] battery ${val(h.battery, (x) => `${x}%`)}, powered ${val(h.powered, (x) => (x ? "yes" : "no"))}, ` +
