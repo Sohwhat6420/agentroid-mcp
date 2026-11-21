@@ -2337,7 +2337,8 @@ pub fn uri_findings(uri: &str) -> Vec<Finding> {
             out.push(f(Kind::Payment, "payment scheme"))
         }
         "tel" => {
-            let rest = &lower[4..];
+            // `get`, not `[4..]`: a bare "tel" (three bytes) would panic the connection's task.
+            let rest = lower.get(4..).unwrap_or("");
             if rest.contains('*')
                 || rest.contains('#')
                 || rest.contains("%23")
@@ -2603,6 +2604,22 @@ mod tests {
             name: "back".into(),
         };
         assert_eq!(decide(None, &back, Touch::Key).verdict, Verdict::Allowed);
+    }
+
+    #[test]
+    fn a_bare_or_short_scheme_does_not_panic() {
+        // OWASP LLM audit, 21 Nov 2026: the URI comes from the model, so any string must get a verdict.
+        for uri in ["tel", "TEL", " tel ", "t", "", ":", "tel:"] {
+            let _ = uri_findings(uri);
+            let d = decide_launch(&Call::OpenUrl {
+                uri: uri.into(),
+                package: None,
+            })
+            .unwrap();
+            if uri.trim().eq_ignore_ascii_case("tel") || uri == "tel:" {
+                assert_ne!(d.verdict, Verdict::Allowed, "{uri:?} opens a call");
+            }
+        }
     }
 
     #[test]
