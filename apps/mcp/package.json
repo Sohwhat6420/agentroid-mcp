@@ -1,6 +1,6 @@
 {
   "name": "@agentroid/mcp",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -8,7 +8,8 @@
     "test": "node --experimental-strip-types --no-warnings --test \"test/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node --experimental-strip-types src/sdk-wiring.ts",
-    "budget:ci": "node --experimental-strip-types scripts/count-tokens-ci.ts"
+    "budget:ci": "node --experimental-strip-types scripts/count-tokens-ci.ts",
+    "docs": "node --experimental-strip-types scripts/docs-tables.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
@@ -17,5 +18,8 @@
   "devDependencies": {
     "@types/node": "26.6.5",
     "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22.6.0"
   }
 }

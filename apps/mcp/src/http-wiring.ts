@@ -35,6 +35,7 @@ import { Supervisor } from "./supervise.ts";
 import { callIsRead, toolByName } from "./tools.ts";
 import type { Profile } from "./tools.ts";
 import { bearer, modeAllows, namesBoundDevice } from "./tokens.ts";
+import { VERSION } from "./version.ts";
 import type { Binding, DeviceRow, TokenTable } from "./tokens.ts";
 
 export const MCP_PATH = "/mcp";
@@ -368,7 +369,7 @@ export async function startHttpServer(opts: StartOptions): Promise<RunningServer
     }
 
     const core = coreFor(b);
-    const sdk = new SdkServer({ name: "agentroid", version: "0.1.0" }, { capabilities: { tools: {} }, instructions: core.instructions });
+    const sdk = new SdkServer({ name: "agentroid", version: VERSION }, { capabilities: { tools: {} }, instructions: core.instructions });
     installHandlers(sdk, core);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

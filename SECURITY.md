@@ -21,7 +21,7 @@ Do not include real access tokens, real device serial numbers or screenshots of 
 
 ## Supported versions
 
-Agentroid is pre-release (version 0.1.0). Only the latest commit on the default branch is supported. Once a release is tagged, the latest release is supported as well.
+The latest release (version 1.0.0) and the latest commit on the default branch are supported. Fixes go to the default branch and into the next release; older releases get no backports.
 
 ## What counts as a vulnerability
 

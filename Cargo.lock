@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "agentroid-adb-link"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "agentroid-bridged"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-adb-link",
  "agentroid-care",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-care"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-adb-link",
  "agentroid-core",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-adb-link",
  "serde_json",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-credstore"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde_json",
  "windows-sys 0.61.2",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-handover"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-adb-link",
  "serde_json",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-link-hub"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-adb-link",
  "agentroid-credstore",
@@ -86,11 +86,11 @@ dependencies = [
 
 [[package]]
 name = "agentroid-mcp"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "agentroid-sandbox"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-core",
  "rquickjs",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-segments"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "getrandom 0.3.4",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "agentroid-setup"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agentroid-adb-link",
  "agentroid-bridged",
