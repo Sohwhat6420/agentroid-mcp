@@ -15,6 +15,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CredstoreError, TokenError } from "./errors.ts";
 
 /** The credstore helper: AGENTROID_CREDSTORE, else the repo's target/release, then target/debug. */
 export function credstorePath(): string {
@@ -22,7 +23,7 @@ export function credstorePath(): string {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
   const exe = process.platform === "win32" ? "credstore.exe" : "credstore";
   for (const p of [join(root, "target", "release", exe), join(root, "target", "debug", exe)]) if (existsSync(p)) return p;
-  throw new Error("credstore helper not found: build it (cargo build --release -p agentroid-credstore) or set AGENTROID_CREDSTORE");
+  throw new CredstoreError("credstore helper not found: build it (cargo build --release -p agentroid-credstore) or set AGENTROID_CREDSTORE");
 }
 
 export const MODES = ["full", "helper", "read_only"] as const;
@@ -57,8 +58,8 @@ export const isMode = (x: unknown): x is Mode => typeof x === "string" && (MODES
 export const validSerial = (s: unknown): s is string => typeof s === "string" && SERIAL_RE.test(s);
 
 export function targetFor(serial: string, mode: Mode, prefix: string = TARGET_PREFIX): string {
-  if (!validSerial(serial)) throw new Error(`bad device serial ${JSON.stringify(serial)}: use the hardware serial (ro.serialno), letters, digits, . _ - only`);
-  if (!isMode(mode)) throw new Error(`bad mode ${JSON.stringify(mode)}: use one of ${MODES.join(", ")}`);
+  if (!validSerial(serial)) throw new TokenError(`bad device serial ${JSON.stringify(serial)}: use the hardware serial (ro.serialno), letters, digits, . _ - only`);
+  if (!isMode(mode)) throw new TokenError(`bad mode ${JSON.stringify(mode)}: use one of ${MODES.join(", ")}`);
   return `${prefix}${serial}:${mode}`;
 }
 
@@ -87,11 +88,11 @@ export class TokenTable {
     const seen = new Set<string>();
     for (const t of tokens) {
       const label = `${String(t.serial)}/${String(t.mode)}`;
-      if (!validSerial(t.serial) || !isMode(t.mode)) throw new Error(`token entry ${label} has a bad serial or mode`);
-      if (typeof t.token !== "string" || t.token.length < MIN_TOKEN_CHARS || t.token.length > MAX_TOKEN_CHARS) throw new Error(`token entry ${label} has a token of the wrong length (want ${MIN_TOKEN_CHARS} to ${MAX_TOKEN_CHARS} characters)`);
+      if (!validSerial(t.serial) || !isMode(t.mode)) throw new TokenError(`token entry ${label} has a bad serial or mode`);
+      if (typeof t.token !== "string" || t.token.length < MIN_TOKEN_CHARS || t.token.length > MAX_TOKEN_CHARS) throw new TokenError(`token entry ${label} has a token of the wrong length (want ${MIN_TOKEN_CHARS} to ${MAX_TOKEN_CHARS} characters)`);
       const hash = digest(t.token);
       const key = hash.toString("hex");
-      if (seen.has(key)) throw new Error(`token entry ${label} reuses another entry's token`);
+      if (seen.has(key)) throw new TokenError(`token entry ${label} reuses another entry's token`);
       seen.add(key);
       this.entries.push({ hash, binding: { serial: t.serial, mode: t.mode, id: `${t.serial}/${t.mode}#${fingerprint(t.token)}` } });
     }
@@ -157,7 +158,7 @@ export class CredStore implements TokenStore {
   private readonly timeoutMs: number;
 
   constructor(exe: string, prefix: string = TARGET_PREFIX, timeoutMs = 10_000) {
-    if (!prefix.startsWith("agentroid:")) throw new Error("credstore targets must start with agentroid:");
+    if (!prefix.startsWith("agentroid:")) throw new CredstoreError("credstore targets must start with agentroid:");
     this.exe = exe;
     this.prefix = prefix;
     this.timeoutMs = timeoutMs;
@@ -178,25 +179,25 @@ export class CredStore implements TokenStore {
       };
       const timer = setTimeout(() => {
         child.kill();
-        done(() => reject(new Error(`credstore: no answer in ${this.timeoutMs} ms`)));
+        done(() => reject(new CredstoreError(`credstore: no answer in ${this.timeoutMs} ms`)));
       }, this.timeoutMs);
       child.stdout.on("data", (b: Buffer) => {
         size += b.length;
         if (size <= 1_048_576) out.push(b);
       });
       child.stderr.resume(); // the helper writes nothing secret there; drain it
-      child.on("error", (e) => done(() => reject(new Error(`credstore: cannot start ${this.exe}: ${e.message}`))));
+      child.on("error", (e) => done(() => reject(new CredstoreError(`credstore: cannot start ${this.exe}: ${e.message}`))));
       child.on("close", () =>
         done(() => {
           let r: unknown;
           try {
             r = JSON.parse(Buffer.concat(out).toString("utf8"));
           } catch {
-            return reject(new Error("credstore: the helper's answer was not JSON"));
+            return reject(new CredstoreError("credstore: the helper's answer was not JSON"));
           }
-          if (r === null || typeof r !== "object") return reject(new Error("credstore: the helper's answer was not an object"));
+          if (r === null || typeof r !== "object") return reject(new CredstoreError("credstore: the helper's answer was not an object"));
           const o = r as Record<string, unknown>;
-          if (o.ok !== true) return reject(new Error(`credstore: ${typeof o.error === "string" ? o.error : "failed"}`));
+          if (o.ok !== true) return reject(new CredstoreError(`credstore: ${typeof o.error === "string" ? o.error : "failed"}`));
           resolve(o);
         }),
       );
