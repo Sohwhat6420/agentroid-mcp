@@ -10,6 +10,7 @@ import { DaemonClient } from "./daemon.ts";
 import { installHandlers } from "./sdk-handlers.ts";
 import { createServer } from "./server-core.ts";
 import { Supervisor, defaultTopicFile, ntfyPost, readTopic } from "./supervise.ts";
+import { VERSION } from "./version.ts";
 
 const profile = process.env.AGENTROID_PROFILE === "minimal" ? "minimal" : "full";
 const session = process.env.AGENTROID_SESSION ?? `claude-${process.pid}`;
@@ -25,7 +26,7 @@ const supervisor = new Supervisor({
 });
 const core = createServer({ daemon, profile, session, supervisor, watch: true });
 
-const server = new Server({ name: "agentroid", version: "0.1.0" }, { capabilities: { tools: {} }, instructions: core.instructions });
+const server = new Server({ name: "agentroid", version: VERSION }, { capabilities: { tools: {} }, instructions: core.instructions });
 
 installHandlers(server, core);
 

@@ -8,12 +8,32 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    # A tag whose name is not v<the version in every file>, or a version with no CHANGELOG
+    # section, stops here, before anything is built or a draft is made.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python -B scripts/check_release.py "${{ github.ref_name }}"
+
   build:
+    needs: check
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch; the version itself comes from rust-toolchain.toml
       - run: cargo test --workspace --no-fail-fast
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: MCP server tests
+        working-directory: apps/mcp
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
       - run: cargo build --release --workspace --bins
       - name: Package
         shell: pwsh
@@ -22,7 +42,7 @@ jobs:
           $dir = "agentroid-$v-windows-x64"
           New-Item -ItemType Directory $dir | Out-Null
           Get-ChildItem target/release -File -Filter *.exe | Copy-Item -Destination $dir
-          Copy-Item LICENSE, NOTICE, README.md, SECURITY.md, docs/SAFETY.md -Destination $dir
+          Copy-Item LICENSE, NOTICE, README.md, SECURITY.md, CHANGELOG.md, docs/SAFETY.md, docs/REFERENCE.md -Destination $dir
           Copy-Item generated/redteam/results.md "$dir/redteam-results.md"
           # The MCP server is TypeScript run by Node 22.6+ directly; ship its source and lock file
           # (run `npm ci` in mcp/ after unzipping).
@@ -34,6 +54,9 @@ jobs:
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
+          # the notes come from the matching section of docs/release-notes; a person reads and
+          # edits the draft before publishing it (the workflow never publishes)
+          body_path: docs/release-notes/${{ github.ref_name }}.md
           files: |
             agentroid-*-windows-x64.zip
             SHA256SUMS.txt

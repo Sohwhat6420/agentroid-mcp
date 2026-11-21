@@ -27,6 +27,7 @@ import { Server as SdkServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { DaemonError } from "./daemon.ts";
 import type { DaemonLike } from "./daemon.ts";
+import { BindRefused, ConfigError } from "./errors.ts";
 import { installHandlers, wantsProgress } from "./sdk-handlers.ts";
 import { createServer as createCore } from "./server-core.ts";
 import type { Server as Core, ServerOptions } from "./server-core.ts";
@@ -34,6 +35,7 @@ import { Supervisor } from "./supervise.ts";
 import { callIsRead, toolByName } from "./tools.ts";
 import type { Profile } from "./tools.ts";
 import { bearer, modeAllows, namesBoundDevice } from "./tokens.ts";
+import { VERSION } from "./version.ts";
 import type { Binding, DeviceRow, TokenTable } from "./tokens.ts";
 
 export const MCP_PATH = "/mcp";
@@ -62,12 +64,7 @@ export interface HttpConfig {
   profile?: Profile;
 }
 
-export class BindRefused extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BindRefused";
-  }
-}
+export { BindRefused, ConfigError } from "./errors.ts";
 
 const OCTET = "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 const IPV4_RE = new RegExp(`^${OCTET}\\.${OCTET}\\.${OCTET}\\.${OCTET}$`);
@@ -129,7 +126,7 @@ export class RateLimiter {
   private readonly now: () => number;
 
   constructor(limit: RateLimit, now: () => number = Date.now) {
-    if (!(limit.perMinute > 0) || !(limit.burst >= 1)) throw new Error("rateLimit needs perMinute > 0 and burst >= 1");
+    if (!(limit.perMinute > 0) || !(limit.burst >= 1)) throw new ConfigError("rateLimit needs perMinute > 0 and burst >= 1");
     this.perMs = limit.perMinute / 60_000;
     this.burst = limit.burst;
     this.now = now;
@@ -298,10 +295,10 @@ export async function startHttpServer(opts: StartOptions): Promise<RunningServer
   const host = checkBindAddress(config.host);
   const port = checkPort(config.port);
   const maxBody = config.maxBodyBytes ?? DEFAULT_MAX_BODY;
-  if (!Number.isInteger(maxBody) || maxBody < 1 || maxBody > 16 * 1_048_576) throw new Error(`maxBodyBytes must be an integer from 1 to ${16 * 1_048_576}`);
-  if (tokens.size === 0) throw new Error("no tokens are stored, so nobody could use the listener; issue one first (src/token-admin.ts issue)");
-  for (const o of config.allowedOrigins ?? []) if (typeof o !== "string" || !/^https?:\/\/[^\s/*]+$/.test(o)) throw new Error(`allowedOrigins entry ${JSON.stringify(o)} must be a plain origin like http://host:port, no wildcards`);
-  for (const h of config.allowedHosts ?? []) if (typeof h !== "string" || !/^[A-Za-z0-9.-]+(:\d{1,5})?$/.test(h)) throw new Error(`allowedHosts entry ${JSON.stringify(h)} must be host or host:port, no wildcards`);
+  if (!Number.isInteger(maxBody) || maxBody < 1 || maxBody > 16 * 1_048_576) throw new ConfigError(`maxBodyBytes must be an integer from 1 to ${16 * 1_048_576}`);
+  if (tokens.size === 0) throw new ConfigError("no tokens are stored, so nobody could use the listener; issue one first (src/token-admin.ts issue)");
+  for (const o of config.allowedOrigins ?? []) if (typeof o !== "string" || !/^https?:\/\/[^\s/*]+$/.test(o)) throw new ConfigError(`allowedOrigins entry ${JSON.stringify(o)} must be a plain origin like http://host:port, no wildcards`);
+  for (const h of config.allowedHosts ?? []) if (typeof h !== "string" || !/^[A-Za-z0-9.-]+(:\d{1,5})?$/.test(h)) throw new ConfigError(`allowedHosts entry ${JSON.stringify(h)} must be host or host:port, no wildcards`);
   const limiter = new RateLimiter(config.rateLimit ?? { perMinute: 120, burst: 30 }, opts.now);
   const profile: Profile = config.profile ?? "full";
   const supervisor = opts.supervisor ?? new Supervisor();
@@ -372,7 +369,7 @@ export async function startHttpServer(opts: StartOptions): Promise<RunningServer
     }
 
     const core = coreFor(b);
-    const sdk = new SdkServer({ name: "agentroid", version: "0.1.0" }, { capabilities: { tools: {} }, instructions: core.instructions });
+    const sdk = new SdkServer({ name: "agentroid", version: VERSION }, { capabilities: { tools: {} }, instructions: core.instructions });
     installHandlers(sdk, core);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
@@ -434,14 +431,14 @@ export async function startHttpServer(opts: StartOptions): Promise<RunningServer
 
 /** Reads and checks a config object (from JSON). */
 export function parseConfig(raw: unknown): HttpConfig {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("config must be a JSON object");
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new ConfigError("config must be a JSON object");
   const o = raw as Record<string, unknown>;
   const cfg: HttpConfig = { host: checkBindAddress(o.host), port: checkPort(o.port) };
   if (o.port === 0) throw new BindRefused("port 0 is for tests only; give a fixed port in the config so clients can find the server");
   const strings = (k: string): string[] | undefined => {
     const v = o[k];
     if (v === undefined) return undefined;
-    if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) throw new Error(`${k} must be a list of strings`);
+    if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) throw new ConfigError(`${k} must be a list of strings`);
     return v as string[];
   };
   const ah = strings("allowedHosts");
@@ -451,7 +448,7 @@ export function parseConfig(raw: unknown): HttpConfig {
   if (o.maxBodyBytes !== undefined) cfg.maxBodyBytes = o.maxBodyBytes as number;
   if (o.rateLimit !== undefined) cfg.rateLimit = o.rateLimit as RateLimit;
   if (o.profile !== undefined) {
-    if (o.profile !== "full" && o.profile !== "minimal") throw new Error('profile must be "full" or "minimal"');
+    if (o.profile !== "full" && o.profile !== "minimal") throw new ConfigError('profile must be "full" or "minimal"');
     cfg.profile = o.profile;
   }
   return cfg;

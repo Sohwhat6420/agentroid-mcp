@@ -7,6 +7,7 @@
 
 import { readFileSync } from "node:fs";
 import { DaemonClient } from "./daemon.ts";
+import { ConfigError } from "./errors.ts";
 import { parseConfig, startHttpServer, stderrLogger } from "./http-wiring.ts";
 import { Supervisor, defaultTopicFile, ntfyPost, readTopic } from "./supervise.ts";
 import { CredStore, TokenTable, credstorePath } from "./tokens.ts";
@@ -14,7 +15,7 @@ import { CredStore, TokenTable, credstorePath } from "./tokens.ts";
 async function main(): Promise<void> {
   const i = process.argv.indexOf("--config");
   const file = i >= 0 ? process.argv[i + 1] : process.env.AGENTROID_HTTP_CONFIG;
-  if (file === undefined) throw new Error("usage: http-main.ts --config <file.json>");
+  if (file === undefined) throw new ConfigError("usage: http-main.ts --config <file.json>");
   const config = parseConfig(JSON.parse(readFileSync(file, "utf8")));
   const tokens = new TokenTable(await new CredStore(credstorePath()).list());
   const daemon = new DaemonClient({ session: `http-${process.pid}`, ...(process.env.AGENTROID_PIPE ? { path: process.env.AGENTROID_PIPE } : {}) });

@@ -9,6 +9,8 @@
 //   job_stop    -> job.stop; with mode: "pause" -> job.pause
 //   run_script  -> job.run_script
 
+import { ERROR_KINDS } from "./errors.ts";
+import type { ErrorKind } from "./errors.ts";
 import { HEADER_SCHEMA } from "./header.ts";
 import { RECEIPT_SCHEMA } from "./receipt.ts";
 import type { Schema } from "./schema.ts";
@@ -293,8 +295,9 @@ No call runs longer than 110 seconds. If a call times out, look again before rep
 export const toolNames = (): string[] => TOOLS.map((t) => t.name);
 export const toolByName = (name: string): ToolDef | undefined => TOOLS.find((t) => t.name === name);
 
-export const ERROR_KINDS = ["invalid_input", "unknown_tool", "refused", "lease_held", "not_holder", "unknown_device", "ambiguous_device", "device_error", "daemon_error", "timeout", "transport", "bad_reply", "bad_output"] as const;
-export type ErrorKind = (typeof ERROR_KINDS)[number];
+// The error kinds live in errors.ts with what each one means; re-exported here for older imports.
+export { ERROR_KINDS };
+export type { ErrorKind };
 
 export const ERROR_SCHEMA: Schema = {
   type: "object",

@@ -679,7 +679,8 @@ export function createServer(opts: ServerOptions): Server {
       }
     }
     const lines = [headerLine(env.header), body];
-    if (!env.ok) lines.push(`error kind: ${env.error?.kind ?? "?"}`);
+    // the run id goes in the text too, so a refusal read from the text alone still matches its receipt (#32)
+    if (!env.ok) lines.push(`error kind: ${env.error?.kind ?? "?"}, run ${env.receipt.run_id}`);
     const result: ToolResult = { content: [{ type: "text", text: lines.filter((l) => l.length > 0).join("\n") }], structuredContent: env };
     if (!env.ok) result.isError = true;
     return result;
@@ -701,7 +702,7 @@ export function createServer(opts: ServerOptions): Server {
         const msg = `internal error: ${e instanceof Error ? e.message : String(e)}`;
         const receipt = buildReceipt({ runId: `${session}-x`, device: "none", tool: String(name), ok: false, wallTimeS: 0, laptopCpuS: 0, retries: 0, errors: [msg] });
         const header = blankHeader();
-        return { content: [{ type: "text", text: `${headerLine(header)}\n${msg}` }], structuredContent: { ok: false, error: { kind: "daemon_error", code: null, message: msg }, header, receipt }, isError: true };
+        return { content: [{ type: "text", text: `${headerLine(header)}\n${msg}\nerror kind: daemon_error, run ${receipt.run_id}` }], structuredContent: { ok: false, error: { kind: "daemon_error", code: null, message: msg }, header, receipt }, isError: true };
       }
     },
   };

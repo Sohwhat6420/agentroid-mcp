@@ -4,7 +4,7 @@ members = ["crates/adb-link", "crates/core", "crates/bridged", "crates/mcp", "cr
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "1.0.0"
 license = "Apache-2.0"
 publish = false
 

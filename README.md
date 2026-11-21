@@ -10,7 +10,7 @@
 Agentroid is an MCP server (MCP is the plug-in standard AI agents use for tools). It lets an agent such as Claude Code see the screen, tap, type, swipe and open apps on a phone you own. It hands the agent a short text list in place of Android's raw screen description (the comparison behind "9 to 50 times") or a screenshot, so a long task fits before the AI runs out of room.
 
 [![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-167C4A?labelColor=0A1410)](LICENSE)
-[![Status: preview 0.1.0](https://img.shields.io/badge/status-preview%200.1.0-167C4A?labelColor=0A1410)](#status-and-limits)
+[![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-167C4A?labelColor=0A1410)](#status-and-limits)
 [![MCP server](https://img.shields.io/badge/MCP-server-167C4A?labelColor=0A1410)](#how-it-works)
 [![Runs on Windows 11](https://img.shields.io/badge/runs%20on-Windows%2011-167C4A?labelColor=0A1410)](#quick-start)
 [![Tested on a POCO X6 Pro, Android 15](https://img.shields.io/badge/tested%20on-POCO%20X6%20Pro%20%C2%B7%20Android%2015-167C4A?labelColor=0A1410)](#works-on)
@@ -209,7 +209,7 @@ Get-Content "$env:LOCALAPPDATA\agentroid\bridged.log" -Tail 1
 It should say:
 
 ```text
-bridged 0.1.0 listening on \\.\pipe\agentroid
+bridged 1.0.0 listening on \\.\pipe\agentroid
 ```
 
 If no new `listening on` line appears, open "when it does not start" under step 5.
@@ -326,7 +326,7 @@ An agent with a phone in its hands needs limits that it cannot talk its way past
 
 ## Status and limits
 
-Agentroid is a preview (0.1.0). It works and is tested, but it is not 1.0.
+Agentroid 1.0.0 is the first tagged release. "1.0" is a promise about the interface, not a claim that every part is finished: the 27 tool names and their inputs, the result shape (`ok`, `data`, `error`, header and receipt) and the [error kinds](docs/REFERENCE.md#errors) only change in a new major version. What is still limited:
 
 - **Windows only** for the daemon in this build, tested on Windows 11. A Linux listener is written but not built or tested.
 - **Build it from source.** Nothing is published to crates.io or npm yet.

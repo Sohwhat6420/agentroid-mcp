@@ -1512,9 +1512,15 @@ fn the_view_refuses_every_interface_the_lan_and_the_tailnet_outside_hub_mode() {
                     async move { bridged::jobview::serve_stream(&ctx, server, peer).await },
                 );
             let (mut r, mut w) = tokio::io::split(client);
-            w.write_all(b"GET /jobs HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
-                .await
-                .unwrap();
+            // A refused peer is answered before its request is read, and the server then closes its
+            // end. When that happens before this write, the write has nowhere to go; the answer is
+            // still there to read. A peer that is served must have its request taken.
+            let wrote = w
+                .write_all(b"GET /jobs HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+                .await;
+            if want != 403 {
+                wrote.unwrap();
+            }
             let mut out = String::new();
             r.read_to_string(&mut out).await.unwrap();
             task.await.unwrap();
